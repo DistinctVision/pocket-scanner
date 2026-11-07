@@ -1,6 +1,10 @@
 .gradle/
 build/
+app/.cxx/
 local.properties
 .idea/
 *.iml
 captures/
+app/src/main/jniLibs/
+app/src/main/slam-libs/
+app/src/main/assets/orb_vocab.fbow

@@ -11,10 +11,13 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
+import com.intel.realsense.librealsense.Align
 import com.intel.realsense.librealsense.CameraInfo
 import com.intel.realsense.librealsense.Colorizer
 import com.intel.realsense.librealsense.Config
+import com.intel.realsense.librealsense.DepthSensor
 import com.intel.realsense.librealsense.DeviceListener
+import com.intel.realsense.librealsense.DistortionType
 import com.intel.realsense.librealsense.Extension
 import com.intel.realsense.librealsense.FrameSet
 import com.intel.realsense.librealsense.GLRsSurfaceView
@@ -37,10 +40,11 @@ import java.util.concurrent.atomic.AtomicReference
 private data class UsbStatus(val headline: String, val detail: String)
 
 data class CaptureUi(
-    val headline: String = "Подключите D435",
+    val headline: String = "Plug in the Realsense-sensor",
     val deviceLine: String = "",
     val streamLine: String = "",
     val fps: Float = 0f,
+    val track: TrackSample? = null,
     val detachCount: Int = 0,
     val saveLine: String = "",
     val colorBitmap: Bitmap? = null,
@@ -92,6 +96,8 @@ class RealSenseSession(
     private var glView: GLRsSurfaceView? = null
     private var colorView: YuyvPreview? = null
     private var loggedLuma = false
+    private var nextColorPreviewNs = 0L
+    private var nextDepthPreviewNs = 0L
     private var worker: Thread? = null
 
     @Volatile
@@ -128,6 +134,7 @@ class RealSenseSession(
         worker = null
     }
 
+    @Synchronized
     private fun publish(transform: (CaptureUi) -> CaptureUi) {
         ui = transform(ui)
         val snapshotUi = ui
@@ -139,31 +146,34 @@ class RealSenseSession(
         val devices = manager.deviceList.values.toList()
         if (devices.isEmpty()) {
             return UsbStatus(
-                headline = "Телефон не видит USB",
-                detail = "Камера должна сидеть в OTG-хосте телефона. " +
-                    "Хаб, запитанный от компьютера, оставляет телефон устройством: он заряжается, а D435 видит компьютер, не телефон.",
+                headline = "Device is not connected",
+                detail = "Waiting for connection...",
             )
         }
         val lines = devices.joinToString("\n") { device ->
-            val access = if (manager.hasPermission(device)) "доступ есть" else "нет доступа"
+            val access = if (manager.hasPermission(device)) "permission granted" else "no permission"
             val name = device.productName ?: device.deviceName
             "%04X:%04X %s (%s)".format(device.vendorId, device.productId, name, access)
         }
         val intel = devices.filter { it.vendorId == 0x8086 }
         val headline = when {
-            intel.isEmpty() -> "USB есть, RealSense нет"
-            intel.any { manager.hasPermission(it) } -> "RealSense в USB, открываю"
-            else -> "Нужен доступ к USB"
+            intel.isEmpty() -> "USB device found, no RealSense"
+            intel.any { manager.hasPermission(it) } -> "RealSense on USB, opening"
+            else -> "USB permission required"
         }
         return UsbStatus(headline, lines)
     }
 
     private fun loop() {
+        val tracker = StellaTracker(context) { sample ->
+            publish { it.copy(track = sample) }
+        }
+        val align = Align(StreamType.COLOR)
         val rs = RsContext()
         val listener = object : DeviceListener {
             override fun onDeviceAttach() {
                 streaming.set(true)
-                publish { it.copy(headline = "Камера подключена") }
+                publish { it.copy(headline = "Camera connected") }
             }
 
             override fun onDeviceDetach() {
@@ -171,7 +181,7 @@ class RealSenseSession(
                 val n = detaches.incrementAndGet()
                 publish {
                     it.copy(
-                        headline = "Камера отключена",
+                        headline = "Camera disconnected",
                         detachCount = n,
                         fps = 0f,
                         colorBitmap = null,
@@ -200,28 +210,31 @@ class RealSenseSession(
                     continue
                 }
                 try {
-                    streamUntilStopped(rs)
+                    streamUntilStopped(rs, tracker, align)
                 } catch (e: Exception) {
                     Log.e(TAG, "stream failed", e)
-                    val line = (e.message ?: "Ошибка потока").lineSequence().first()
+                    val line = (e.message ?: "Stream error").lineSequence().first()
                     publish { it.copy(headline = line) }
                     streaming.set(false)
                     Thread.sleep(2000)
                 }
             }
         } finally {
+            tracker.close()
+            align.close()
             rs.close()
         }
     }
 
-    private fun streamUntilStopped(rs: RsContext) {
+    private fun streamUntilStopped(rs: RsContext, tracker: StellaTracker, align: Align) {
         val pipeline = Pipeline()
         val colorizer = Colorizer()
         try {
-            val opened = openPipeline(rs, pipeline, colorizer)
+            val opened = openPipeline(rs, pipeline, colorizer, align, tracker)
+            tracker.configure(opened.camera)
             publish {
                 it.copy(
-                    headline = "Идёт поток",
+                    headline = "Streaming",
                     deviceLine = opened.deviceLine,
                     streamLine = opened.streamLine,
                 )
@@ -231,7 +244,7 @@ class RealSenseSession(
             while (alive.get() && streaming.get()) {
                 try {
                     val frames = pipeline.waitForFrames(2000)
-                    frames.use { set -> consume(set, colorizer) }
+                    frames.use { set -> consume(set, colorizer, align, tracker) }
                     framesInWindow++
                 } catch (e: Exception) {
                     val message = e.message.orEmpty()
@@ -251,6 +264,7 @@ class RealSenseSession(
                 }
             }
         } finally {
+            tracker.configure(null)
             try {
                 pipeline.stop()
             } catch (_: Exception) {
@@ -260,27 +274,37 @@ class RealSenseSession(
         }
     }
 
-    private data class Opened(val deviceLine: String, val streamLine: String)
+    private data class Opened(
+        val deviceLine: String,
+        val streamLine: String,
+        val camera: SlamCamera?,
+    )
 
     private fun resetDepthPreview() {
         val view = glView ?: return
         view.queueEvent { view.clear() }
     }
 
-    private fun openPipeline(rs: RsContext, pipeline: Pipeline, colorizer: Colorizer): Opened {
+    private fun openPipeline(
+        rs: RsContext,
+        pipeline: Pipeline,
+        colorizer: Colorizer,
+        align: Align,
+        tracker: StellaTracker,
+    ): Opened {
         resetDepthPreview()
         val probe = probe(rs)
         val options = catalog(pipeline, probe.modes)
         catalog = options
         Log.i(TAG, "usb=${probe.usb} profiles=${options.joinToString(" | ") { it.label }}")
         if (options.isEmpty()) {
-            throw IllegalStateException("Камера не отдала ни одной пары depth и color")
+            throw IllegalStateException("Camera did not advertise a depth and color pair")
         }
         loggedLuma = false
         val request = pick(options)
         publish {
             it.copy(
-                headline = "Открываю ${request.label}",
+                headline = "Opening ${request.label}",
                 profiles = options.map { option -> option.label },
                 selectedProfile = request.label,
             )
@@ -289,7 +313,7 @@ class RealSenseSession(
             val opened = start(pipeline, request)
             Log.i(TAG, "started ${request.label}")
             val frames = pipeline.waitForFrames(4000)
-            frames.use { consume(it, colorizer) }
+            frames.use { consume(it, colorizer, align, tracker) }
             Log.i(TAG, "first frame ${request.label}")
             return opened
         } catch (e: Exception) {
@@ -298,7 +322,7 @@ class RealSenseSession(
                 pipeline.stop()
             } catch (_: Exception) {
             }
-            throw IllegalStateException("${request.label}: ${e.message ?: "нет кадров"}")
+            throw IllegalStateException("${request.label}: ${e.message ?: "no frames"}")
         }
     }
 
@@ -469,15 +493,15 @@ class RealSenseSession(
         }
         val label = when {
             depth == null && color != null ->
-                "цвет ${color.w}×${color.h} @${color.fps}$formatNote"
+                "color ${color.w}×${color.h} @${color.fps}$formatNote"
             depth != null && color == null ->
-                "глубина ${depth.w}×${depth.h} @${depth.fps}"
+                "depth ${depth.w}×${depth.h} @${depth.fps}"
             depth != null && color != null &&
                 depth.w == color.w && depth.h == color.h && depth.fps == color.fps ->
                 "${depth.w}×${depth.h} @${depth.fps}$formatNote"
             depth != null && color != null ->
                 "D ${depth.w}×${depth.h}@${depth.fps} · ${color.w}×${color.h}@${color.fps}$formatNote"
-            else -> "пустой профиль"
+            else -> "empty profile"
         }
         return StreamRequest(
             label = label,
@@ -519,13 +543,14 @@ class RealSenseSession(
             }
             pipeline.start(config).use { profile ->
                 val device = profile.device
-                val deviceLine = try {
+                try {
                     capColorExposure(device)
-                    deviceLine(device)
+                    val line = deviceLine(device)
+                    val camera = cameraOf(device, request)
+                    return Opened(line, request.label, camera)
                 } finally {
                     device.close()
                 }
-                return Opened(deviceLine, request.label)
             }
         }
     }
@@ -547,38 +572,128 @@ class RealSenseSession(
         }
     }
 
+    private fun cameraOf(
+        device: com.intel.realsense.librealsense.Device,
+        request: StreamRequest,
+    ): SlamCamera? {
+        if (!request.depthEnabled || !request.colorEnabled || request.colorFormat != StreamFormat.YUYV) {
+            return null
+        }
+        var factor = 1000.0
+        var fx = 0.0
+        var fy = 0.0
+        var cx = 0.0
+        var cy = 0.0
+        var k1 = 0.0
+        var k2 = 0.0
+        var p1 = 0.0
+        var p2 = 0.0
+        var k3 = 0.0
+        var note = "pinhole"
+        var found = false
+        for (sensor in device.querySensors()) {
+            if (sensor.`is`(Extension.DEPTH_SENSOR)) {
+                try {
+                    val scale = sensor.`as`<DepthSensor>(Extension.DEPTH_SENSOR).depthScale
+                    if (scale > 1e-9f) factor = 1.0 / scale.toDouble()
+                } catch (e: Exception) {
+                    Log.w(TAG, "depth scale: ${e.message}")
+                }
+            }
+            val profiles = sensor.activeStreams.ifEmpty { sensor.streamProfiles }
+            for (profile in profiles) {
+                if (profile.type != StreamType.COLOR || profile.format != StreamFormat.YUYV) continue
+                if (!profile.`is`(Extension.VIDEO_PROFILE)) continue
+                val video = profile.`as`<VideoStreamProfile>(Extension.VIDEO_PROFILE)
+                if (video.width != request.colorW || video.height != request.colorH) continue
+                try {
+                    val intrinsic = video.intrinsic
+                    fx = intrinsic.fx.toDouble()
+                    fy = intrinsic.fy.toDouble()
+                    cx = intrinsic.ppx.toDouble()
+                    cy = intrinsic.ppy.toDouble()
+                    val coeffs = intrinsic.coeffs ?: FloatArray(5)
+                    val model = intrinsic.model
+                    if (model == DistortionType.BROWN_CONRADY) {
+                        k1 = coeffs.getOrElse(0) { 0f }.toDouble()
+                        k2 = coeffs.getOrElse(1) { 0f }.toDouble()
+                        p1 = coeffs.getOrElse(2) { 0f }.toDouble()
+                        p2 = coeffs.getOrElse(3) { 0f }.toDouble()
+                        k3 = coeffs.getOrElse(4) { 0f }.toDouble()
+                        note = "brown"
+                    } else {
+                        note = "pinhole, $model is not the OpenCV model"
+                    }
+                    found = fx > 0.0 && fy > 0.0
+                    Log.i(TAG, "intrinsic fx=$fx fy=$fy cx=$cx cy=$cy model=$model factor=$factor $note")
+                } catch (e: Exception) {
+                    Log.w(TAG, "intrinsic: ${e.message}")
+                }
+            }
+        }
+        if (!found) return null
+        return SlamCamera(
+            w = request.colorW,
+            h = request.colorH,
+            fps = request.colorFps,
+            fx = fx,
+            fy = fy,
+            cx = cx,
+            cy = cy,
+            k1 = k1,
+            k2 = k2,
+            p1 = p1,
+            p2 = p2,
+            k3 = k3,
+            depthFactor = factor,
+            note = note,
+        )
+    }
+
     private fun deviceLine(device: com.intel.realsense.librealsense.Device): String {
         fun info(which: CameraInfo): String =
             if (device.supportsInfo(which)) device.getInfo(which) else "—"
         return "${info(CameraInfo.NAME)}  fw ${info(CameraInfo.FIRMWARE_VERSION)}  USB ${info(CameraInfo.USB_TYPE_DESCRIPTOR)}"
     }
 
-    private fun consume(frames: FrameSet, colorizer: Colorizer) {
+    private fun consume(frames: FrameSet, colorizer: Colorizer, align: Align, tracker: StellaTracker) {
         val color = frames.first(StreamType.COLOR)
         val depth = frames.first(StreamType.DEPTH, StreamFormat.Z16)
         try {
             if (color != null && color.`is`(Extension.VIDEO_FRAME)) {
                 val video = color.`as`<VideoFrame>(Extension.VIDEO_FRAME)
                 val format = color.profile.use { it.format }
-                val raw = ByteArray(color.dataSize)
-                color.getData(raw)
+                val now = System.nanoTime()
+                val wantPreview = format == StreamFormat.YUYV && now >= nextColorPreviewNs
+                val wantSnapshot = snapshot.get()
+                val raw = if (wantPreview || wantSnapshot || format != StreamFormat.YUYV) {
+                    ByteArray(color.dataSize).also { color.getData(it) }
+                } else {
+                    null
+                }
                 if (format == StreamFormat.YUYV) {
-                    if (!loggedLuma) {
-                        loggedLuma = true
-                        logLuma(raw, video.stride, video.height)
+                    if (raw != null && wantPreview) {
+                        if (!loggedLuma) {
+                            loggedLuma = true
+                            logLuma(raw, video.stride, video.height)
+                        }
+                        nextColorPreviewNs = now + 66_000_000L
+                        colorView?.submit(raw, video.width, video.height, video.stride)
                     }
-                    colorView?.submit(raw, video.width, video.height, video.stride)
+                    if (depth != null && tracker.wantsFrame()) {
+                        offerAligned(frames, align, tracker)
+                    }
                 }
                 val line = "color ${video.width}×${video.height} $format   depth ${depthSize(depth)}"
                 if (ui.streamLine != line) {
-                    val bitmap = if (format == StreamFormat.MJPEG) {
+                    val bitmap = if (format == StreamFormat.MJPEG && raw != null) {
                         BitmapFactory.decodeByteArray(raw, 0, raw.size)
                     } else {
                         null
                     }
                     publish { it.copy(streamLine = line, colorBitmap = bitmap) }
                 }
-                if (snapshot.compareAndSet(true, false)) {
+                if (raw != null && snapshot.compareAndSet(true, false)) {
                     val depthBytes = depth?.let {
                         ByteArray(it.dataSize).also { buf -> it.getData(buf) }
                     }
@@ -600,7 +715,8 @@ class RealSenseSession(
                     publish { it.copy(saveLine = saved) }
                 }
             }
-            if (depth != null) {
+            if (depth != null && glView != null && System.nanoTime() >= nextDepthPreviewNs) {
+                nextDepthPreviewNs = System.nanoTime() + 125_000_000L
                 val colored = depth.applyFilter(colorizer)
                 try {
                     glView?.upload(colored)
@@ -611,6 +727,47 @@ class RealSenseSession(
         } finally {
             color?.close()
             depth?.close()
+        }
+    }
+
+    private fun offerAligned(frames: FrameSet, align: Align, tracker: StellaTracker) {
+        var aligned: FrameSet? = null
+        var ownsAligned = false
+        var color: com.intel.realsense.librealsense.Frame? = null
+        var depth: com.intel.realsense.librealsense.Frame? = null
+        try {
+            aligned = align.process(frames)
+            ownsAligned = aligned !== frames
+            val colorFrame = aligned.first(StreamType.COLOR, StreamFormat.YUYV)
+            val depthFrame = aligned.first(StreamType.DEPTH, StreamFormat.Z16)
+            color = colorFrame
+            depth = depthFrame
+            if (colorFrame == null || depthFrame == null) return
+            if (!colorFrame.`is`(Extension.VIDEO_FRAME) || !depthFrame.`is`(Extension.VIDEO_FRAME)) return
+            val colorVideo = colorFrame.`as`<VideoFrame>(Extension.VIDEO_FRAME)
+            val depthVideo = depthFrame.`as`<VideoFrame>(Extension.VIDEO_FRAME)
+            if (colorVideo.width != depthVideo.width || colorVideo.height != depthVideo.height) return
+            val colorBytes = ByteArray(colorFrame.dataSize)
+            val depthBytes = ByteArray(depthFrame.dataSize)
+            colorFrame.getData(colorBytes)
+            depthFrame.getData(depthBytes)
+            tracker.offer(
+                color = colorBytes,
+                width = colorVideo.width,
+                height = colorVideo.height,
+                stride = colorVideo.stride,
+                depth = depthBytes,
+                depthW = depthVideo.width,
+                depthH = depthVideo.height,
+                depthStride = depthVideo.stride,
+                timestampSec = colorFrame.timestamp / 1000.0,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "align: ${e.message}")
+        } finally {
+            color?.close()
+            depth?.close()
+            if (ownsAligned) aligned?.close()
         }
     }
 
@@ -635,7 +792,7 @@ class RealSenseSession(
     }
 
     private fun depthSize(depth: com.intel.realsense.librealsense.Frame?): String {
-        if (depth == null || !depth.`is`(Extension.VIDEO_FRAME)) return "нет"
+        if (depth == null || !depth.`is`(Extension.VIDEO_FRAME)) return "none"
         val video = depth.`as`<VideoFrame>(Extension.VIDEO_FRAME)
         return "${video.width}×${video.height} Z16"
     }
@@ -721,7 +878,7 @@ class RealSenseSession(
                 writeStore(context, "$stamp.z16", "application/octet-stream", relative, depth)
             }
             writeStore(context, "$stamp.txt", "text/plain", relative, note.toByteArray())
-            return "Сохранено $stamp"
+            return "Saved $stamp"
         }
 
         private fun writeStore(
@@ -739,9 +896,9 @@ class RealSenseSession(
             }
             val collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
             val uri = context.contentResolver.insert(collection, values)
-                ?: error("MediaStore не принял $name")
+                ?: error("MediaStore rejected $name")
             context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-                ?: error("Нет потока для $name")
+                ?: error("No output stream for $name")
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             context.contentResolver.update(uri, values, null, null)
@@ -767,7 +924,7 @@ class RealSenseSession(
             File(dir, "$stamp.jpg").writeBytes(jpeg)
             if (depth != null) File(dir, "$stamp.z16").writeBytes(depth)
             File(dir, "$stamp.txt").writeText(note)
-            return "Сохранено ${dir.name}/$stamp"
+            return "Saved ${dir.name}/$stamp"
         }
     }
 }

@@ -17,6 +17,25 @@ android {
         ndk {
             abiFilters += "arm64-v8a"
         }
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DSTELLA_PREFIX=/home/alex/dev/android-prefix/arm64",
+                    "-DOpenCV_DIR=/home/alex/dev/android-prefix/arm64/sdk/native/jni",
+                )
+            }
+        }
+    }
+
+    ndkVersion = "28.2.13676358"
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     buildTypes {

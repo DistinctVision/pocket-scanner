@@ -13,13 +13,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -29,17 +27,21 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -65,7 +67,7 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestGameMode()
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            MaterialTheme(colorScheme = Scheme) {
                 CaptureScaffold(
                     ui = ui,
                     onColor = { view ->
@@ -124,38 +126,63 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val Ink = Color(0xFF101010)
-private val Muted = Color(0xFFBDBDBD)
-private val Chip = Color(0xCC000000)
+private val Scheme = darkColorScheme(
+    primary = Color(0xFF8AB4F8),
+    onPrimary = Color(0xFF062E6F),
+    primaryContainer = Color(0xFF1B3A5F),
+    onPrimaryContainer = Color(0xFFD3E4FF),
+    secondary = Color(0xFF4DD0E1),
+    background = Color(0xFF000000),
+    surface = Color(0xFF121212),
+    surfaceContainer = Color(0xFF1E1E1E),
+    onSurface = Color(0xFFE6E1E5),
+    onSurfaceVariant = Color(0xFFCAC4D0),
+    outline = Color(0xFF938F99),
+)
+
+private enum class PreviewMode { Color, Depth }
 
 @Composable
 private fun CaptureScaffold(
     ui: CaptureUi,
-    onColor: (YuyvPreview) -> Unit,
-    onDepth: (GLRsSurfaceView) -> Unit,
+    onColor: (YuyvPreview?) -> Unit,
+    onDepth: (GLRsSurfaceView?) -> Unit,
     onSelect: (String) -> Unit,
     onSnapshot: () -> Unit,
 ) {
+    val scheme = MaterialTheme.colorScheme
+    var mode by remember { mutableStateOf(PreviewMode.Color) }
+    var marker by remember { mutableStateOf<Marker?>(null) }
+    val trail = remember { androidx.compose.runtime.mutableStateListOf<Vec3>() }
+    val pose = ui.track?.pose
+    SideEffect {
+        val current = pose ?: return@SideEffect
+        val camera = cameraPosition(current)
+        val last = trail.lastOrNull()
+        if (last == null || last.distanceTo(camera) > 0.05f) {
+            trail.add(camera)
+            if (trail.size > 400) trail.removeAt(0)
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(scheme.background)
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text(ui.headline, color = Color.White, style = MaterialTheme.typography.titleMedium)
+        Text("Pocket Scanner", color = scheme.onSurface, style = MaterialTheme.typography.titleLarge)
+        Text(ui.headline, color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
         if (ui.deviceLine.isNotEmpty()) {
-            Text(ui.deviceLine, color = Muted, style = MaterialTheme.typography.bodyMedium)
+            Text(ui.deviceLine, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
-        val detail = buildString {
-            if (ui.streamLine.isNotEmpty()) append(ui.streamLine)
-            if (isNotEmpty()) append("   ")
-            append("fps ${"%.1f".format(ui.fps)}   отвалы ${ui.detachCount}")
+        Text(captureLine(ui), color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        ui.track?.let { sample ->
+            Text(trackLine(sample), color = scheme.primary, style = MaterialTheme.typography.bodyMedium)
         }
-        Text(detail, color = Muted, style = MaterialTheme.typography.bodySmall)
         if (ui.saveLine.isNotEmpty()) {
-            Text(ui.saveLine, color = Color.White, style = MaterialTheme.typography.bodyMedium)
+            Text(ui.saveLine, color = scheme.onSurface, style = MaterialTheme.typography.bodyMedium)
         }
         if (ui.profiles.isNotEmpty()) {
             ProfileMenu(
@@ -164,35 +191,99 @@ private fun CaptureScaffold(
                 onSelect = onSelect,
             )
         }
-        PreviewCard(title = "Цвет", modifier = Modifier.weight(1f)) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx -> YuyvPreview(ctx).also(onColor) },
-            )
-        }
-        PreviewCard(title = "Глубина", modifier = Modifier.weight(1f)) {
-            BoxWithConstraints(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center,
-            ) {
-                val frame = 16f / 9f
-                val wide = maxWidth / maxHeight > frame
+        PreviewSwitch(mode = mode, onMode = { mode = it })
+        PreviewCard(modifier = Modifier.weight(1f)) {
+            if (mode == PreviewMode.Color) {
                 AndroidView(
-                    modifier = if (wide) {
-                        Modifier.fillMaxHeight().aspectRatio(frame)
-                    } else {
-                        Modifier.fillMaxWidth().aspectRatio(frame)
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx -> YuyvPreview(ctx).also(onColor) },
+                    onRelease = { onColor(null) },
+                )
+                val sample = ui.track
+                WorldOverlay(
+                    pose = sample?.pose,
+                    fx = sample?.fx ?: 0f,
+                    fy = sample?.fy ?: 0f,
+                    cx = sample?.cx ?: 0f,
+                    cy = sample?.cy ?: 0f,
+                    imageWidth = sample?.width ?: 0,
+                    imageHeight = sample?.height ?: 0,
+                    marker = marker,
+                    trail = trail,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        GLRsSurfaceView(ctx).also {
+                            onDepth(it)
+                            it.onResume()
+                        }
                     },
-                    factory = { ctx -> GLRsSurfaceView(ctx).also(onDepth) },
                     onRelease = { view ->
+                        onDepth(null)
                         view.onPause()
                         view.close()
                     },
                 )
             }
         }
-        Button(onClick = onSnapshot, modifier = Modifier.fillMaxWidth()) {
-            Text("Снять кадр")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilledTonalButton(
+                onClick = {
+                    val current = ui.track?.pose ?: return@FilledTonalButton
+                    marker = markerInFront(current)
+                },
+                enabled = ui.track?.pose != null,
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(if (marker == null) "Place marker" else "Move marker")
+            }
+            Button(onClick = onSnapshot, modifier = Modifier.weight(1f)) {
+                Text("Save frame")
+            }
+        }
+    }
+}
+
+private fun captureLine(ui: CaptureUi): String = buildString {
+    if (ui.streamLine.isNotEmpty()) append(ui.streamLine)
+    if (isNotEmpty()) append("   ")
+    append("capture ${"%.1f".format(ui.fps)} fps")
+    if (ui.detachCount > 0) append("   drops ${ui.detachCount}")
+}
+
+private fun trackLine(sample: TrackSample): String {
+    val name = when (sample.state) {
+        "tracking" -> "Tracking"
+        "lost" -> "Lost"
+        "initializing" -> "Initializing"
+        "no-pose" -> "No pose"
+        "off" -> "Tracking off"
+        else -> sample.state
+    }
+    if (sample.fps <= 0f) return name
+    return "$name · ${"%.1f".format(sample.fps)} fps · ${sample.frameMs} ms"
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PreviewSwitch(mode: PreviewMode, onMode: (PreviewMode) -> Unit) {
+    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+        SegmentedButton(
+            selected = mode == PreviewMode.Color,
+            onClick = { onMode(PreviewMode.Color) },
+            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+        ) {
+            Text("Color")
+        }
+        SegmentedButton(
+            selected = mode == PreviewMode.Depth,
+            onClick = { onMode(PreviewMode.Depth) },
+            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+        ) {
+            Text("Depth")
         }
     }
 }
@@ -215,16 +306,8 @@ private fun ProfileMenu(
             onValueChange = {},
             readOnly = true,
             singleLine = true,
-            label = { Text("Профиль") },
+            label = { Text("Profile") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White,
-                focusedBorderColor = Color.White,
-                unfocusedBorderColor = Muted,
-                focusedLabelColor = Color.White,
-                unfocusedLabelColor = Muted,
-            ),
             modifier = Modifier
                 .menuAnchor(MenuAnchorType.PrimaryNotEditable)
                 .fillMaxWidth(),
@@ -248,26 +331,15 @@ private fun ProfileMenu(
 
 @Composable
 private fun PreviewCard(
-    title: String,
     modifier: Modifier,
     content: @Composable () -> Unit,
 ) {
     Box(
         modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
-            .background(Ink),
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer),
     ) {
         content()
-        Text(
-            title,
-            color = Color.White,
-            style = MaterialTheme.typography.labelLarge,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(10.dp)
-                .background(Chip, RoundedCornerShape(8.dp))
-                .padding(horizontal = 10.dp, vertical = 4.dp),
-        )
     }
 }
