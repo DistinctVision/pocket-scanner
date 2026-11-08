@@ -20,7 +20,6 @@ import com.intel.realsense.librealsense.DeviceListener
 import com.intel.realsense.librealsense.DistortionType
 import com.intel.realsense.librealsense.Extension
 import com.intel.realsense.librealsense.FrameSet
-import com.intel.realsense.librealsense.GLRsSurfaceView
 import com.intel.realsense.librealsense.Pipeline
 import com.intel.realsense.librealsense.RsContext
 import com.intel.realsense.librealsense.StreamFormat
@@ -77,8 +76,8 @@ private data class VideoMode(
 )
 
 /**
- * One camera thread owns the pipeline. The GL view receives a colorized depth
- * frame; MJPEG is decoded to a bitmap because the stock viewer cannot draw it.
+ * One camera thread owns the pipeline. The Vulkan preview draws YUYV color and
+ * colorized depth; MJPEG is decoded to a bitmap because it is not a live view.
  */
 class RealSenseSession(
     private val context: Context,
@@ -93,8 +92,8 @@ class RealSenseSession(
 
     @Volatile
     private var catalog: List<StreamRequest> = emptyList()
-    private var glView: GLRsSurfaceView? = null
-    private var colorView: YuyvPreview? = null
+    private var preview: VkPreview? = null
+    private val showColor = AtomicBoolean(true)
     private var loggedLuma = false
     private var nextColorPreviewNs = 0L
     private var nextDepthPreviewNs = 0L
@@ -103,12 +102,12 @@ class RealSenseSession(
     @Volatile
     private var ui = CaptureUi()
 
-    fun attachPreview(view: GLRsSurfaceView?) {
-        glView = view
+    fun attachPreview(view: VkPreview?) {
+        preview = view
     }
 
-    fun attachColorPreview(view: YuyvPreview?) {
-        colorView = view
+    fun setShowsColor(color: Boolean) {
+        showColor.set(color)
     }
 
     fun selectProfile(label: String) {
@@ -280,11 +279,6 @@ class RealSenseSession(
         val camera: SlamCamera?,
     )
 
-    private fun resetDepthPreview() {
-        val view = glView ?: return
-        view.queueEvent { view.clear() }
-    }
-
     private fun openPipeline(
         rs: RsContext,
         pipeline: Pipeline,
@@ -292,7 +286,6 @@ class RealSenseSession(
         align: Align,
         tracker: StellaTracker,
     ): Opened {
-        resetDepthPreview()
         val probe = probe(rs)
         val options = catalog(pipeline, probe.modes)
         catalog = options
@@ -664,7 +657,7 @@ class RealSenseSession(
                 val video = color.`as`<VideoFrame>(Extension.VIDEO_FRAME)
                 val format = color.profile.use { it.format }
                 val now = System.nanoTime()
-                val wantPreview = format == StreamFormat.YUYV && now >= nextColorPreviewNs
+                val wantPreview = format == StreamFormat.YUYV && showColor.get() && now >= nextColorPreviewNs
                 val wantSnapshot = snapshot.get()
                 val raw = if (wantPreview || wantSnapshot || format != StreamFormat.YUYV) {
                     ByteArray(color.dataSize).also { color.getData(it) }
@@ -672,13 +665,13 @@ class RealSenseSession(
                     null
                 }
                 if (format == StreamFormat.YUYV) {
-                    if (raw != null && wantPreview) {
+                    if (raw != null && wantPreview && showColor.get()) {
                         if (!loggedLuma) {
                             loggedLuma = true
                             logLuma(raw, video.stride, video.height)
                         }
                         nextColorPreviewNs = now + 66_000_000L
-                        colorView?.submit(raw, video.width, video.height, video.stride)
+                        preview?.submitYuyv(raw, video.width, video.height, video.stride)
                     }
                     if (depth != null && tracker.wantsFrame()) {
                         offerAligned(frames, align, tracker)
@@ -715,11 +708,17 @@ class RealSenseSession(
                     publish { it.copy(saveLine = saved) }
                 }
             }
-            if (depth != null && glView != null && System.nanoTime() >= nextDepthPreviewNs) {
+            if (depth != null && preview != null && !showColor.get() && System.nanoTime() >= nextDepthPreviewNs) {
                 nextDepthPreviewNs = System.nanoTime() + 125_000_000L
                 val colored = depth.applyFilter(colorizer)
                 try {
-                    glView?.upload(colored)
+                    if (colored.`is`(Extension.VIDEO_FRAME)) {
+                        val video = colored.`as`<VideoFrame>(Extension.VIDEO_FRAME)
+                        val format = video.profile.use { it.format.value() }
+                        val raw = ByteArray(colored.dataSize)
+                        colored.getData(raw)
+                        preview?.submitRgb(raw, video.width, video.height, video.stride, format)
+                    }
                 } finally {
                     colored.close()
                 }

@@ -26,3 +26,51 @@ target_link_libraries(pocket_slam
     "${SLAM_LIBS}/libopencv_imgproc.so"
     "${SLAM_LIBS}/libopencv_core.so"
     log)
+
+find_program(GLSLC glslc
+    PATHS "${ANDROID_NDK}/shader-tools/linux-x86_64"
+          "$ENV{ANDROID_NDK_HOME}/shader-tools/linux-x86_64"
+          "/home/alex/dev/android-sdk/ndk/28.2.13676358/shader-tools/linux-x86_64"
+    NO_DEFAULT_PATH)
+if(NOT GLSLC)
+    message(FATAL_ERROR "glslc not found; Vulkan shaders cannot be compiled")
+endif()
+
+set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vk/shaders")
+set(SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+set(SHADER_HEADERS
+    "${SHADER_OUT}/yuyv.comp.h"
+    "${SHADER_OUT}/present.vert.h"
+    "${SHADER_OUT}/present.frag.h")
+
+add_custom_command(
+    OUTPUT "${SHADER_OUT}/yuyv.comp.h"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
+    COMMAND ${GLSLC} --target-env=vulkan1.1 -mfmt=c -fshader-stage=compute
+            "${SHADER_DIR}/yuyv.comp" -o "${SHADER_OUT}/yuyv.comp.h"
+    DEPENDS "${SHADER_DIR}/yuyv.comp"
+    VERBATIM)
+add_custom_command(
+    OUTPUT "${SHADER_OUT}/present.vert.h"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
+    COMMAND ${GLSLC} --target-env=vulkan1.1 -mfmt=c -fshader-stage=vert
+            "${SHADER_DIR}/present.vert" -o "${SHADER_OUT}/present.vert.h"
+    DEPENDS "${SHADER_DIR}/present.vert"
+    VERBATIM)
+add_custom_command(
+    OUTPUT "${SHADER_OUT}/present.frag.h"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
+    COMMAND ${GLSLC} --target-env=vulkan1.1 -mfmt=c -fshader-stage=frag
+            "${SHADER_DIR}/present.frag" -o "${SHADER_OUT}/present.frag.h"
+    DEPENDS "${SHADER_DIR}/present.frag"
+    VERBATIM)
+
+add_library(pocket_vk SHARED
+    vk/vk_device.cpp
+    vk/vk_preview.cpp
+    vk/preview_jni.cpp
+    ${SHADER_HEADERS})
+set_source_files_properties(${SHADER_HEADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
+target_include_directories(pocket_vk PRIVATE "${SHADER_OUT}")
+target_compile_features(pocket_vk PRIVATE cxx_std_17)
+target_link_libraries(pocket_vk vulkan android log)

@@ -48,13 +48,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import com.intel.realsense.librealsense.GLRsSurfaceView
 
 class MainActivity : ComponentActivity() {
     private var ui by mutableStateOf(CaptureUi())
     private var session by mutableStateOf<RealSenseSession?>(null)
-    private var colorPreview: YuyvPreview? = null
-    private var depthPreview: GLRsSurfaceView? = null
+    private var preview: VkPreview? = null
 
     private val cameraPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -70,14 +68,11 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = Scheme) {
                 CaptureScaffold(
                     ui = ui,
-                    onColor = { view ->
-                        colorPreview = view
-                        session?.attachColorPreview(view)
-                    },
-                    onDepth = { view ->
-                        depthPreview = view
+                    onPreview = { view ->
+                        preview = view
                         session?.attachPreview(view)
                     },
+                    onShowsColor = { session?.setShowsColor(it) },
                     onSelect = { session?.selectProfile(it) },
                     onSnapshot = { session?.requestSnapshot() },
                 )
@@ -96,7 +91,6 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestGameMode()
-        depthPreview?.onResume()
     }
 
     private fun requestGameMode() {
@@ -105,17 +99,11 @@ class MainActivity : ComponentActivity() {
         manager.setGameState(GameState(false, GameState.MODE_GAMEPLAY_UNINTERRUPTIBLE))
     }
 
-    override fun onPause() {
-        depthPreview?.onPause()
-        super.onPause()
-    }
-
     private fun startSession() {
         if (session != null) return
         val created = RealSenseSession(applicationContext) { ui = it }
         session = created
-        colorPreview?.let { created.attachColorPreview(it) }
-        depthPreview?.let { created.attachPreview(it) }
+        preview?.let { created.attachPreview(it) }
         created.start()
     }
 
@@ -145,8 +133,8 @@ private enum class PreviewMode { Color, Depth }
 @Composable
 private fun CaptureScaffold(
     ui: CaptureUi,
-    onColor: (YuyvPreview?) -> Unit,
-    onDepth: (GLRsSurfaceView?) -> Unit,
+    onPreview: (VkPreview?) -> Unit,
+    onShowsColor: (Boolean) -> Unit,
     onSelect: (String) -> Unit,
     onSnapshot: () -> Unit,
 ) {
@@ -191,14 +179,20 @@ private fun CaptureScaffold(
                 onSelect = onSelect,
             )
         }
-        PreviewSwitch(mode = mode, onMode = { mode = it })
+        PreviewSwitch(
+            mode = mode,
+            onMode = {
+                mode = it
+                onShowsColor(it == PreviewMode.Color)
+            },
+        )
         PreviewCard(modifier = Modifier.weight(1f)) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx -> VkPreview(ctx).also(onPreview) },
+                onRelease = { onPreview(null) },
+            )
             if (mode == PreviewMode.Color) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { ctx -> YuyvPreview(ctx).also(onColor) },
-                    onRelease = { onColor(null) },
-                )
                 val sample = ui.track
                 WorldOverlay(
                     pose = sample?.pose,
@@ -211,21 +205,6 @@ private fun CaptureScaffold(
                     marker = marker,
                     trail = trail,
                     modifier = Modifier.fillMaxSize(),
-                )
-            } else {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { ctx ->
-                        GLRsSurfaceView(ctx).also {
-                            onDepth(it)
-                            it.onResume()
-                        }
-                    },
-                    onRelease = { view ->
-                        onDepth(null)
-                        view.onPause()
-                        view.close()
-                    },
                 )
             }
         }

@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D yuyvTex;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D rgbaOut;
+
+layout(push_constant) uniform Push {
+    ivec2 size;
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= pc.size.x || pix.y >= pc.size.y) {
+        return;
+    }
+    vec4 packed = texelFetch(yuyvTex, ivec2(pix.x >> 1, pix.y), 0);
+    float luma = ((pix.x & 1) == 0) ? packed.r : packed.b;
+    float c = luma * 255.0 - 16.0;
+    float d = packed.g * 255.0 - 128.0;
+    float e = packed.a * 255.0 - 128.0;
+    float r = (298.0 * c + 409.0 * e + 128.0) / 256.0;
+    float g = (298.0 * c - 100.0 * d - 208.0 * e + 128.0) / 256.0;
+    float b = (298.0 * c + 516.0 * d + 128.0) / 256.0;
+    imageStore(rgbaOut, pix, vec4(
+        clamp(r, 0.0, 255.0) / 255.0,
+        clamp(g, 0.0, 255.0) / 255.0,
+        clamp(b, 0.0, 255.0) / 255.0,
+        1.0));
+}
