@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vk_device.h"
+#include "volume.h"
 
 #include <android/native_window.h>
 
@@ -14,6 +15,13 @@ struct Preview {
     void resize(int width, int height);
     void uploadYuyv(const uint8_t* data, int bytes, int width, int height, int stride);
     void uploadRgb(const uint8_t* data, int bytes, int width, int height, int stride, int format);
+    void setMode(int mode);
+    void setView(const float pose[16], float fx, float fy, float cx, float cy, int width, int height);
+    void meshConfigure(float voxelSize, float maxDepthMeters);
+    void meshUpsert(int id, const float pose[16], const float* depth, const uint8_t* rgb,
+                    int width, int height, float fx, float fy, float cx, float cy);
+    void meshErase(int id);
+    void redraw();
     void destroy();
 
 private:
@@ -26,7 +34,8 @@ private:
     void writeDescriptors();
     void transition(VkCommandBuffer cmd, GpuImage& image, VkImageLayout next,
                     VkPipelineStageFlags dstStage, VkAccessFlags dstAccess);
-    bool present(bool fromYuyv);
+    bool present(bool upload, bool fromYuyv);
+    void destroyDepth();
     void waitInFlight();
 
     VkCore core;
@@ -39,6 +48,10 @@ private:
     std::vector<VkImageView> swapViews;
     std::vector<VkFramebuffer> framebuffers;
     VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkImage depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    VkImageView depthView = VK_NULL_HANDLE;
+    Volume volume;
     VkDescriptorSetLayout graphicsSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout graphicsLayout = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;

@@ -93,7 +93,14 @@ class RealSenseSession(
     @Volatile
     private var catalog: List<StreamRequest> = emptyList()
     private var preview: VkPreview? = null
-    private val showColor = AtomicBoolean(true)
+    private val previewKind = AtomicInteger(0)
+    private val settings = AtomicReference(ScanSettings())
+
+    @Volatile
+    private var mesh: MeshSync? = null
+
+    @Volatile
+    private var trackerRef: StellaTracker? = null
     private var loggedLuma = false
     private var nextColorPreviewNs = 0L
     private var nextDepthPreviewNs = 0L
@@ -104,10 +111,25 @@ class RealSenseSession(
 
     fun attachPreview(view: VkPreview?) {
         preview = view
+        val scan = settings.get()
+        view?.meshConfigure(scan.voxelCm / 100f, scan.depthMeters)
+        view?.setMode(previewKind.get())
     }
 
-    fun setShowsColor(color: Boolean) {
-        showColor.set(color)
+    fun setPreviewKind(kind: Int) {
+        previewKind.set(kind)
+        preview?.setMode(kind)
+    }
+
+    fun setView(pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float, width: Int, height: Int) {
+        preview?.setView(pose, fx, fy, cx, cy, width, height)
+    }
+
+    fun applyScan(next: ScanSettings) {
+        settings.set(next)
+        mesh?.apply(next)
+        trackerRef?.updateTuning(next.tuning())
+        preview?.meshConfigure(next.voxelCm / 100f, next.depthMeters)
     }
 
     fun selectProfile(label: String) {
@@ -189,6 +211,10 @@ class RealSenseSession(
             }
         }
         rs.setDevicesChangedCallback(listener)
+        trackerRef = tracker
+        val meshSync = MeshSync(tracker) { preview }
+        mesh = meshSync
+        meshSync.start()
         try {
             rs.queryDevices().use { list ->
                 if (list.deviceCount > 0) {
@@ -219,6 +245,9 @@ class RealSenseSession(
                 }
             }
         } finally {
+            mesh = null
+            trackerRef = null
+            meshSync.close()
             tracker.close()
             align.close()
             rs.close()
@@ -231,6 +260,7 @@ class RealSenseSession(
         try {
             val opened = openPipeline(rs, pipeline, colorizer, align, tracker)
             tracker.configure(opened.camera)
+            mesh?.setCamera(opened.camera)
             publish {
                 it.copy(
                     headline = "Streaming",
@@ -264,6 +294,7 @@ class RealSenseSession(
             }
         } finally {
             tracker.configure(null)
+            mesh?.setCamera(null)
             try {
                 pipeline.stop()
             } catch (_: Exception) {
@@ -657,7 +688,8 @@ class RealSenseSession(
                 val video = color.`as`<VideoFrame>(Extension.VIDEO_FRAME)
                 val format = color.profile.use { it.format }
                 val now = System.nanoTime()
-                val wantPreview = format == StreamFormat.YUYV && showColor.get() && now >= nextColorPreviewNs
+                val kind = previewKind.get()
+                val wantPreview = format == StreamFormat.YUYV && kind == 0 && now >= nextColorPreviewNs
                 val wantSnapshot = snapshot.get()
                 val raw = if (wantPreview || wantSnapshot || format != StreamFormat.YUYV) {
                     ByteArray(color.dataSize).also { color.getData(it) }
@@ -665,7 +697,7 @@ class RealSenseSession(
                     null
                 }
                 if (format == StreamFormat.YUYV) {
-                    if (raw != null && wantPreview && showColor.get()) {
+                    if (raw != null && wantPreview) {
                         if (!loggedLuma) {
                             loggedLuma = true
                             logLuma(raw, video.stride, video.height)
@@ -708,7 +740,7 @@ class RealSenseSession(
                     publish { it.copy(saveLine = saved) }
                 }
             }
-            if (depth != null && preview != null && !showColor.get() && System.nanoTime() >= nextDepthPreviewNs) {
+            if (depth != null && preview != null && previewKind.get() == 1 && System.nanoTime() >= nextDepthPreviewNs) {
                 nextDepthPreviewNs = System.nanoTime() + 125_000_000L
                 val colored = depth.applyFilter(colorizer)
                 try {
@@ -750,6 +782,16 @@ class RealSenseSession(
             val depthBytes = ByteArray(depthFrame.dataSize)
             colorFrame.getData(colorBytes)
             depthFrame.getData(depthBytes)
+            val timestampSec = colorFrame.timestamp / 1000.0
+            mesh?.note(
+                timestampSec = timestampSec,
+                color = colorBytes,
+                colorStride = colorVideo.stride,
+                depth = depthBytes,
+                depthStride = depthVideo.stride,
+                width = colorVideo.width,
+                height = colorVideo.height,
+            )
             tracker.offer(
                 color = colorBytes,
                 width = colorVideo.width,
@@ -759,7 +801,7 @@ class RealSenseSession(
                 depthW = depthVideo.width,
                 depthH = depthVideo.height,
                 depthStride = depthVideo.stride,
-                timestampSec = colorFrame.timestamp / 1000.0,
+                timestampSec = timestampSec,
             )
         } catch (e: Exception) {
             Log.w(TAG, "align: ${e.message}")

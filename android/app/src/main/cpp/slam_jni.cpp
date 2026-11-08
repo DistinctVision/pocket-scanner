@@ -9,8 +9,13 @@
 #include <opencv2/imgproc.hpp>
 
 #include "stella_vslam/config.h"
+#include "stella_vslam/data/keyframe.h"
 #include "stella_vslam/publish/frame_publisher.h"
+#include "stella_vslam/publish/map_publisher.h"
 #include "stella_vslam/system.h"
+
+#include <algorithm>
+#include <vector>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "pocket-slam", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "pocket-slam", __VA_ARGS__)
@@ -121,6 +126,42 @@ Java_com_pocketscanner_capture_StellaTracker_nativeFeed(
     env->ReleaseByteArrayElements(color, color_ptr, JNI_ABORT);
     env->ReleaseByteArrayElements(depth, depth_ptr, JNI_ABORT);
     return env->NewStringUTF(line.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pocketscanner_capture_StellaTracker_nativeCopyKeyframes(
+    JNIEnv* env, jobject, jlong handle, jintArray ids, jdoubleArray times, jfloatArray poses) {
+    auto* tracker = reinterpret_cast<Tracker*>(handle);
+    if (tracker == nullptr || tracker->slam == nullptr || ids == nullptr || times == nullptr || poses == nullptr) {
+        return 0;
+    }
+    const jsize cap = std::min(env->GetArrayLength(ids), env->GetArrayLength(times));
+    if (cap <= 0 || env->GetArrayLength(poses) < cap * 16) return 0;
+    std::vector<std::shared_ptr<stella_vslam::data::keyframe>> keyframes;
+    tracker->slam->get_map_publisher()->get_keyframes(keyframes);
+    const int count = std::min(static_cast<int>(keyframes.size()), static_cast<int>(cap));
+    std::vector<jint> idOut(count);
+    std::vector<jdouble> timeOut(count);
+    std::vector<jfloat> poseOut(static_cast<size_t>(count) * 16);
+    for (int i = 0; i < count; ++i) {
+        const auto& keyframe = keyframes[i];
+        if (!keyframe || keyframe->will_be_erased()) {
+            idOut[i] = -1;
+            continue;
+        }
+        idOut[i] = static_cast<jint>(keyframe->id_);
+        timeOut[i] = keyframe->timestamp_;
+        const stella_vslam::Mat44_t pose = keyframe->get_pose_wc();
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                poseOut[static_cast<size_t>(i) * 16 + row * 4 + col] = static_cast<float>(pose(row, col));
+            }
+        }
+    }
+    env->SetIntArrayRegion(ids, 0, count, idOut.data());
+    env->SetDoubleArrayRegion(times, 0, count, timeOut.data());
+    env->SetFloatArrayRegion(poses, 0, count * 16, poseOut.data());
+    return count;
 }
 
 extern "C" JNIEXPORT void JNICALL

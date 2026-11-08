@@ -38,6 +38,18 @@ private class SlamFrame(
     val timestampSec: Double,
 )
 
+data class SlamTuning(
+    val minSize: Int = 500,
+    val pyramidLevels: Int = 6,
+    val depthMeters: Float = 6f,
+)
+
+data class KeyframePose(
+    val id: Int,
+    val timestampSec: Double,
+    val pose: FloatArray,
+)
+
 class TrackSample(
     val state: String,
     val pose: FloatArray?,
@@ -64,6 +76,9 @@ class StellaTracker(
     private val generation = AtomicInteger(0)
     private val running = AtomicBoolean(true)
     private val ready = AtomicBoolean(false)
+    private val tuning = AtomicReference(SlamTuning())
+
+    @Volatile
     private var handle = 0L
     private val thread = Thread(::loop, "stella-track")
 
@@ -72,6 +87,31 @@ class StellaTracker(
     }
 
     fun wantsFrame(): Boolean = ready.get() && pending.get() == null
+
+    fun updateTuning(next: SlamTuning) {
+        tuning.set(next)
+        generation.incrementAndGet()
+        ready.set(false)
+        pending.set(null)
+    }
+
+    fun copyKeyframes(): List<KeyframePose> {
+        val native = handle
+        if (native == 0L) return emptyList()
+        val ids = IntArray(512)
+        val times = DoubleArray(512)
+        val poses = FloatArray(512 * 16)
+        val count = synchronized(nativeLock) {
+            if (handle == 0L) 0 else nativeCopyKeyframes(handle, ids, times, poses)
+        }
+        return List(count) { index ->
+            KeyframePose(
+                id = ids[index],
+                timestampSec = times[index],
+                pose = poses.copyOfRange(index * 16, index * 16 + 16),
+            )
+        }.filter { it.id >= 0 }
+    }
 
     fun configure(next: SlamCamera?) {
         camera.set(next)
@@ -231,12 +271,14 @@ class StellaTracker(
         )
     }
 
+    private val nativeLock = Any()
+
     private fun stopNative() {
         ready.set(false)
-        val current = handle
-        handle = 0L
-        if (current != 0L) {
-            nativeStop(current)
+        synchronized(nativeLock) {
+            val current = handle
+            handle = 0L
+            if (current != 0L) nativeStop(current)
         }
     }
 
@@ -252,6 +294,7 @@ class StellaTracker(
     }
 
     private fun writeConfig(model: SlamCamera): File {
+        val chosen = tuning.get()
         val file = File(context.filesDir, "d435.yaml")
         file.writeText(
             """
@@ -272,17 +315,17 @@ class StellaTracker(
               cols: ${model.w}
               rows: ${model.h}
               focal_x_baseline: ${model.fx * 0.05}
-              depth_threshold: 6.0
+              depth_threshold: ${chosen.depthMeters}
               color_order: "Gray"
             Tracking:
               margin_local_map_projection: 10.0
             Preprocessing:
-              min_size: 500
+              min_size: ${chosen.minSize}
               depthmap_factor: ${model.depthFactor}
             Feature:
               name: "default ORB feature extraction setting"
               scale_factor: 1.2
-              num_levels: 6
+              num_levels: ${chosen.pyramidLevels}
               ini_fast_threshold: 20
               min_fast_threshold: 7
             Mapping:
@@ -329,6 +372,8 @@ class StellaTracker(
     ): String
 
     private external fun nativeStop(handle: Long)
+
+    private external fun nativeCopyKeyframes(handle: Long, ids: IntArray, times: DoubleArray, poses: FloatArray): Int
 
     companion object {
         private const val TAG = "pocket-slam"

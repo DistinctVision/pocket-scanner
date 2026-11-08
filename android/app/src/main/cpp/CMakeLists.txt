@@ -65,10 +65,44 @@ add_custom_command(
     DEPENDS "${SHADER_DIR}/present.frag"
     VERBATIM)
 
+find_program(SLANGC slangc
+    PATHS "/home/alex/dev/slang/bin" "$ENV{HOME}/dev/slang/bin")
+if(NOT SLANGC)
+    message(FATAL_ERROR "slangc not found")
+endif()
+
+function(slang_shader source entry stage symbol)
+    set(header "${SHADER_OUT}/${symbol}.h")
+    set(spv "${SHADER_OUT}/${symbol}.spv")
+    add_custom_command(
+        OUTPUT "${header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
+        COMMAND ${SLANGC} "${source}" -target spirv -profile spirv_1_3 -stage ${stage} -entry ${entry}
+                -matrix-layout-row-major -o "${spv}"
+        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/vk/spv_to_c.py" "${spv}" "${header}" "${symbol}"
+        DEPENDS "${source}" "${CMAKE_CURRENT_SOURCE_DIR}/vk/spv_to_c.py"
+        VERBATIM)
+endfunction()
+
+slang_shader("${SHADER_DIR}/integrate.slang" integrate compute integrate_spv)
+slang_shader("${SHADER_DIR}/marching.slang" clearDraw compute clear_draw_spv)
+slang_shader("${SHADER_DIR}/marching.slang" clampDraw compute clamp_draw_spv)
+slang_shader("${SHADER_DIR}/marching.slang" marching compute marching_spv)
+slang_shader("${SHADER_DIR}/mesh.slang" meshVert vertex mesh_vert_spv)
+slang_shader("${SHADER_DIR}/mesh.slang" meshFrag fragment mesh_frag_spv)
+list(APPEND SHADER_HEADERS
+    "${SHADER_OUT}/integrate_spv.h"
+    "${SHADER_OUT}/clear_draw_spv.h"
+    "${SHADER_OUT}/clamp_draw_spv.h"
+    "${SHADER_OUT}/marching_spv.h"
+    "${SHADER_OUT}/mesh_vert_spv.h"
+    "${SHADER_OUT}/mesh_frag_spv.h")
+
 add_library(pocket_vk SHARED
     vk/vk_device.cpp
     vk/vk_preview.cpp
     vk/preview_jni.cpp
+    vk/volume.cpp
     ${SHADER_HEADERS})
 set_source_files_properties(${SHADER_HEADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
 target_include_directories(pocket_vk PRIVATE "${SHADER_OUT}")

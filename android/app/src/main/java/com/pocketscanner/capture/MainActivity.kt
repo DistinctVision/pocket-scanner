@@ -11,6 +11,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,9 +39,12 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
@@ -72,8 +79,12 @@ class MainActivity : ComponentActivity() {
                         preview = view
                         session?.attachPreview(view)
                     },
-                    onShowsColor = { session?.setShowsColor(it) },
+                    onPreviewKind = { session?.setPreviewKind(it) },
+                    onView = { pose, fx, fy, cx, cy, width, height ->
+                        session?.setView(pose, fx, fy, cx, cy, width, height)
+                    },
                     onSelect = { session?.selectProfile(it) },
+                    onApply = { session?.applyScan(it) },
                     onSnapshot = { session?.requestSnapshot() },
                 )
             }
@@ -128,30 +139,43 @@ private val Scheme = darkColorScheme(
     outline = Color(0xFF938F99),
 )
 
-private enum class PreviewMode { Color, Depth }
+private enum class PreviewMode { Color, Depth, Mesh }
 
 @Composable
 private fun CaptureScaffold(
     ui: CaptureUi,
     onPreview: (VkPreview?) -> Unit,
-    onShowsColor: (Boolean) -> Unit,
+    onPreviewKind: (Int) -> Unit,
+    onView: (FloatArray, Float, Float, Float, Float, Int, Int) -> Unit,
     onSelect: (String) -> Unit,
+    onApply: (ScanSettings) -> Unit,
     onSnapshot: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
     var mode by remember { mutableStateOf(PreviewMode.Color) }
     var marker by remember { mutableStateOf<Marker?>(null) }
+    var settingsOpen by remember { mutableStateOf(false) }
+    var applied by remember { mutableStateOf(ScanSettings()) }
+    var resetEpoch by remember { mutableIntStateOf(0) }
     val trail = remember { androidx.compose.runtime.mutableStateListOf<Vec3>() }
-    val pose = ui.track?.pose
+    LaunchedEffect(resetEpoch) {
+        marker = null
+        trail.clear()
+    }
     SideEffect {
-        val current = pose ?: return@SideEffect
-        val camera = cameraPosition(current)
-        val last = trail.lastOrNull()
-        if (last == null || last.distanceTo(camera) > 0.05f) {
-            trail.add(camera)
-            if (trail.size > 400) trail.removeAt(0)
+        val sample = ui.track
+        val current = sample?.pose
+        if (current != null) {
+            onView(current, sample.fx, sample.fy, sample.cx, sample.cy, sample.width, sample.height)
+            val camera = cameraPosition(current)
+            val last = trail.lastOrNull()
+            if (last == null || last.distanceTo(camera) > 0.05f) {
+                trail.add(camera)
+                if (trail.size > 400) trail.removeAt(0)
+            }
         }
     }
+    Box(Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -160,7 +184,19 @@ private fun CaptureScaffold(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text("Pocket Scanner", color = scheme.onSurface, style = MaterialTheme.typography.titleLarge)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("Pocket Scanner", color = scheme.onSurface, style = MaterialTheme.typography.titleLarge)
+            Row {
+                TextButton(onClick = {
+                    resetEpoch++
+                    onApply(applied)
+                }) { Text("Reset") }
+                TextButton(onClick = { settingsOpen = true }) { Text("Settings") }
+            }
+        }
         Text(ui.headline, color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
         if (ui.deviceLine.isNotEmpty()) {
             Text(ui.deviceLine, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
@@ -172,18 +208,11 @@ private fun CaptureScaffold(
         if (ui.saveLine.isNotEmpty()) {
             Text(ui.saveLine, color = scheme.onSurface, style = MaterialTheme.typography.bodyMedium)
         }
-        if (ui.profiles.isNotEmpty()) {
-            ProfileMenu(
-                profiles = ui.profiles,
-                selected = ui.selectedProfile.ifEmpty { ui.profiles.first() },
-                onSelect = onSelect,
-            )
-        }
         PreviewSwitch(
             mode = mode,
             onMode = {
                 mode = it
-                onShowsColor(it == PreviewMode.Color)
+                onPreviewKind(it.ordinal)
             },
         )
         PreviewCard(modifier = Modifier.weight(1f)) {
@@ -224,6 +253,26 @@ private fun CaptureScaffold(
             }
         }
     }
+        if (settingsOpen) {
+            SettingsPanel(
+                ui = ui,
+                applied = applied,
+                onSelect = onSelect,
+                onApply = {
+                    applied = it
+                    resetEpoch++
+                    onApply(it)
+                    settingsOpen = false
+                },
+                onReset = {
+                    resetEpoch++
+                    onApply(applied)
+                    settingsOpen = false
+                },
+                onClose = { settingsOpen = false },
+            )
+        }
+    }
 }
 
 private fun captureLine(ui: CaptureUi): String = buildString {
@@ -253,16 +302,23 @@ private fun PreviewSwitch(mode: PreviewMode, onMode: (PreviewMode) -> Unit) {
         SegmentedButton(
             selected = mode == PreviewMode.Color,
             onClick = { onMode(PreviewMode.Color) },
-            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
         ) {
             Text("Color")
         }
         SegmentedButton(
             selected = mode == PreviewMode.Depth,
             onClick = { onMode(PreviewMode.Depth) },
-            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
         ) {
             Text("Depth")
+        }
+        SegmentedButton(
+            selected = mode == PreviewMode.Mesh,
+            onClick = { onMode(PreviewMode.Mesh) },
+            shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3),
+        ) {
+            Text("Mesh")
         }
     }
 }
@@ -303,6 +359,86 @@ private fun ProfileMenu(
                         if (label != selected) onSelect(label)
                     },
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsPanel(
+    ui: CaptureUi,
+    applied: ScanSettings,
+    onSelect: (String) -> Unit,
+    onApply: (ScanSettings) -> Unit,
+    onReset: () -> Unit,
+    onClose: () -> Unit,
+) {
+    var voxel by remember { mutableIntStateOf(applied.voxelCm) }
+    var integrate by remember { mutableIntStateOf(applied.integrateWidth) }
+    var minSize by remember { mutableIntStateOf(applied.minSize) }
+    var levels by remember { mutableIntStateOf(applied.pyramidLevels) }
+    var depth by remember { mutableIntStateOf(applied.depthMeters.toInt()) }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background.copy(alpha = 0.96f))
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Settings", color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.titleLarge)
+            TextButton(onClick = onClose) { Text("Close") }
+        }
+        Text(
+            "Apply and Reset both restart tracking and clear the mesh. The camera stays on.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        if (ui.profiles.isNotEmpty()) {
+            ProfileMenu(
+                profiles = ui.profiles,
+                selected = ui.selectedProfile.ifEmpty { ui.profiles.first() },
+                onSelect = onSelect,
+            )
+        }
+        ChoiceRow("Voxel", listOf(2, 4, 8), voxel, { "$it cm" }) { voxel = it }
+        ChoiceRow("Integrate", listOf(80, 160, 320), integrate, { "$it×${it * 3 / 4}" }) { integrate = it }
+        ChoiceRow("Features", listOf(300, 500, 800), minSize, { "$it" }) { minSize = it }
+        ChoiceRow("Pyramid", listOf(4, 6, 8), levels, { "$it" }) { levels = it }
+        ChoiceRow("Depth", listOf(3, 6, 10), depth, { "$it m" }) { depth = it }
+        Spacer(Modifier.height(4.dp))
+        Button(
+            onClick = {
+                onApply(
+                    ScanSettings(
+                        voxelCm = voxel,
+                        integrateWidth = integrate,
+                        minSize = minSize,
+                        pyramidLevels = levels,
+                        depthMeters = depth.toFloat(),
+                    ),
+                )
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Apply") }
+        FilledTonalButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) { Text("Reset") }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun <T> ChoiceRow(label: String, values: List<T>, selected: T, title: (T) -> String, onPick: (T) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelLarge)
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            values.forEachIndexed { index, value ->
+                SegmentedButton(
+                    selected = value == selected,
+                    onClick = { onPick(value) },
+                    shape = SegmentedButtonDefaults.itemShape(index = index, count = values.size),
+                ) { Text(title(value)) }
             }
         }
     }
