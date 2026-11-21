@@ -15,6 +15,8 @@ data class ScanSettings(
     val minSize: Int = 500,
     val pyramidLevels: Int = 6,
     val depthMeters: Float = 6f,
+    val reviewVoxelCm: Int = 2,
+    val closeLoops: Boolean = true,
 ) {
     val integrateHeight: Int get() = integrateWidth * 3 / 4
 
@@ -79,6 +81,17 @@ class MeshSync(
         preview()?.meshConfigure(next.voxelCm / 100f, next.depthMeters)
     }
 
+    fun replaceSettings(next: ScanSettings) {
+        settings.set(next)
+    }
+
+    /** Drop the current mesh and integrate the stored keyframes at this voxel size. */
+    fun rebuild(voxelCm: Int) {
+        val depth = settings.get().depthMeters
+        preview()?.meshConfigure(voxelCm / 100f, depth)
+        adoptPoses()
+    }
+
     fun setRecording(enabled: Boolean) {
         val was = recording.getAndSet(enabled)
         if (enabled && !was) {
@@ -88,6 +101,62 @@ class MeshSync(
     }
 
     fun recordedCount(): Int = recorded.get()
+
+    fun saveScan(dir: File): Int {
+        val shots = synchronized(lock) {
+            held.map { (id, frame) -> Triple(id, frame.pose.copyOf(), frame.snap) }
+        }
+        dir.mkdirs()
+        dir.listFiles()?.forEach { it.delete() }
+        val header = "id,width,height,fx,fy,cx,cy," + (0 until 16).joinToString(",") { "p$it" } + "\n"
+        val index = StringBuilder(header)
+        var written = 0
+        for ((id, pose, snap) in shots) {
+            if (id >= COVER_ID_BASE) continue
+            try {
+                val depth = ByteBuffer.allocate(snap.depth.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+                for (value in snap.depth) depth.putFloat(value)
+                File(dir, "$id.f32").writeBytes(depth.array())
+                File(dir, "$id.rgb").writeBytes(snap.color)
+                index.append(
+                    "$id,${snap.width},${snap.height},${snap.fx},${snap.fy},${snap.cx},${snap.cy}," +
+                        pose.joinToString(",") + "\n",
+                )
+                written++
+            } catch (error: Exception) {
+                Log.w(TAG, "save $id: ${error.message}")
+            }
+        }
+        File(dir, "index.csv").writeText(index.toString())
+        Log.i(TAG, "saved $written keyframes to ${dir.absolutePath}")
+        return written
+    }
+
+    fun adoptPoses() {
+        val view = preview() ?: return
+        val poll = tracker.copyKeyframes()
+        synchronized(lock) {
+            for (id in covered.keys.toList()) view.meshErase(id)
+            covered.clear()
+            for (keyframe in poll.frames) {
+                val heldFrame = held[keyframe.id] ?: continue
+                held[keyframe.id] = Held(heldFrame.snap, keyframe.pose.copyOf())
+                view.meshUpsert(
+                    keyframe.id,
+                    keyframe.pose,
+                    heldFrame.snap.depth,
+                    heldFrame.snap.color,
+                    heldFrame.snap.width,
+                    heldFrame.snap.height,
+                    heldFrame.snap.fx,
+                    heldFrame.snap.fy,
+                    heldFrame.snap.cx,
+                    heldFrame.snap.cy,
+                    force = true,
+                )
+            }
+        }
+    }
 
     fun setTracking(active: Boolean) {
         acceptFrames.set(active)

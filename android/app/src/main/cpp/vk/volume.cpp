@@ -645,7 +645,7 @@ void Volume::relink(Kf& kf, const float* oldPose) {
 }
 
 void Volume::upsert(int id, const float pose[16], const float* depth, const uint8_t* rgb,
-                    int width, int height, float fx, float fy, float cx, float cy) {
+                    int width, int height, float fx, float fy, float cx, float cy, bool force) {
     if (!ready || width <= 0 || height <= 0 || width * height > kMaxImage) return;
     if (baked.find(id) != baked.end()) return;
     if (imageW == 0) {
@@ -659,7 +659,7 @@ void Volume::upsert(int id, const float pose[16], const float* depth, const uint
     float oldPose[16];
     const bool update = index >= 0;
     if (update) {
-        if (poseClose(keyframes[index].pose, pose, kPoseTrans, kPoseRot)) return;
+        if (!force && poseClose(keyframes[index].pose, pose, kPoseTrans, kPoseRot)) return;
         std::memcpy(oldPose, keyframes[index].pose, sizeof(oldPose));
     } else {
         index = allocKf();

@@ -8,6 +8,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "refine.h"
 #include "stella_vslam/config.h"
 #include "stella_vslam/data/keyframe.h"
 #include "stella_vslam/publish/frame_publisher.h"
@@ -171,6 +172,84 @@ Java_com_pocketscanner_capture_StellaTracker_nativeCopyKeyframes(
     env->SetDoubleArrayRegion(times, 0, count, timeOut.data());
     env->SetFloatArrayRegion(poses, 0, count * 16, poseOut.data());
     return count;
+}
+
+namespace {
+
+struct RefineTick {
+    JNIEnv* env;
+    jobject listener;
+    jmethodID method;
+};
+
+void refine_tick(int done, int total, void* user) {
+    auto* tick = static_cast<RefineTick*>(user);
+    if (tick == nullptr || tick->listener == nullptr || tick->method == nullptr) return;
+    tick->env->CallVoidMethod(tick->listener, tick->method, done, total);
+    if (tick->env->ExceptionCheck()) tick->env->ExceptionClear();
+}
+
+RefineTick make_tick(JNIEnv* env, jobject listener) {
+    RefineTick tick{env, listener, nullptr};
+    if (listener == nullptr) return tick;
+    jclass type = env->GetObjectClass(listener);
+    tick.method = env->GetMethodID(type, "onCount", "(II)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return tick;
+}
+
+} // namespace
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_pocketscanner_capture_StellaTracker_nativeFreeze(JNIEnv* env, jobject, jlong handle) {
+    auto* tracker = reinterpret_cast<Tracker*>(handle);
+    if (tracker == nullptr || tracker->slam == nullptr) return;
+    try {
+        pocket_freeze(tracker->slam.get());
+    } catch (const std::exception& error) {
+        LOGE("freeze: %s", error.what());
+        throw_runtime(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pocketscanner_capture_StellaTracker_nativeLocalBa(JNIEnv* env, jobject, jlong handle, jobject listener) {
+    auto* tracker = reinterpret_cast<Tracker*>(handle);
+    if (tracker == nullptr || tracker->slam == nullptr) return 0;
+    try {
+        RefineTick tick = make_tick(env, listener);
+        return pocket_local_ba(tracker->slam.get(), refine_tick, &tick);
+    } catch (const std::exception& error) {
+        LOGE("local BA: %s", error.what());
+        throw_runtime(env, error.what());
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pocketscanner_capture_StellaTracker_nativeSearchLoops(JNIEnv* env, jobject, jlong handle, jobject listener) {
+    auto* tracker = reinterpret_cast<Tracker*>(handle);
+    if (tracker == nullptr || tracker->slam == nullptr) return 0;
+    try {
+        RefineTick tick = make_tick(env, listener);
+        return pocket_search_loops(tracker->slam.get(), refine_tick, &tick);
+    } catch (const std::exception& error) {
+        LOGE("loops: %s", error.what());
+        throw_runtime(env, error.what());
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_pocketscanner_capture_StellaTracker_nativeResume(JNIEnv* env, jobject, jlong handle) {
+    auto* tracker = reinterpret_cast<Tracker*>(handle);
+    if (tracker == nullptr || tracker->slam == nullptr) return;
+    try {
+        pocket_resume(tracker->slam.get());
+    } catch (const std::exception& error) {
+        LOGE("resume: %s", error.what());
+        throw_runtime(env, error.what());
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL

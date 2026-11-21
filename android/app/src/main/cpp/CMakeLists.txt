@@ -14,7 +14,7 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 # library it links, and jniLibs holds only the libraries this .so does not name.
 set(SLAM_LIBS "${CMAKE_CURRENT_SOURCE_DIR}/../slam-libs/${ANDROID_ABI}")
 
-add_library(pocket_slam SHARED slam_jni.cpp)
+add_library(pocket_slam SHARED slam_jni.cpp refine.cpp)
 target_include_directories(pocket_slam PRIVATE
     "${STELLA_PREFIX}/include"
     "${STELLA_PREFIX}/include/eigen3"
@@ -25,6 +25,10 @@ target_link_libraries(pocket_slam
     "${SLAM_LIBS}/libstella_vslam.so"
     "${SLAM_LIBS}/libopencv_imgproc.so"
     "${SLAM_LIBS}/libopencv_core.so"
+    "${SLAM_LIBS}/libyaml-cpp.so"
+    "${SLAM_LIBS}/libg2o_core.so"
+    "${SLAM_LIBS}/libg2o_stuff.so"
+    "${SLAM_LIBS}/libg2o_types_sim3.so"
     log)
 
 find_program(GLSLC glslc

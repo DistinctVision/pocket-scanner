@@ -50,6 +50,10 @@ data class KeyframePose(
     val pose: FloatArray,
 )
 
+fun interface RefineCount {
+    fun onCount(done: Int, total: Int)
+}
+
 class KeyframePoll(
     val frames: List<KeyframePose>,
     val complete: Boolean,
@@ -77,6 +81,7 @@ class StellaTracker(
     private val context: Context,
     private val onSample: (TrackSample) -> Unit,
 ) {
+    private val nativeLock = Any()
     private val pending = AtomicReference<SlamFrame?>(null)
     private val camera = AtomicReference<SlamCamera?>(null)
     private val generation = AtomicInteger(0)
@@ -226,9 +231,34 @@ class StellaTracker(
     private var trackFrames = 0
     private var trackWindowStart = System.nanoTime()
 
+    fun freezeMapping() {
+        synchronized(nativeLock) {
+            if (handle != 0L) nativeFreeze(handle)
+        }
+    }
+
+    fun localBundleAdjust(tick: RefineCount) {
+        synchronized(nativeLock) {
+            if (handle != 0L) nativeLocalBa(handle, tick)
+        }
+    }
+
+    fun searchLoops(tick: RefineCount): Int {
+        return synchronized(nativeLock) {
+            if (handle == 0L) 0 else nativeSearchLoops(handle, tick)
+        }
+    }
+
+    fun resumeMapping() {
+        synchronized(nativeLock) {
+            if (handle != 0L) nativeResume(handle)
+        }
+    }
+
     private fun feed(frame: SlamFrame) {
         val started = System.nanoTime()
         val state = try {
+            synchronized(nativeLock) {
             nativeFeed(
                 handle,
                 frame.color,
@@ -242,6 +272,7 @@ class StellaTracker(
                 frame.timestampSec,
                 poseBuf,
             )
+            }
         } catch (error: Exception) {
             Log.e(TAG, "feed", error)
             "Frame error"
@@ -278,8 +309,6 @@ class StellaTracker(
             ),
         )
     }
-
-    private val nativeLock = Any()
 
     private fun stopNative() {
         ready.set(false)
@@ -388,6 +417,14 @@ class StellaTracker(
         timestampSec: Double,
         poseOut: FloatArray,
     ): String
+
+    private external fun nativeFreeze(handle: Long)
+
+    private external fun nativeLocalBa(handle: Long, tick: RefineCount)
+
+    private external fun nativeSearchLoops(handle: Long, tick: RefineCount): Int
+
+    private external fun nativeResume(handle: Long)
 
     private external fun nativeStop(handle: Long)
 

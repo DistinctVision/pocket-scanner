@@ -1,0 +1,72 @@
+package com.pocketscanner.capture
+
+import android.os.Bundle
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
+import androidx.activity.addCallback
+import androidx.activity.compose.setContent
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.LaunchedEffect
+
+class RefineActivity : ComponentActivity() {
+    private var session: RealSenseSession? = null
+    private var preview: VkPreview? = null
+    private var retained = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onBackPressedDispatcher.addCallback(this) { leave() }
+        val created = CaptureRuntime.retain(this)
+        session = created
+        retained = true
+        created.setPreviewKind(MESH)
+        setContent {
+            val ui = CaptureRuntime.ui
+            LaunchedEffect(ui.phase) {
+                if (ui.phase == "idle") finishBack()
+            }
+            MaterialTheme(colorScheme = Scheme) {
+                RefineScreen(
+                    ui = ui,
+                    onPreview = { view ->
+                        preview = view
+                        view.onAttached = { attached -> created.attachPreview(attached) }
+                    },
+                    onPreviewGone = { created.detachPreview(it) },
+                    onView = { pose, fx, fy, cx, cy, width, height ->
+                        created.setView(pose, fx, fy, cx, cy, width, height)
+                    },
+                    onSettings = { openSettings() },
+                    onBack = { leave() },
+                    onSplat = { created.noteSplatting() },
+                    firstPose = { created.firstKeyframePose() },
+                )
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        session?.setPreviewKind(MESH)
+        preview?.reclaim()
+    }
+
+    private fun leave() {
+        session?.backToScan()
+        finishBack()
+    }
+
+    override fun onDestroy() {
+        if (retained) {
+            retained = false
+            CaptureRuntime.release()
+            session = null
+        }
+        super.onDestroy()
+    }
+
+    private companion object {
+        const val MESH = 2
+    }
+}

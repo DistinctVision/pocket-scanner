@@ -7,6 +7,7 @@ import android.view.Surface
 import android.view.TextureView
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -19,47 +20,42 @@ import java.util.concurrent.atomic.AtomicReference
 class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTextureListener {
     private val pending = AtomicReference<Pending?>(null)
     private val poseFrame = AtomicReference<PoseFrame?>(null)
-    private val shownChunks = AtomicInteger(0)
-    private val shownPending = AtomicInteger(0)
-    private val shownCap = AtomicInteger(0)
-    private var thread: HandlerThread? = null
-    private var handler: Handler? = null
-    private var nativeHandle = 0L
-    private var window: Surface? = null
+    var onAttached: ((VkPreview) -> Unit)? = null
 
     init {
         isOpaque = true
         surfaceTextureListener = this
+        if (anchor == null) anchor = this
     }
 
     fun submitYuyv(data: ByteArray, width: Int, height: Int, stride: Int) {
         pending.set(Pending.Yuyv(data, width, height, stride))
-        handler?.post { drain() }
+        engine()?.post { drain() }
     }
 
     fun submitRgb(data: ByteArray, width: Int, height: Int, stride: Int, format: Int) {
         pending.set(Pending.Rgb(data, width, height, stride, format))
-        handler?.post { drain() }
+        engine()?.post { drain() }
     }
 
     fun setMode(mode: Int) {
-        handler?.post {
-            val handle = nativeHandle
+        engine()?.post {
+            val handle = sharedHandle
             if (handle != 0L) nativeSetMode(handle, mode)
         }
     }
 
     fun setFrontier(enabled: Boolean) {
-        handler?.post {
-            val handle = nativeHandle
+        engine()?.post {
+            val handle = sharedHandle
             if (handle != 0L) nativeSetFrontier(handle, enabled)
         }
     }
 
     fun setView(pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float, width: Int, height: Int) {
         val copy = pose.copyOf(16)
-        handler?.post {
-            val handle = nativeHandle
+        engine()?.post {
+            val handle = sharedHandle
             if (handle != 0L) nativeSetView(handle, copy, fx, fy, cx, cy, width, height)
         }
     }
@@ -78,7 +74,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         imageWidth: Int,
         imageHeight: Int,
     ): Boolean {
-        val loop = handler ?: return false
+        val loop = engine() ?: return false
         poseFrame.set(
             PoseFrame(
                 data.copyOf(),
@@ -104,14 +100,16 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
 
     fun chunkCap(): Int = shownCap.get()
 
-    fun meshConfigure(voxelSize: Float, maxDepth: Float) {
-        handler?.post {
-            val handle = nativeHandle
+    fun meshConfigure(voxelSize: Float, maxDepth: Float): Boolean {
+        val loop = engine() ?: return false
+        loop.post {
+            val handle = sharedHandle
             if (handle != 0L) {
                 nativeMeshConfigure(handle, voxelSize, maxDepth)
                 publishChunks(handle)
             }
         }
+        return true
     }
 
     fun meshUpsert(
@@ -125,16 +123,19 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         fy: Float,
         cx: Float,
         cy: Float,
+        force: Boolean = false,
     ): Boolean {
-        val loop = handler ?: return false
+        val loop = engine() ?: return false
         val poseCopy = pose.copyOf(16)
         val depthCopy = depth.copyOf()
         val colorCopy = color.copyOf()
         loop.post {
             if (poseFrame.get() != null) drainPose()
-            val handle = nativeHandle
+            val handle = sharedHandle
             if (handle != 0L) {
-                nativeMeshUpsert(handle, id, poseCopy, depthCopy, colorCopy, width, height, fx, fy, cx, cy)
+                nativeMeshUpsert(
+                    handle, id, poseCopy, depthCopy, colorCopy, width, height, fx, fy, cx, cy, force,
+                )
                 publishChunks(handle)
             }
         }
@@ -142,8 +143,8 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     }
 
     fun meshErase(id: Int) {
-        handler?.post {
-            val handle = nativeHandle
+        engine()?.post {
+            val handle = sharedHandle
             if (handle != 0L) {
                 nativeMeshErase(handle, id)
                 publishChunks(handle)
@@ -151,52 +152,76 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         }
     }
 
+    fun reclaim() {
+        val texture = surfaceTexture ?: return
+        if (!isAvailable || width <= 0 || height <= 0) return
+        bind(texture, width, height)
+    }
+
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-        val worker = HandlerThread("pocket-vk")
-        worker.start()
-        thread = worker
-        val loop = Handler(worker.looper)
-        handler = loop
+        bind(surface, width, height)
+    }
+
+    private fun bind(texture: SurfaceTexture, width: Int, height: Int) {
+        val created = Surface(texture)
+        val loop = engineLoop()
         loop.post {
-            val created = Surface(surface)
-            window = created
-            nativeHandle = nativeCreate(created)
-            if (nativeHandle == 0L) {
-                Log.e(TAG, "vulkan preview failed to start")
+            if (owner === this && bound != null) {
+                created.release()
                 return@post
             }
-            nativeResize(nativeHandle, width, height)
+            val previous = bound
+            owner = this
+            if (sharedHandle == 0L) {
+                sharedHandle = nativeCreate(created)
+                if (sharedHandle == 0L) {
+                    Log.e(TAG, "vulkan preview failed to start")
+                    created.release()
+                    owner = null
+                    return@post
+                }
+            } else if (!nativeAdopt(sharedHandle, created)) {
+                Log.e(TAG, "vulkan preview failed to rebind")
+            }
+            val handle = sharedHandle
+            if (handle != 0L) nativeResize(handle, width, height)
+            if (previous !== created) previous?.release()
+            bound = created
             drain()
-            loop.post(redraw)
+            if (!redrawing) {
+                redrawing = true
+                loop.post(redraw)
+            }
+            Handler(Looper.getMainLooper()).post { onAttached?.invoke(this) }
         }
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-        handler?.post {
-            val handle = nativeHandle
-            if (handle != 0L) nativeResize(handle, width, height)
-            drain()
+        engine()?.post {
+            val handle = sharedHandle
+            if (handle != 0L && owner === this) nativeResize(handle, width, height)
+            if (owner === this) drain()
         }
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
         val done = CountDownLatch(1)
-        handler?.removeCallbacks(redraw)
-        handler?.post {
-            val handle = nativeHandle
-            nativeHandle = 0L
-            shownChunks.set(0)
-            shownPending.set(0)
-            shownCap.set(0)
-            if (handle != 0L) nativeDestroy(handle)
-            window?.release()
-            window = null
+        val loop = engine()
+        if (loop == null) {
             done.countDown()
-        } ?: done.countDown()
+        } else {
+            loop.post {
+                if (owner === this) {
+                    val handle = sharedHandle
+                    if (handle != 0L) nativeDetach(handle)
+                    bound?.release()
+                    bound = null
+                    owner = null
+                }
+                done.countDown()
+            }
+        }
         done.await(2, TimeUnit.SECONDS)
-        thread?.quitSafely()
-        handler = null
-        thread = null
         return true
     }
 
@@ -208,20 +233,9 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         shownCap.set(nativeChunkCap(handle))
     }
 
-    private val redraw = object : Runnable {
-        override fun run() {
-            if (poseFrame.get() != null) drainPose()
-            val handle = nativeHandle
-            val more = handle != 0L && nativeRedraw(handle)
-            if (handle != 0L) publishChunks(handle)
-            // A zero delay kept this thread inside marching cubes and the pose frame never ran.
-            handler?.postDelayed(this, if (more) 50L else 200L)
-        }
-    }
-
     private fun drain() {
         val frame = pending.getAndSet(null) ?: return
-        val handle = nativeHandle
+        val handle = sharedHandle
         if (handle == 0L) return
         when (frame) {
             is Pending.Yuyv -> nativeUploadYuyv(handle, frame.data, frame.width, frame.height, frame.stride)
@@ -231,7 +245,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
 
     private fun drainPose() {
         val frame = poseFrame.getAndSet(null) ?: return
-        val handle = nativeHandle
+        val handle = sharedHandle
         if (handle == 0L) return
         nativeSetView(handle, frame.pose, frame.fx, frame.fy, frame.cx, frame.cy, frame.imageWidth, frame.imageHeight)
         nativeUploadYuyv(handle, frame.data, frame.width, frame.height, frame.stride)
@@ -257,6 +271,8 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     )
 
     private external fun nativeCreate(surface: Surface): Long
+    private external fun nativeAdopt(handle: Long, surface: Surface): Boolean
+    private external fun nativeDetach(handle: Long)
     private external fun nativeResize(handle: Long, width: Int, height: Int)
     private external fun nativeUploadYuyv(handle: Long, data: ByteArray, width: Int, height: Int, stride: Int)
     private external fun nativeUploadRgb(handle: Long, data: ByteArray, width: Int, height: Int, stride: Int, format: Int)
@@ -269,7 +285,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeMeshConfigure(handle: Long, voxelSize: Float, maxDepth: Float)
     private external fun nativeMeshUpsert(
         handle: Long, id: Int, pose: FloatArray, depth: FloatArray, color: ByteArray,
-        width: Int, height: Int, fx: Float, fy: Float, cx: Float, cy: Float,
+        width: Int, height: Int, fx: Float, fy: Float, cx: Float, cy: Float, force: Boolean,
     )
     private external fun nativeMeshErase(handle: Long, id: Int)
     private external fun nativeChunkCount(handle: Long): Int
@@ -277,8 +293,76 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeChunkCap(handle: Long): Int
     private external fun nativeRedraw(handle: Long): Boolean
 
-    private companion object {
+    companion object {
         const val TAG = "pocket-vk"
+        private val shownChunks = AtomicInteger(0)
+        private val shownPending = AtomicInteger(0)
+        private val shownCap = AtomicInteger(0)
+        private val gate = Any()
+        @Volatile private var sharedHandle = 0L
+        private var worker: HandlerThread? = null
+        private var loop: Handler? = null
+        private var owner: VkPreview? = null
+        private var anchor: VkPreview? = null
+        private var bound: Surface? = null
+        private var redrawing = false
+
+        private val redraw = object : Runnable {
+            override fun run() {
+                val view = owner ?: anchor
+                val handle = sharedHandle
+                if (owner != null) {
+                    owner?.drainPose()
+                    owner?.drain()
+                }
+                val more = view != null && handle != 0L && view.nativeRedraw(handle)
+                if (view != null && handle != 0L) view.publishChunks(handle)
+                // A zero delay kept this thread inside marching cubes and the pose frame never ran.
+                loop?.postDelayed(this, if (more) 50L else 200L)
+            }
+        }
+
+        private fun engine(): Handler? = loop
+
+        private fun engineLoop(): Handler {
+            synchronized(gate) {
+                val existing = loop
+                if (existing != null) return existing
+                val thread = HandlerThread("pocket-vk")
+                thread.start()
+                worker = thread
+                val created = Handler(thread.looper)
+                loop = created
+                return created
+            }
+        }
+
+        fun shutdown() {
+            val handler = loop ?: return
+            val done = CountDownLatch(1)
+            handler.post {
+                val view = anchor
+                val handle = sharedHandle
+                sharedHandle = 0L
+                redrawing = false
+                handler.removeCallbacks(redraw)
+                if (view != null && handle != 0L) view.nativeDestroy(handle)
+                bound?.release()
+                bound = null
+                owner = null
+                shownChunks.set(0)
+                shownPending.set(0)
+                shownCap.set(0)
+                done.countDown()
+            }
+            done.await(2, TimeUnit.SECONDS)
+            worker?.quitSafely()
+            synchronized(gate) {
+                loop = null
+                worker = null
+            }
+        }
+
         init {
             System.loadLibrary("pocket_vk")
         }

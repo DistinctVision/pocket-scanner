@@ -19,7 +19,7 @@ struct Volume {
 
     void configure(float voxelSize, float maxDepthMeters);
     void upsert(int id, const float pose[16], const float* depth, const uint8_t* rgb,
-                int width, int height, float fx, float fy, float cx, float cy);
+                int width, int height, float fx, float fy, float cx, float cy, bool force = false);
     void erase(int id);
     void setView(const float pose[16], float fx, float fy, float cx, float cy, int width, int height);
     void setMode(int mode);

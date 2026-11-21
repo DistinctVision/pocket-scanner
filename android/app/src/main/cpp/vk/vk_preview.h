@@ -12,6 +12,8 @@
 // kernel into an RGBA image; depth arrives already colorized and is copied in.
 struct Preview {
     bool create(ANativeWindow* window);
+    bool adopt(ANativeWindow* window);
+    void detach();
     void resize(int width, int height);
     void uploadYuyv(const uint8_t* data, int bytes, int width, int height, int stride);
     void uploadRgb(const uint8_t* data, int bytes, int width, int height, int stride, int format);
@@ -20,7 +22,7 @@ struct Preview {
     void setView(const float pose[16], float fx, float fy, float cx, float cy, int width, int height);
     void meshConfigure(float voxelSize, float maxDepthMeters);
     void meshUpsert(int id, const float pose[16], const float* depth, const uint8_t* rgb,
-                    int width, int height, float fx, float fy, float cx, float cy);
+                    int width, int height, float fx, float fy, float cx, float cy, bool force = false);
     void meshErase(int id);
     bool redraw();
     int chunkCount() const;
@@ -31,6 +33,7 @@ struct Preview {
 private:
     bool recreateSwapchain();
     void destroySwapchain();
+    void releaseWindow();
     bool createGraphics();
     void destroyGraphics();
     bool ensureImages(int width, int height);

@@ -46,6 +46,10 @@ data class CaptureUi(
     val track: TrackSample? = null,
     val detachCount: Int = 0,
     val saveLine: String = "",
+    val phase: String = "idle",
+    val refineDetail: String = "",
+    val refineProgress: Float = 0f,
+    val framesOnDisk: Boolean = false,
     val colorBitmap: Bitmap? = null,
     val profiles: List<String> = emptyList(),
     val selectedProfile: String = "",
@@ -100,6 +104,10 @@ class RealSenseSession(
     private var loggedPreviewMiss = false
     private val settings = AtomicReference(ScanSettings())
     private val recordFrames = AtomicBoolean(false)
+    private val frontierOn = AtomicBoolean(false)
+    private val volumeConfigured = AtomicBoolean(false)
+    private val scanning = AtomicBoolean(false)
+    private val scanDir = File(context.getExternalFilesDir(null), "scan-frames")
 
     @Volatile
     private var mesh: MeshSync? = null
@@ -116,12 +124,32 @@ class RealSenseSession(
 
     fun attachPreview(view: VkPreview?) {
         preview = view
-        val scan = settings.get()
-        view?.meshConfigure(scan.voxelCm / 100f, scan.depthMeters)
-        view?.setMode(previewKind.get())
+        if (view == null) return
+        view.setMode(previewKind.get())
+        view.setFrontier(frontierOn.get())
+        if (!volumeConfigured.get()) {
+            val scan = settings.get()
+            if (view.meshConfigure(scan.voxelCm / 100f, scan.depthMeters)) volumeConfigured.set(true)
+        }
+    }
+
+    fun detachPreview(view: VkPreview) {
+        if (preview === view) preview = null
+    }
+
+    fun scanSettings(): ScanSettings = settings.get()
+
+    fun frontierEnabled(): Boolean = frontierOn.get()
+
+    fun recordingEnabled(): Boolean = recordFrames.get()
+
+    fun firstKeyframePose(): FloatArray? {
+        val frames = trackerRef?.copyKeyframes()?.frames ?: return null
+        return frames.filter { it.id >= 0 }.minByOrNull { it.id }?.pose?.copyOf()
     }
 
     fun setFrontier(enabled: Boolean) {
+        frontierOn.set(enabled)
         preview?.setFrontier(enabled)
     }
 
@@ -133,7 +161,8 @@ class RealSenseSession(
     fun recordedCount(): Int = mesh?.recordedCount() ?: 0
 
     fun setPreviewKind(kind: Int) {
-        previewKind.set(kind)
+        val previous = previewKind.getAndSet(kind)
+        if (kind == 0 && previous != 0) colorLockedToPose.set(false)
         preview?.setMode(kind)
     }
 
@@ -142,10 +171,14 @@ class RealSenseSession(
     }
 
     fun applyScan(next: ScanSettings) {
+        scanning.set(false)
         settings.set(next)
         mesh?.apply(next)
         trackerRef?.updateTuning(next.tuning())
         preview?.meshConfigure(next.voxelCm / 100f, next.depthMeters)
+        publish {
+            it.copy(phase = "idle", refineDetail = "", refineProgress = 0f, framesOnDisk = false, saveLine = "")
+        }
     }
 
     fun selectProfile(label: String) {
@@ -156,6 +189,109 @@ class RealSenseSession(
 
     fun requestSnapshot() {
         snapshot.set(true)
+    }
+
+    fun beginScan(wipe: Boolean) {
+        if (wipe) {
+            applyScan(settings.get())
+            publish { it.copy(framesOnDisk = false, saveLine = "", refineDetail = "") }
+        }
+        scanning.set(true)
+        publish { it.copy(phase = "scanning", refineDetail = "", refineProgress = 0f) }
+    }
+
+    fun updateRefine(closeLoops: Boolean, reviewVoxelCm: Int) {
+        val next = settings.get().copy(closeLoops = closeLoops, reviewVoxelCm = reviewVoxelCm)
+        settings.set(next)
+        mesh?.replaceSettings(next)
+        if (ui.phase == "review") mesh?.rebuild(reviewVoxelCm)
+    }
+
+    fun stopAndRefine(): Boolean {
+        if (!scanning.getAndSet(false)) return false
+        val searchLoops = settings.get().closeLoops
+        mesh?.setTracking(false)
+        publish { it.copy(phase = "refining", refineDetail = "Queue", refineProgress = 0.05f) }
+        Thread({
+            val saved = mesh?.saveScan(scanDir) ?: 0
+            publish { it.copy(framesOnDisk = saved > 0, saveLine = "$saved keyframes saved") }
+            waitForMapper()
+            publish { it.copy(refineDetail = "Local BA", refineProgress = 0.2f) }
+            try {
+                trackerRef?.freezeMapping()
+                trackerRef?.localBundleAdjust { done, total ->
+                    val span = if (total <= 0) 0.5f else 0.2f + 0.45f * done / total
+                    publish { it.copy(refineDetail = "Local BA $done / $total", refineProgress = span) }
+                }
+                var found = 0
+                if (searchLoops) {
+                    publish { it.copy(refineDetail = "Loops", refineProgress = 0.7f) }
+                    found = trackerRef?.searchLoops { done, total ->
+                        val span = if (total <= 0) 0.9f else 0.7f + 0.2f * done / total
+                        publish { it.copy(refineDetail = "Loops $done / $total", refineProgress = span) }
+                    } ?: 0
+                }
+                publish { it.copy(refineDetail = "Mesh", refineProgress = 0.95f) }
+                mesh?.rebuild(settings.get().reviewVoxelCm)
+                val detail = when {
+                    !searchLoops -> "Loops off"
+                    found > 0 -> "Closed $found loops"
+                    else -> "No loop accepted"
+                }
+                publish { it.copy(phase = "review", refineDetail = detail, refineProgress = 1f) }
+            } catch (error: Exception) {
+                Log.e(TAG, "refine", error)
+                publish {
+                    it.copy(
+                        phase = "review",
+                        refineDetail = error.message?.lineSequence()?.firstOrNull() ?: "Refine failed",
+                        refineProgress = 1f,
+                    )
+                }
+            }
+        }, "pose-refine").start()
+        return true
+    }
+
+    fun noteSplatting() {
+        if (!ui.framesOnDisk) return
+        publish { it.copy(saveLine = "Splatting is the next step") }
+    }
+
+    fun backToScan() {
+        try {
+            trackerRef?.resumeMapping()
+        } catch (error: Exception) {
+            Log.e(TAG, "resume", error)
+        }
+        scanning.set(true)
+        mesh?.rebuild(settings.get().voxelCm)
+        publish { it.copy(phase = "scanning", refineDetail = "", refineProgress = 0f) }
+    }
+
+    fun resetScan() {
+        scanning.set(false)
+        applyScan(settings.get())
+        publish {
+            it.copy(phase = "idle", refineDetail = "", refineProgress = 0f, framesOnDisk = false, saveLine = "")
+        }
+    }
+
+    private fun waitForMapper() {
+        val tracker = trackerRef ?: return
+        var last = -1
+        var stable = 0
+        repeat(40) {
+            val count = tracker.copyKeyframes().frames.size
+            if (count == last) stable++ else stable = 0
+            last = count
+            if (stable >= 4) return
+            try {
+                Thread.sleep(400)
+            } catch (_: InterruptedException) {
+                return
+            }
+        }
     }
 
     fun start() {
@@ -169,6 +305,7 @@ class RealSenseSession(
         streaming.set(false)
         worker?.join(2000)
         worker = null
+        VkPreview.shutdown()
     }
 
     @Synchronized
@@ -756,7 +893,7 @@ class RealSenseSession(
                         nextColorPreviewNs = now + 66_000_000L
                         preview?.submitYuyv(raw, video.width, video.height, video.stride)
                     }
-                    if (depth != null && tracker.wantsFrame()) {
+                    if (depth != null && scanning.get() && tracker.wantsFrame()) {
                         offerAligned(frames, align, tracker)
                     }
                 }

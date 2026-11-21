@@ -16,6 +16,21 @@ JNIEXPORT jlong JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCreate(JN
     return reinterpret_cast<jlong>(preview);
 }
 
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeAdopt(
+    JNIEnv* env, jobject, jlong handle, jobject surface) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr) return JNI_FALSE;
+    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    if (window == nullptr) return JNI_FALSE;
+    return preview->adopt(window) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeDetach(
+    JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview != nullptr) preview->detach();
+}
+
 JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeResize(
     JNIEnv*, jobject, jlong handle, jint width, jint height) {
     auto* preview = reinterpret_cast<Preview*>(handle);
@@ -73,7 +88,7 @@ JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeMeshConfig
 
 JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeMeshUpsert(
     JNIEnv* env, jobject, jlong handle, jint id, jfloatArray pose, jfloatArray depth, jbyteArray color,
-    jint width, jint height, jfloat fx, jfloat fy, jfloat cx, jfloat cy) {
+    jint width, jint height, jfloat fx, jfloat fy, jfloat cx, jfloat cy, jboolean force) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     if (preview == nullptr || pose == nullptr || depth == nullptr || color == nullptr) return;
     if (env->GetArrayLength(pose) < 16) return;
@@ -85,7 +100,7 @@ JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeMeshUpsert
     jbyte* colorValues = env->GetByteArrayElements(color, nullptr);
     if (depthValues != nullptr && colorValues != nullptr) {
         preview->meshUpsert(id, poseValues, depthValues, reinterpret_cast<const uint8_t*>(colorValues),
-                            width, height, fx, fy, cx, cy);
+                            width, height, fx, fy, cx, cy, force == JNI_TRUE);
     }
     if (depthValues != nullptr) env->ReleaseFloatArrayElements(depth, depthValues, JNI_ABORT);
     if (colorValues != nullptr) env->ReleaseByteArrayElements(color, colorValues, JNI_ABORT);

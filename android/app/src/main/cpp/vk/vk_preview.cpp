@@ -149,6 +149,53 @@ bool Preview::create(ANativeWindow* nativeWindow) {
     return true;
 }
 
+void Preview::releaseWindow() {
+    if (core.device != VK_NULL_HANDLE) vkDeviceWaitIdle(core.device);
+    if (fencePending && fence != VK_NULL_HANDLE && core.device != VK_NULL_HANDLE) {
+        vkWaitForFences(core.device, 1, &fence, VK_TRUE, 1000000000ull);
+        vkResetFences(core.device, 1, &fence);
+        fencePending = false;
+    }
+    destroySwapchain();
+    if (surface != VK_NULL_HANDLE && core.instance != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(core.instance, surface, nullptr);
+    }
+    surface = VK_NULL_HANDLE;
+    if (window != nullptr) ANativeWindow_release(window);
+    window = nullptr;
+}
+
+bool Preview::adopt(ANativeWindow* nativeWindow) {
+    if (core.device == VK_NULL_HANDLE) return create(nativeWindow);
+    releaseWindow();
+    window = nativeWindow;
+    VkAndroidSurfaceCreateInfoKHR surfaceInfo{};
+    surfaceInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+    surfaceInfo.window = window;
+    if (!ok(vkCreateAndroidSurfaceKHR(core.instance, &surfaceInfo, nullptr, &surface), "android surface")) {
+        ANativeWindow_release(nativeWindow);
+        window = nullptr;
+        return false;
+    }
+    VkBool32 presentable = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(core.physical, core.queueFamily, surface, &presentable);
+    if (presentable != VK_TRUE) {
+        LOGE("queue cannot present");
+        releaseWindow();
+        return false;
+    }
+    viewWidth = ANativeWindow_getWidth(window);
+    viewHeight = ANativeWindow_getHeight(window);
+    if (viewWidth > 0 && viewHeight > 0 && !recreateSwapchain()) return false;
+    LOGI("preview rebound");
+    return true;
+}
+
+void Preview::detach() {
+    if (core.device == VK_NULL_HANDLE) return;
+    releaseWindow();
+}
+
 void Preview::resize(int width, int height) {
     viewWidth = width;
     viewHeight = height;
@@ -304,8 +351,8 @@ void Preview::setView(const float pose[16], float fx, float fy, float cx, float 
 void Preview::meshConfigure(float voxelSize, float maxDepthMeters) { volume.configure(voxelSize, maxDepthMeters); }
 
 void Preview::meshUpsert(int id, const float pose[16], const float* depth, const uint8_t* rgb,
-                         int width, int height, float fx, float fy, float cx, float cy) {
-    volume.upsert(id, pose, depth, rgb, width, height, fx, fy, cx, cy);
+                         int width, int height, float fx, float fy, float cx, float cy, bool force) {
+    volume.upsert(id, pose, depth, rgb, width, height, fx, fy, cx, cy, force);
 }
 
 void Preview::meshErase(int id) { volume.erase(id); }

@@ -10,9 +10,15 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.VectorConverter
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -22,12 +28,18 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -42,27 +54,38 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import kotlinx.coroutines.delay
+import androidx.compose.runtime.MutableIntState
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.launch
+import kotlin.math.PI
+import kotlin.math.atan2
 
 class MainActivity : ComponentActivity() {
-    private var ui by mutableStateOf(CaptureUi())
-    private var session by mutableStateOf<RealSenseSession?>(null)
+    private var session: RealSenseSession? = null
     private var preview: VkPreview? = null
+    private var retained = false
 
     private val cameraPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -75,26 +98,33 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestGameMode()
         setContent {
+            val ui = CaptureRuntime.ui
             MaterialTheme(colorScheme = Scheme) {
-                CaptureScaffold(
+                ScanScreen(
                     ui = ui,
                     onPreview = { view ->
                         preview = view
-                        session?.attachPreview(view)
+                        view.onAttached = { attached ->
+                            session?.attachPreview(attached)
+                        }
                     },
+                    onPreviewGone = { view -> session?.detachPreview(view) },
                     onPreviewKind = { session?.setPreviewKind(it) },
                     onView = { pose, fx, fy, cx, cy, width, height ->
                         session?.setView(pose, fx, fy, cx, cy, width, height)
                     },
-                    onSelect = { session?.selectProfile(it) },
                     onApply = { session?.applyScan(it) },
-                    onFrontier = { session?.setFrontier(it) },
-                    onSnapshot = { session?.requestSnapshot() },
+                    onBegin = { session?.beginScan(it) },
+                    onStop = {
+                        if (session?.stopAndRefine() == true) openRefine()
+                    },
+                    onSettings = { openSettings() },
                     chunkCount = { preview?.chunkCount() ?: 0 },
                     chunkPending = { preview?.chunkPending() ?: 0 },
                     chunkCap = { preview?.chunkCap() ?: 0 },
                     onRecord = { session?.setRecording(it) },
                     recordedCount = { session?.recordedCount() ?: 0 },
+                    recording = session?.recordingEnabled() == true,
                 )
             }
         }
@@ -111,6 +141,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         requestGameMode()
+        preview?.reclaim()
     }
 
     private fun requestGameMode() {
@@ -120,21 +151,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startSession() {
-        if (session != null) return
-        val created = RealSenseSession(applicationContext) { ui = it }
-        session = created
-        preview?.let { created.attachPreview(it) }
-        created.start()
+        if (retained) return
+        retained = true
+        session = CaptureRuntime.retain(this)
+        preview?.let { session?.attachPreview(it) }
     }
 
     override fun onDestroy() {
-        session?.stop()
-        session = null
+        if (retained) {
+            retained = false
+            CaptureRuntime.release()
+            session = null
+        }
         super.onDestroy()
     }
 }
 
-private val Scheme = darkColorScheme(
+internal val Scheme = darkColorScheme(
     primary = Color(0xFF8AB4F8),
     onPrimary = Color(0xFF062E6F),
     primaryContainer = Color(0xFF1B3A5F),
@@ -150,34 +183,81 @@ private val Scheme = darkColorScheme(
 
 private enum class PreviewMode { Color, Depth, Mesh }
 
+private class LookHolder {
+    var look = Look(0f, 0f, 0f, Vec3(0f, 0f, 0f))
+    var anchor: FloatArray? = null
+    var holdAnchor = false
+}
+
+private class LookGestures(private val holder: LookHolder, private val tick: MutableIntState) {
+    fun flyBy(forward: Float, strafe: Float) {
+        holder.holdAnchor = false
+        holder.look = fly(holder.look, forward, strafe)
+        tick.intValue++
+    }
+
+    fun lookBy(dx: Float, dy: Float) {
+        holder.holdAnchor = false
+        holder.look = lookAround(holder.look, dx * 0.007f, dy * 0.007f)
+        tick.intValue++
+    }
+
+    fun twist(delta: Float) {
+        holder.holdAnchor = false
+        holder.look = rollBy(holder.look, -delta)
+        tick.intValue++
+    }
+
+    fun snap(pose: FloatArray) {
+        holder.anchor = pose.copyOf()
+        holder.look = lookFromPose(pose)
+        holder.holdAnchor = true
+        tick.intValue++
+    }
+
+    fun viewPose(): FloatArray {
+        val saved = holder.anchor
+        return if (holder.holdAnchor && saved != null) saved else poseOf(holder.look)
+    }
+}
+
 @Composable
-private fun CaptureScaffold(
+private fun ScanScreen(
     ui: CaptureUi,
-    onPreview: (VkPreview?) -> Unit,
+    onPreview: (VkPreview) -> Unit,
+    onPreviewGone: (VkPreview) -> Unit,
     onPreviewKind: (Int) -> Unit,
     onView: (FloatArray, Float, Float, Float, Float, Int, Int) -> Unit,
-    onSelect: (String) -> Unit,
     onApply: (ScanSettings) -> Unit,
-    onFrontier: (Boolean) -> Unit,
-    onSnapshot: () -> Unit,
+    onBegin: (Boolean) -> Unit,
+    onStop: () -> Unit,
+    onSettings: () -> Unit,
     chunkCount: () -> Int,
     chunkPending: () -> Int,
     chunkCap: () -> Int,
     onRecord: (Boolean) -> Unit,
     recordedCount: () -> Int,
+    recording: Boolean,
 ) {
     val scheme = MaterialTheme.colorScheme
     var mode by remember { mutableStateOf(PreviewMode.Color) }
     var marker by remember { mutableStateOf<Marker?>(null) }
-    var settingsOpen by remember { mutableStateOf(false) }
     var applied by remember { mutableStateOf(ScanSettings()) }
-    var showFrontier by remember { mutableStateOf(false) }
     var resetEpoch by remember { mutableIntStateOf(0) }
     var chunks by remember { mutableIntStateOf(0) }
     var pendingChunks by remember { mutableIntStateOf(0) }
     var chunkLimit by remember { mutableIntStateOf(0) }
-    var recording by remember { mutableStateOf(false) }
+    var record by remember { mutableStateOf(recording) }
     var recorded by remember { mutableIntStateOf(0) }
+    var confirmNew by remember { mutableStateOf(false) }
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle, mode) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) onPreviewKind(mode.ordinal)
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     LaunchedEffect(Unit) {
         while (true) {
             chunks = chunkCount()
@@ -195,10 +275,10 @@ private fun CaptureScaffold(
     SideEffect {
         val sample = ui.track
         val current = sample?.pose
-        if (current != null) {
-            if (mode != PreviewMode.Color) {
-                onView(current, sample.fx, sample.fy, sample.cx, sample.cy, sample.width, sample.height)
-            }
+        if (ui.phase == "scanning" && mode != PreviewMode.Color && current != null) {
+            onView(current, sample.fx, sample.fy, sample.cx, sample.cy, sample.width, sample.height)
+        }
+        if (current != null && ui.phase == "scanning") {
             val camera = cameraPosition(current)
             val last = trail.lastOrNull()
             if (last == null || last.distanceTo(camera) > 0.05f) {
@@ -207,129 +287,68 @@ private fun CaptureScaffold(
             }
         }
     }
-    Box(Modifier.fillMaxSize()) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(scheme.background)
-            .windowInsetsPadding(WindowInsets.safeDrawing)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Text("Pocket Scanner", color = scheme.onSurface, style = MaterialTheme.typography.titleLarge)
-            Row {
-                TextButton(onClick = {
-                    resetEpoch++
-                    onApply(applied)
-                }) { Text("Reset") }
-                TextButton(onClick = { settingsOpen = true }) { Text("Settings") }
-            }
-        }
-        Text(ui.headline, color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
-        if (ui.deviceLine.isNotEmpty()) {
-            Text(ui.deviceLine, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-        }
-        Text(captureLine(ui), color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-        Text(
-            if (chunkLimit > 0) "Chunks $chunks / $chunkLimit, $pendingChunks waiting" else "Chunks $chunks",
-            color = scheme.onSurface,
-            style = MaterialTheme.typography.bodyMedium,
+    Box(Modifier.fillMaxSize().background(scheme.background)) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx -> VkPreview(ctx).also(onPreview) },
+            onRelease = onPreviewGone,
         )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                if (recording) "Recording $recorded frames" else "Record frames",
-                color = scheme.onSurface,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Switch(
-                checked = recording,
-                onCheckedChange = {
-                    recording = it
-                    onRecord(it)
-                },
+        if (mode == PreviewMode.Color) {
+            val sample = ui.track
+            WorldOverlay(
+                pose = sample?.pose,
+                fx = sample?.fx ?: 0f,
+                fy = sample?.fy ?: 0f,
+                cx = sample?.cx ?: 0f,
+                cy = sample?.cy ?: 0f,
+                imageWidth = sample?.width ?: 0,
+                imageHeight = sample?.height ?: 0,
+                marker = marker,
+                trail = trail,
+                modifier = Modifier.fillMaxSize(),
             )
         }
-        ui.track?.let { sample ->
-            Text(trackLine(sample), color = scheme.primary, style = MaterialTheme.typography.bodyMedium)
-        }
-        if (ui.saveLine.isNotEmpty()) {
-            Text(ui.saveLine, color = scheme.onSurface, style = MaterialTheme.typography.bodyMedium)
-        }
-        PreviewSwitch(
+        ScanChrome(
+            ui = ui,
             mode = mode,
+            chunks = chunks,
+            pendingChunks = pendingChunks,
+            chunkLimit = chunkLimit,
+            recording = record,
+            recorded = recorded,
             onMode = {
                 mode = it
                 onPreviewKind(it.ordinal)
             },
+            onRecord = {
+                record = it
+                onRecord(it)
+            },
+            onReset = {
+                resetEpoch++
+                onApply(applied)
+            },
+            onSettings = onSettings,
+            onPrimary = {
+                if (ui.phase == "scanning") onStop()
+                else if (ui.framesOnDisk) confirmNew = true
+                else onBegin(false)
+            },
         )
-        PreviewCard(modifier = Modifier.weight(1f)) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx -> VkPreview(ctx).also(onPreview) },
-                onRelease = { onPreview(null) },
-            )
-            if (mode == PreviewMode.Color) {
-                val sample = ui.track
-                WorldOverlay(
-                    pose = sample?.pose,
-                    fx = sample?.fx ?: 0f,
-                    fy = sample?.fy ?: 0f,
-                    cx = sample?.cx ?: 0f,
-                    cy = sample?.cy ?: 0f,
-                    imageWidth = sample?.width ?: 0,
-                    imageHeight = sample?.height ?: 0,
-                    marker = marker,
-                    trail = trail,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilledTonalButton(
-                onClick = {
-                    val current = ui.track?.pose ?: return@FilledTonalButton
-                    marker = markerInFront(current)
+        if (confirmNew) {
+            AlertDialog(
+                onDismissRequest = { confirmNew = false },
+                title = { Text("Start a new scan?") },
+                text = { Text("This clears the current scan.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmNew = false
+                        onBegin(true)
+                    }) { Text("Start") }
                 },
-                enabled = ui.track?.pose != null,
-                modifier = Modifier.weight(1f),
-            ) {
-                Text(if (marker == null) "Place marker" else "Move marker")
-            }
-            Button(onClick = onSnapshot, modifier = Modifier.weight(1f)) {
-                Text("Save frame")
-            }
-        }
-    }
-        if (settingsOpen) {
-            SettingsPanel(
-                ui = ui,
-                applied = applied,
-                onSelect = onSelect,
-                showFrontier = showFrontier,
-                onFrontier = {
-                    showFrontier = it
-                    onFrontier(it)
+                dismissButton = {
+                    TextButton(onClick = { confirmNew = false }) { Text("Cancel") }
                 },
-                onApply = {
-                    applied = it
-                    resetEpoch++
-                    onApply(it)
-                    settingsOpen = false
-                },
-                onReset = {
-                    resetEpoch++
-                    onApply(applied)
-                    settingsOpen = false
-                },
-                onClose = { settingsOpen = false },
             )
         }
     }
@@ -353,6 +372,305 @@ private fun trackLine(sample: TrackSample): String {
     }
     if (sample.fps <= 0f) return name
     return "$name · ${"%.1f".format(sample.fps)} fps · ${sample.frameMs} ms"
+}
+
+@Composable
+private fun ScanChrome(
+    ui: CaptureUi,
+    mode: PreviewMode,
+    chunks: Int,
+    pendingChunks: Int,
+    chunkLimit: Int,
+    recording: Boolean,
+    recorded: Int,
+    onMode: (PreviewMode) -> Unit,
+    onRecord: (Boolean) -> Unit,
+    onReset: () -> Unit,
+    onSettings: () -> Unit,
+    onPrimary: () -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val status = buildString {
+        append(ui.headline)
+        if (chunkLimit > 0) append("  ·  $chunks/$chunkLimit")
+        if (pendingChunks > 0) append("  ·  $pendingChunks waiting")
+        ui.track?.let { append("  ·  ${trackLine(it)}") }
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(18.dp))
+                .background(scheme.surface.copy(alpha = 0.45f))
+                .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                status,
+                color = scheme.onSurface,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onReset) { Text("Reset") }
+            TextButton(onClick = onSettings) { Text("Settings") }
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    if (recording) "Recording $recorded" else "Record",
+                    color = scheme.onSurface,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(scheme.surface.copy(alpha = 0.45f))
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+                Switch(checked = recording, onCheckedChange = onRecord)
+            }
+            PreviewSwitch(mode = mode, onMode = onMode)
+            Button(onClick = onPrimary, modifier = Modifier.fillMaxWidth()) {
+                Text(if (ui.phase == "scanning") "Stop" else "Start scanning")
+            }
+        }
+    }
+}
+
+@Composable
+internal fun RefineScreen(
+    ui: CaptureUi,
+    onPreview: (VkPreview) -> Unit,
+    onPreviewGone: (VkPreview) -> Unit,
+    onView: (FloatArray, Float, Float, Float, Float, Int, Int) -> Unit,
+    onSettings: () -> Unit,
+    onBack: () -> Unit,
+    onSplat: () -> Unit,
+    firstPose: () -> FloatArray?,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val refining = ui.phase == "refining"
+    val review = ui.phase == "review"
+    val lookHolder = remember { LookHolder() }
+    val lookTick = remember { mutableIntStateOf(0) }
+    val gestures = remember { LookGestures(lookHolder, lookTick) }
+    LaunchedEffect(ui.phase) {
+        if (ui.phase != "review") return@LaunchedEffect
+        repeat(8) {
+            val pose = firstPose()
+            if (pose != null) {
+                gestures.snap(pose)
+                return@LaunchedEffect
+            }
+            delay(200)
+        }
+    }
+    val poseRevision = lookTick.intValue
+    SideEffect {
+        val sample = ui.track ?: return@SideEffect
+        if (review && sample.fx > 0f && poseRevision != Int.MIN_VALUE) {
+            onView(
+                gestures.viewPose(),
+                sample.fx, sample.fy, sample.cx, sample.cy, sample.width, sample.height,
+            )
+        }
+    }
+    Box(Modifier.fillMaxSize().background(scheme.background)) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx -> VkPreview(ctx).also(onPreview) },
+            onRelease = onPreviewGone,
+        )
+        if (review) {
+            LookPad(
+                onLook = { dx, dy -> gestures.lookBy(dx, dy) },
+                onRoll = { delta -> gestures.twist(delta) },
+            )
+        }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(scheme.surface.copy(alpha = 0.45f))
+                    .padding(start = 14.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("Pose refinement", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
+                TextButton(onClick = onSettings, enabled = !refining) { Text("Settings") }
+            }
+            if (!refining) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (ui.refineDetail.isNotEmpty() || ui.saveLine.isNotEmpty()) {
+                        Text(
+                            listOf(ui.refineDetail, ui.saveLine).filter { it.isNotEmpty() }.joinToString("  ·  "),
+                            color = scheme.onSurface,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Trackball(enabled = true) { dx, dy -> gestures.flyBy(-dy * 0.008f, dx * 0.008f) }
+                    FilledTonalButton(
+                        onClick = { firstPose()?.let { gestures.snap(it) } },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("First frame") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilledTonalButton(onClick = onBack, modifier = Modifier.weight(1f)) { Text("Back") }
+                        Button(
+                            onClick = onSplat,
+                            enabled = ui.framesOnDisk,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("Start splatting") }
+                    }
+                }
+            } else {
+                Spacer(Modifier.height(1.dp))
+            }
+        }
+        if (refining) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(horizontal = 36.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (ui.refineDetail.isNotEmpty()) {
+                    Text(ui.refineDetail, color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
+                }
+                LinearProgressIndicator(
+                    progress = { ui.refineProgress.coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (ui.saveLine.isNotEmpty()) {
+                    Text(ui.saveLine, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun LookPad(onLook: (Float, Float) -> Unit, onRoll: (Float) -> Unit) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    val previous = HashMap<Long, Offset>()
+                    var twisting = false
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val down = event.changes.filter { it.pressed }
+                        if (down.isEmpty()) break
+                        if (down.size >= 2) {
+                            twisting = true
+                            val a = down[0]
+                            val b = down[1]
+                            val beforeA = previous[a.id.value]
+                            val beforeB = previous[b.id.value]
+                            if (beforeA != null && beforeB != null) {
+                                val was = atan2(beforeB.y - beforeA.y, beforeB.x - beforeA.x)
+                                val now = atan2(b.position.y - a.position.y, b.position.x - a.position.x)
+                                var delta = now - was
+                                val turn = (2.0 * PI).toFloat()
+                                if (delta > PI.toFloat()) delta -= turn
+                                if (delta < -PI.toFloat()) delta += turn
+                                if (delta != 0f) onRoll(delta)
+                            }
+                        } else if (!twisting) {
+                            val change = down[0]
+                            val delta = change.position - change.previousPosition
+                            if (delta.x != 0f || delta.y != 0f) onLook(delta.x, delta.y)
+                        }
+                        for (change in down) previous[change.id.value] = change.position
+                        event.changes.forEach { it.consume() }
+                    }
+                }
+            },
+    )
+}
+
+@Composable
+internal fun Trackball(enabled: Boolean, onDrag: (Float, Float) -> Unit) {
+    val knob = remember { Animatable(Offset.Zero, Offset.VectorConverter) }
+    val scope = rememberCoroutineScope()
+    Canvas(
+        Modifier
+            .size(124.dp)
+            .pointerInput(enabled) {
+                if (!enabled) return@pointerInput
+                val limit = minOf(size.width, size.height) / 2f - 22.dp.toPx()
+                detectDragGestures(
+                    onDrag = { change, drag ->
+                        change.consume()
+                        val next = clampOffset(knob.value + drag, limit)
+                        scope.launch { knob.snapTo(next) }
+                        onDrag(drag.x, drag.y)
+                    },
+                    onDragEnd = { scope.launch { knob.animateTo(Offset.Zero, spring(stiffness = Spring.StiffnessMediumLow)) } },
+                    onDragCancel = { scope.launch { knob.animateTo(Offset.Zero, spring(stiffness = Spring.StiffnessMediumLow)) } },
+                )
+            },
+    ) {
+        val radius = size.minDimension / 2f
+        drawLitBall(center, radius, bright = false)
+        drawLitBall(center + knob.value, 16.dp.toPx(), bright = true)
+    }
+}
+
+private fun DrawScope.drawLitBall(center: Offset, radius: Float, bright: Boolean) {
+    val light = center + Offset(-radius * 0.36f, -radius * 0.42f)
+    val body = if (bright) {
+        listOf(Color(0xFFF4F8FF), Color(0xFF9EC4F8), Color(0xFF24558C))
+    } else {
+        listOf(Color(0xFFE7F0FC), Color(0xFF4F86C4), Color(0xFF101A2C))
+    }
+    drawCircle(
+        brush = Brush.radialGradient(body, center = light, radius = radius * 1.7f),
+        radius = radius,
+        center = center,
+    )
+    drawCircle(
+        brush = Brush.radialGradient(
+            listOf(Color.White.copy(alpha = if (bright) 0.85f else 0.45f), Color.Transparent),
+            center = light,
+            radius = radius * 0.42f,
+        ),
+        radius = radius * 0.42f,
+        center = light,
+    )
+    drawCircle(
+        color = Color.White.copy(alpha = 0.22f),
+        radius = radius - 1.dp.toPx(),
+        center = center,
+        style = Stroke(width = 1.4.dp.toPx()),
+    )
+}
+
+private fun clampOffset(offset: Offset, limit: Float): Offset {
+    val length = offset.getDistance()
+    if (length <= limit || length == 0f) return offset
+    return offset * (limit / length)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -425,7 +743,7 @@ private fun ProfileMenu(
 }
 
 @Composable
-private fun SettingsPanel(
+internal fun SettingsPanel(
     ui: CaptureUi,
     applied: ScanSettings,
     showFrontier: Boolean,
@@ -433,6 +751,7 @@ private fun SettingsPanel(
     onSelect: (String) -> Unit,
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
+    onRefine: (Boolean, Int) -> Unit,
     onClose: () -> Unit,
 ) {
     var voxel by remember { mutableIntStateOf(applied.voxelCm) }
@@ -440,22 +759,26 @@ private fun SettingsPanel(
     var minSize by remember { mutableIntStateOf(applied.minSize) }
     var levels by remember { mutableIntStateOf(applied.pyramidLevels) }
     var depth by remember { mutableIntStateOf(applied.depthMeters.toInt()) }
+    var closeLoops by remember { mutableStateOf(applied.closeLoops) }
+    var reviewVoxel by remember { mutableIntStateOf(applied.reviewVoxelCm) }
+    val scheme = MaterialTheme.colorScheme
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background.copy(alpha = 0.96f))
+            .background(scheme.background)
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(horizontal = 16.dp, vertical = 12.dp)
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Settings", color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.titleLarge)
+            Text("Settings", color = scheme.onSurface, style = MaterialTheme.typography.titleLarge)
             TextButton(onClick = onClose) { Text("Close") }
         }
+        Text("Tracking", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
         Text(
             "Apply and Reset both restart tracking and clear the mesh. The camera stays on.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = scheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
         if (ui.profiles.isNotEmpty()) {
@@ -479,13 +802,12 @@ private fun SettingsPanel(
                 Text("Unscanned edge", style = MaterialTheme.typography.labelLarge)
                 Text(
                     "Amber outline. Applies immediately and does not restart tracking.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = scheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
             Switch(checked = showFrontier, onCheckedChange = onFrontier)
         }
-        Spacer(Modifier.height(4.dp))
         Button(
             onClick = {
                 onApply(
@@ -495,12 +817,56 @@ private fun SettingsPanel(
                         minSize = minSize,
                         pyramidLevels = levels,
                         depthMeters = depth.toFloat(),
+                        reviewVoxelCm = reviewVoxel,
+                        closeLoops = closeLoops,
                     ),
                 )
             },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Apply") }
         FilledTonalButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) { Text("Reset") }
+        Text("Pose refinement", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Used after Stop. These apply immediately and do not restart tracking.",
+            color = scheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Close loops", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    "After Stop, search for a return to a place already scanned.",
+                    color = scheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(
+                checked = closeLoops,
+                onCheckedChange = {
+                    closeLoops = it
+                    onRefine(it, reviewVoxel)
+                },
+            )
+        }
+        ChoiceRow("Review mesh", listOf(2, 4, 8), reviewVoxel, { "$it cm" }) {
+            reviewVoxel = it
+            onRefine(closeLoops, it)
+        }
+        Text(
+            "Finer than the live scan mesh. 2 cm can fill the chunk budget in a large room.",
+            color = scheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text("Splatting", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Splatting settings will be added with that window.",
+            color = scheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 
@@ -521,17 +887,3 @@ private fun <T> ChoiceRow(label: String, values: List<T>, selected: T, title: (T
     }
 }
 
-@Composable
-private fun PreviewCard(
-    modifier: Modifier,
-    content: @Composable () -> Unit,
-) {
-    Box(
-        modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(MaterialTheme.colorScheme.surfaceContainer),
-    ) {
-        content()
-    }
-}

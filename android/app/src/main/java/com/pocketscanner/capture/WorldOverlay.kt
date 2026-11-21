@@ -8,6 +8,10 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
+import kotlin.math.asin
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 internal data class Vec3(val x: Float, val y: Float, val z: Float) {
@@ -30,6 +34,95 @@ internal fun markerInFront(pose: FloatArray): Marker {
 }
 
 internal fun cameraPosition(pose: FloatArray) = Vec3(pose[3], pose[7], pose[11])
+
+internal data class Look(
+    val yaw: Float,
+    val pitch: Float,
+    val roll: Float,
+    val position: Vec3,
+)
+
+/** Upright view along the pose's look direction. Roll starts at zero. */
+internal fun lookFromPose(pose: FloatArray): Look {
+    val forwardY = pose[6].coerceIn(-1f, 1f)
+    val pitch = asin(forwardY).coerceIn(-PITCH_LIMIT, PITCH_LIMIT)
+    val yaw = atan2(pose[2], pose[10])
+    return Look(yaw, pitch, 0f, cameraPosition(pose))
+}
+
+/** Camera-to-world pose. Yaw around world up, then pitch, then roll. Pitch stays short of upside down. */
+internal fun poseOf(look: Look): FloatArray {
+    val rotation = mul3(rotationY(look.yaw), mul3(rotationX(-look.pitch), rotationZ(look.roll)))
+    val pose = FloatArray(16)
+    for (row in 0 until 3) {
+        for (col in 0 until 3) pose[row * 4 + col] = rotation[row * 3 + col]
+    }
+    pose[3] = look.position.x
+    pose[7] = look.position.y
+    pose[11] = look.position.z
+    pose[15] = 1f
+    return pose
+}
+
+internal fun fly(look: Look, forward: Float, strafe: Float): Look {
+    val pose = poseOf(look)
+    val right = Vec3(pose[0], pose[4], pose[8])
+    val ahead = Vec3(pose[2], pose[6], pose[10])
+    return look.copy(position = look.position + ahead * forward + right * strafe)
+}
+
+internal fun lookAround(look: Look, yawDelta: Float, pitchDelta: Float): Look {
+    return look.copy(
+        yaw = look.yaw + yawDelta,
+        pitch = (look.pitch + pitchDelta).coerceIn(-PITCH_LIMIT, PITCH_LIMIT),
+    )
+}
+
+internal fun rollBy(look: Look, delta: Float) = look.copy(roll = look.roll + delta)
+
+private const val PITCH_LIMIT = 1.2f
+
+private fun rotationX(angle: Float): FloatArray {
+    val c = cos(angle)
+    val s = sin(angle)
+    return floatArrayOf(
+        1f, 0f, 0f,
+        0f, c, -s,
+        0f, s, c,
+    )
+}
+
+private fun rotationY(angle: Float): FloatArray {
+    val c = cos(angle)
+    val s = sin(angle)
+    return floatArrayOf(
+        c, 0f, s,
+        0f, 1f, 0f,
+        -s, 0f, c,
+    )
+}
+
+private fun rotationZ(angle: Float): FloatArray {
+    val c = cos(angle)
+    val s = sin(angle)
+    return floatArrayOf(
+        c, -s, 0f,
+        s, c, 0f,
+        0f, 0f, 1f,
+    )
+}
+
+private fun mul3(left: FloatArray, right: FloatArray): FloatArray {
+    val out = FloatArray(9)
+    for (row in 0 until 3) {
+        for (col in 0 until 3) {
+            var sum = 0f
+            for (k in 0 until 3) sum += left[row * 3 + k] * right[k * 3 + col]
+            out[row * 3 + col] = sum
+        }
+    }
+    return out
+}
 
 @Composable
 internal fun WorldOverlay(
