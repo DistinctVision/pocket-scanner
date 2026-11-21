@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
@@ -15,6 +16,7 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -39,13 +41,20 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
@@ -125,6 +134,7 @@ class MainActivity : ComponentActivity() {
                     onRecord = { session?.setRecording(it) },
                     recordedCount = { session?.recordedCount() ?: 0 },
                     recording = session?.recordingEnabled() == true,
+                    onScans = { openScans(fromRefine = false) },
                 )
             }
         }
@@ -238,6 +248,7 @@ private fun ScanScreen(
     onRecord: (Boolean) -> Unit,
     recordedCount: () -> Int,
     recording: Boolean,
+    onScans: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
     var mode by remember { mutableStateOf(PreviewMode.Color) }
@@ -250,6 +261,8 @@ private fun ScanScreen(
     var record by remember { mutableStateOf(recording) }
     var recorded by remember { mutableIntStateOf(0) }
     var confirmNew by remember { mutableStateOf(false) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle, mode) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
@@ -287,6 +300,57 @@ private fun ScanScreen(
             }
         }
     }
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 28.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        "Scan",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Settings") },
+                        selected = false,
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            onSettings()
+                        },
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Scans") },
+                        selected = false,
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            onScans()
+                        },
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(if (record) "Recording $recorded" else "Record")
+                        Switch(
+                            checked = record,
+                            onCheckedChange = {
+                                record = it
+                                onRecord(it)
+                            },
+                        )
+                    }
+                }
+            }
+        },
+    ) {
+    val menuOpen = drawerState.currentValue == DrawerValue.Open || drawerState.targetValue == DrawerValue.Open
+    BackHandler(enabled = menuOpen) { scope.launch { drawerState.close() } }
     Box(Modifier.fillMaxSize().background(scheme.background)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -314,21 +378,15 @@ private fun ScanScreen(
             chunks = chunks,
             pendingChunks = pendingChunks,
             chunkLimit = chunkLimit,
-            recording = record,
-            recorded = recorded,
             onMode = {
                 mode = it
                 onPreviewKind(it.ordinal)
-            },
-            onRecord = {
-                record = it
-                onRecord(it)
             },
             onReset = {
                 resetEpoch++
                 onApply(applied)
             },
-            onSettings = onSettings,
+            onMenu = { scope.launch { drawerState.open() } },
             onPrimary = {
                 if (ui.phase == "scanning") onStop()
                 else if (ui.framesOnDisk) confirmNew = true
@@ -352,6 +410,7 @@ private fun ScanScreen(
             )
         }
     }
+    }
 }
 
 private fun captureLine(ui: CaptureUi): String = buildString {
@@ -359,6 +418,28 @@ private fun captureLine(ui: CaptureUi): String = buildString {
     if (isNotEmpty()) append("   ")
     append("capture ${"%.1f".format(ui.fps)} fps")
     if (ui.detachCount > 0) append("   drops ${ui.detachCount}")
+}
+
+@Composable
+internal fun MeshWorkBadge(chunks: Int, pending: Int) {
+    if (chunks <= 0 || pending <= 0) return
+    val done = ((chunks - pending) * 100 / chunks).coerceIn(0, 100)
+    val scheme = MaterialTheme.colorScheme
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(scheme.surface.copy(alpha = 0.45f))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(14.dp),
+            strokeWidth = 2.dp,
+            color = scheme.primary,
+        )
+        Text("Mesh $done%", color = scheme.onSurface, style = MaterialTheme.typography.bodyMedium)
+    }
 }
 
 private fun trackLine(sample: TrackSample): String {
@@ -381,12 +462,9 @@ private fun ScanChrome(
     chunks: Int,
     pendingChunks: Int,
     chunkLimit: Int,
-    recording: Boolean,
-    recorded: Int,
     onMode: (PreviewMode) -> Unit,
-    onRecord: (Boolean) -> Unit,
     onReset: () -> Unit,
-    onSettings: () -> Unit,
+    onMenu: () -> Unit,
     onPrimary: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
@@ -403,42 +481,29 @@ private fun ScanChrome(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.SpaceBetween,
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(18.dp))
-                .background(scheme.surface.copy(alpha = 0.45f))
-                .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                status,
-                color = scheme.onSurface,
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-            TextButton(onClick = onReset) { Text("Reset") }
-            TextButton(onClick = onSettings) { Text("Settings") }
-        }
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(scheme.surface.copy(alpha = 0.45f))
+                    .padding(start = 4.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                MenuButton(onMenu)
                 Text(
-                    if (recording) "Recording $recorded" else "Record",
+                    status,
                     color = scheme.onSurface,
                     style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(scheme.surface.copy(alpha = 0.45f))
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
-                Switch(checked = recording, onCheckedChange = onRecord)
+                TextButton(onClick = onReset) { Text("Reset") }
             }
+            MeshWorkBadge(chunks, pendingChunks)
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             PreviewSwitch(mode = mode, onMode = onMode)
             Button(onClick = onPrimary, modifier = Modifier.fillMaxWidth()) {
                 Text(if (ui.phase == "scanning") "Stop" else "Start scanning")
@@ -456,7 +521,12 @@ internal fun RefineScreen(
     onSettings: () -> Unit,
     onBack: () -> Unit,
     onSplat: () -> Unit,
+    onSave: () -> Unit,
+    onScans: () -> Unit,
     firstPose: () -> FloatArray?,
+    lens: () -> ViewLens?,
+    chunkCount: () -> Int,
+    chunkPending: () -> Int,
 ) {
     val scheme = MaterialTheme.colorScheme
     val refining = ui.phase == "refining"
@@ -464,6 +534,15 @@ internal fun RefineScreen(
     val lookHolder = remember { LookHolder() }
     val lookTick = remember { mutableIntStateOf(0) }
     val gestures = remember { LookGestures(lookHolder, lookTick) }
+    var meshChunks by remember { mutableIntStateOf(0) }
+    var meshPending by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            meshChunks = chunkCount()
+            meshPending = chunkPending()
+            delay(250)
+        }
+    }
     LaunchedEffect(ui.phase) {
         if (ui.phase != "review") return@LaunchedEffect
         repeat(8) {
@@ -476,15 +555,53 @@ internal fun RefineScreen(
         }
     }
     val poseRevision = lookTick.intValue
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
     SideEffect {
-        val sample = ui.track ?: return@SideEffect
-        if (review && sample.fx > 0f && poseRevision != Int.MIN_VALUE) {
-            onView(
-                gestures.viewPose(),
-                sample.fx, sample.fy, sample.cx, sample.cy, sample.width, sample.height,
-            )
+        val eye = lens() ?: return@SideEffect
+        if (review && eye.fx > 0f && poseRevision != Int.MIN_VALUE) {
+            onView(gestures.viewPose(), eye.fx, eye.fy, eye.cx, eye.cy, eye.width, eye.height)
         }
     }
+    val menuOpen = drawerState.currentValue == DrawerValue.Open || drawerState.targetValue == DrawerValue.Open
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        gesturesEnabled = menuOpen,
+        drawerContent = {
+            ModalDrawerSheet {
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 28.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        "Pose refinement",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Settings") },
+                        selected = false,
+                        onClick = {
+                            if (refining || ui.saving) return@NavigationDrawerItem
+                            scope.launch { drawerState.close() }
+                            onSettings()
+                        },
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Scans") },
+                        selected = false,
+                        onClick = {
+                            if (ui.saving) return@NavigationDrawerItem
+                            scope.launch { drawerState.close() }
+                            onScans()
+                        },
+                    )
+                }
+            }
+        },
+    ) {
+    BackHandler(enabled = menuOpen && !ui.saving) { scope.launch { drawerState.close() } }
+    BackHandler(enabled = ui.saving) {}
     Box(Modifier.fillMaxSize().background(scheme.background)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -504,17 +621,24 @@ internal fun RefineScreen(
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.SpaceBetween,
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(scheme.surface.copy(alpha = 0.45f))
-                    .padding(start = 14.dp, end = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text("Pose refinement", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
-                TextButton(onClick = onSettings, enabled = !refining) { Text("Settings") }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(scheme.surface.copy(alpha = 0.45f))
+                        .padding(start = 4.dp, end = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    MenuButton(onClick = { scope.launch { drawerState.open() } }, enabled = !refining)
+                    Text(
+                        "Pose refinement",
+                        color = scheme.onSurface,
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                MeshWorkBadge(meshChunks, meshPending)
             }
             if (!refining) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -532,6 +656,11 @@ internal fun RefineScreen(
                         onClick = { firstPose()?.let { gestures.snap(it) } },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("First frame") }
+                    Button(
+                        onClick = onSave,
+                        enabled = ui.framesOnDisk,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Save") }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilledTonalButton(onClick = onBack, modifier = Modifier.weight(1f)) { Text("Back") }
                         Button(
@@ -564,6 +693,42 @@ internal fun RefineScreen(
                     Text(ui.saveLine, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                 }
             }
+        }
+        if (ui.saving) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.72f))
+                    .clickable(enabled = true, onClick = {}),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    CircularProgressIndicator()
+                    Text("Saving", color = Color.White)
+                }
+            }
+        }
+    }
+    }
+}
+
+@Composable
+private fun MenuButton(onClick: () -> Unit, enabled: Boolean = true) {
+    IconButton(onClick = onClick, enabled = enabled) {
+        Canvas(Modifier.size(22.dp)) {
+            val color = Color.White.copy(alpha = if (enabled) 1f else 0.4f)
+            val stroke = 2.dp.toPx()
+            val left = 1.dp.toPx()
+            val right = size.width - 1.dp.toPx()
+            val y0 = size.height * 0.28f
+            val y1 = size.height * 0.5f
+            val y2 = size.height * 0.72f
+            drawLine(color, Offset(left, y0), Offset(right, y0), strokeWidth = stroke)
+            drawLine(color, Offset(left, y1), Offset(right, y1), strokeWidth = stroke)
+            drawLine(color, Offset(left, y2), Offset(right, y2), strokeWidth = stroke)
         }
     }
 }
@@ -643,7 +808,7 @@ private fun DrawScope.drawLitBall(center: Offset, radius: Float, bright: Boolean
     val body = if (bright) {
         listOf(Color(0xFFF4F8FF), Color(0xFF9EC4F8), Color(0xFF24558C))
     } else {
-        listOf(Color(0xFFE7F0FC), Color(0xFF4F86C4), Color(0xFF101A2C))
+        listOf(Color(0xFFFFFFFF), Color(0xFFD8D8DE), Color(0xFF8E8E96))
     }
     drawCircle(
         brush = Brush.radialGradient(body, center = light, radius = radius * 1.7f),

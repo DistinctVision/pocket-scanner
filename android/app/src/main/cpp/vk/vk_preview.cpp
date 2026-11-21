@@ -365,8 +365,18 @@ int Preview::chunkCap() const { return volume.chunkCap(); }
 
 bool Preview::redraw() {
     waitInFlight();
-    present(false, false, true);
-    return volume.pendingFresh();
+    const bool fresh = volume.pendingFresh();
+    // The camera pose is shown by this present. Keep that rate steady after the
+    // fresh queue is empty. Old chunks stay on the slower cadence.
+    bool integrate = true;
+    if (!fresh) {
+        idleStep = (idleStep + 1) % 4;
+        integrate = idleStep == 0;
+    } else {
+        idleStep = 0;
+    }
+    present(false, false, integrate);
+    return fresh;
 }
 
 bool Preview::present(bool upload, bool fromYuyv, bool integrate) {

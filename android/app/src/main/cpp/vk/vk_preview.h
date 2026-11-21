@@ -78,6 +78,7 @@ private:
     int viewWidth = 0;
     int viewHeight = 0;
     int frameWidth = 0;
+    int idleStep = 0;
     int frameHeight = 0;
     uint32_t rowTexels = 0;
     bool descriptorsDirty = true;

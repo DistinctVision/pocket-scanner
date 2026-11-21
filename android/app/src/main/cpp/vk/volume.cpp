@@ -395,9 +395,17 @@ int Volume::chunkCount() const {
 }
 
 int Volume::chunkPending() const {
+    std::vector<uint8_t> busy(chunks.size(), 0);
+    for (const Op& op : ops) {
+        if (op.slot < 0 || op.slot >= static_cast<int>(chunks.size())) continue;
+        if (!chunks[op.slot].live) continue;
+        busy[op.slot] = 1;
+    }
     int pending = 0;
-    for (const Chunk& chunk : chunks) {
-        if (chunk.live && !chunk.drawn) pending++;
+    for (int slot = 0; slot < static_cast<int>(chunks.size()); ++slot) {
+        if (!chunks[slot].live) continue;
+        // A chunk stays busy after its first draw while pose updates are still queued.
+        if (!chunks[slot].drawn || busy[slot]) pending++;
     }
     return pending;
 }

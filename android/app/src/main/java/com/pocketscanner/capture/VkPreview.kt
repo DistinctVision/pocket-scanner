@@ -315,10 +315,13 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
                     owner?.drainPose()
                     owner?.drain()
                 }
-                val more = view != null && handle != 0L && view.nativeRedraw(handle)
-                if (view != null && handle != 0L) view.publishChunks(handle)
+                if (view != null && handle != 0L) {
+                    view.nativeRedraw(handle)
+                    view.publishChunks(handle)
+                }
                 // A zero delay kept this thread inside marching cubes and the pose frame never ran.
-                loop?.postDelayed(this, if (more) 50L else 200L)
+                // Finished mesh used to fall back to 200 ms, which showed the review camera at 5 Hz.
+                loop?.postDelayed(this, 50L)
             }
         }
 

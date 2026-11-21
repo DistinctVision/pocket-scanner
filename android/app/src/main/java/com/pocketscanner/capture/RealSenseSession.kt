@@ -2,6 +2,8 @@ package com.pocketscanner.capture
 
 import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
+import android.provider.DocumentsContract
 import android.hardware.usb.UsbManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -50,6 +52,7 @@ data class CaptureUi(
     val refineDetail: String = "",
     val refineProgress: Float = 0f,
     val framesOnDisk: Boolean = false,
+    val saving: Boolean = false,
     val colorBitmap: Bitmap? = null,
     val profiles: List<String> = emptyList(),
     val selectedProfile: String = "",
@@ -144,8 +147,88 @@ class RealSenseSession(
     fun recordingEnabled(): Boolean = recordFrames.get()
 
     fun firstKeyframePose(): FloatArray? {
+        mesh?.oldestPose()?.let { return it }
         val frames = trackerRef?.copyKeyframes()?.frames ?: return null
         return frames.filter { it.id >= 0 }.minByOrNull { it.id }?.pose?.copyOf()
+    }
+
+    fun viewLens(): ViewLens? {
+        val track = ui.track
+        if (track != null && track.fx > 0f && track.width > 0) {
+            return ViewLens(track.fx, track.fy, track.cx, track.cy, track.width, track.height)
+        }
+        return mesh?.storedLens()
+    }
+
+    fun savePackage(uri: Uri) {
+        publish { it.copy(saving = true, saveLine = "") }
+        val app = context
+        Thread({
+            try {
+                val stream = app.contentResolver.openOutputStream(uri)
+                    ?: error("Could not open the file")
+                val count = stream.use { mesh?.writePackage(it, settings.get()) ?: 0 }
+                if (count <= 0) {
+                    try {
+                        DocumentsContract.deleteDocument(app.contentResolver, uri)
+                    } catch (_: Exception) {
+                    }
+                    publish { it.copy(saving = false, saveLine = "Nothing to save") }
+                    return@Thread
+                }
+                ScanLibrary.persist(app, uri)
+                val name = ScanLibrary.displayName(app, uri)
+                ScanLibrary.remember(app, uri, name, count)
+                publish { it.copy(saving = false, saveLine = "Saved $count frames", framesOnDisk = true) }
+            } catch (error: Exception) {
+                Log.e(TAG, "save package", error)
+                publish { it.copy(saving = false, saveLine = error.message ?: "Save failed") }
+            }
+        }, "scan-save").start()
+    }
+
+    fun loadPackage(uri: Uri, onReady: (Boolean) -> Unit) {
+        val restorePhase = ui.phase
+        scanning.set(false)
+        mesh?.setTracking(false)
+        publish { it.copy(phase = "refining", refineDetail = "Loading", refineProgress = 0.2f, saveLine = "") }
+        val app = context
+        Thread({
+            try {
+                val doc = ScanPackage.read(app, uri)
+                val tuned = settings.get().copy(
+                    voxelCm = doc.voxelCm,
+                    reviewVoxelCm = doc.reviewVoxelCm,
+                )
+                settings.set(tuned)
+                mesh?.replaceSettings(tuned)
+                val count = mesh?.restore(doc) ?: 0
+                ScanLibrary.persist(app, uri)
+                ScanLibrary.remember(app, uri, ScanLibrary.displayName(app, uri), count)
+                publish {
+                    it.copy(
+                        phase = "review",
+                        framesOnDisk = count > 0,
+                        refineDetail = "Loaded $count frames",
+                        refineProgress = 1f,
+                        saveLine = "",
+                    )
+                }
+                main.post { onReady(true) }
+            } catch (error: Exception) {
+                Log.e(TAG, "load package", error)
+                publish {
+                    it.copy(
+                        phase = if (restorePhase == "review") "review" else "idle",
+                        refineDetail = if (restorePhase == "review") it.refineDetail else "",
+                        refineProgress = if (restorePhase == "review") it.refineProgress else 0f,
+                        framesOnDisk = it.framesOnDisk,
+                        saveLine = error.message ?: "Load failed",
+                    )
+                }
+                main.post { onReady(false) }
+            }
+        }, "scan-load").start()
     }
 
     fun setFrontier(enabled: Boolean) {
@@ -397,8 +480,10 @@ class RealSenseSession(
         }
         rs.setDevicesChangedCallback(listener)
         trackerRef = tracker
-        val dump = java.io.File(context.getExternalFilesDir(null), "mesh-dump")
-        val meshSync = MeshSync(tracker, { preview }, dump)
+        val files = context.getExternalFilesDir(null)
+        val dump = java.io.File(files, "mesh-dump")
+        val fullFrames = java.io.File(files, "full-frames")
+        val meshSync = MeshSync(tracker, { preview }, dump, fullFrames)
         meshSync.setRecording(recordFrames.get())
         mesh = meshSync
         meshSync.start()

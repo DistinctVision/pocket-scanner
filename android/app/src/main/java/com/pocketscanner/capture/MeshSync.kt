@@ -1,9 +1,16 @@
 package com.pocketscanner.capture
 
 import android.util.Log
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -32,15 +39,19 @@ class MeshSync(
     private val tracker: StellaTracker,
     private val preview: () -> VkPreview?,
     private val dumpDir: File? = null,
+    private val fullDir: File? = null,
 ) {
     private val running = AtomicBoolean(true)
     private val acceptFrames = AtomicBoolean(false)
     private val settings = AtomicReference(ScanSettings())
     private val camera = AtomicReference<SlamCamera?>(null)
     private val ring = LinkedHashMap<Long, Snap>()
+    private val fullFiles = LinkedHashMap<Long, Stored>()
     private val held = HashMap<Int, Held>()
+    private var lens: ViewLens? = null
     private val covered = HashMap<Int, Held>()
     private val missed = HashSet<Int>()
+    private val bare = HashSet<Int>()
     private val trackedPose = AtomicReference<Tracked?>(null)
     private var nextCoverId = COVER_ID_BASE
     private var loggedRing = false
@@ -49,15 +60,26 @@ class MeshSync(
     private val recording = AtomicBoolean(false)
     private val recorded = AtomicInteger(0)
     private val thread = Thread(::loop, "mesh-sync")
+    private val saveQueue = ArrayBlockingQueue<SaveJob>(2)
+    private val saving = ConcurrentHashMap.newKeySet<Long>()
+    private val saveEpoch = AtomicInteger(0)
+    private val publishedTime = AtomicReference(Double.NaN)
+    private val saver = Thread(::saveLoop, "frame-save")
+    private var loggedDrop = false
 
     fun start() {
+        fullDir?.mkdirs()
+        fullDir?.listFiles()?.forEach { it.delete() }
         thread.start()
+        saver.start()
     }
 
     fun close() {
         running.set(false)
         thread.interrupt()
+        saver.interrupt()
         thread.join(2000)
+        saver.join(2000)
     }
 
     fun setCamera(next: SlamCamera?) {
@@ -66,18 +88,26 @@ class MeshSync(
 
     fun apply(next: ScanSettings) {
         settings.set(next)
-        synchronized(lock) {
+        saveEpoch.incrementAndGet()
+        val doomed = synchronized(lock) {
+            val files = collectFullFiles()
             ring.clear()
+            fullFiles.clear()
             held.clear()
             covered.clear()
             missed.clear()
+            bare.clear()
+            lens = null
             nextCoverId = COVER_ID_BASE
             loggedRing = false
+            publishedTime.set(Double.NaN)
             if (recording.get()) {
                 recorded.set(0)
                 resetDump()
             }
+            files
         }
+        doomed.forEach { it.delete() }
         preview()?.meshConfigure(next.voxelCm / 100f, next.depthMeters)
     }
 
@@ -132,30 +162,181 @@ class MeshSync(
         return written
     }
 
+    fun storedLens(): ViewLens? = synchronized(lock) { lens }
+
+    fun oldestPose(): FloatArray? = synchronized(lock) {
+        held.entries.filter { it.key < COVER_ID_BASE }.minByOrNull { it.key }?.value?.pose?.copyOf()
+    }
+
+    fun writePackage(dest: java.io.OutputStream, scan: ScanSettings): Int {
+        val shots = synchronized(lock) {
+            held.entries
+                .filter { it.key < COVER_ID_BASE && it.value.full != null }
+                .sortedBy { it.key }
+                .map { (id, frame) ->
+                    val full = frame.full!!
+                    ShotMeta(
+                        id,
+                        frame.pose.copyOf(),
+                        full.width,
+                        full.height,
+                        full.fx,
+                        full.fy,
+                        full.cx,
+                        full.cy,
+                        full.depthScale,
+                        full.file,
+                    )
+                }
+        }
+        if (shots.isEmpty()) return 0
+        ScanPackage.write(dest, scan, shots) { meta ->
+            val raw = readStored(meta.file)
+            PackageShot(
+                meta.id,
+                meta.pose,
+                meta.width,
+                meta.height,
+                meta.fx,
+                meta.fy,
+                meta.cx,
+                meta.cy,
+                meta.depthScale,
+                raw.color,
+                raw.colorStride,
+                raw.depth,
+                raw.depthStride,
+            )
+        }
+        return shots.size
+    }
+
+    internal fun restore(doc: ScanDocument): Int {
+        saveEpoch.incrementAndGet()
+        val scan = settings.get()
+        val built = ArrayList<Pair<Int, Held>>(doc.frames.size)
+        var eye: ViewLens? = null
+        for (frame in doc.frames) {
+            if (frame.id >= COVER_ID_BASE) continue
+            val yuyv = rgbToYuyv(frame.rgb, frame.width, frame.height)
+            val model = SlamCamera(
+                w = frame.width,
+                h = frame.height,
+                fps = 30,
+                fx = frame.fx.toDouble(),
+                fy = frame.fy.toDouble(),
+                cx = frame.cx.toDouble(),
+                cy = frame.cy.toDouble(),
+                k1 = 0.0,
+                k2 = 0.0,
+                p1 = 0.0,
+                p2 = 0.0,
+                k3 = 0.0,
+                depthFactor = frame.depthScale.toDouble(),
+                note = "package",
+            )
+            val snap = downsample(
+                yuyv,
+                frame.width * 2,
+                frame.depth,
+                frame.width * 2,
+                frame.width,
+                frame.height,
+                scan.integrateWidth,
+                scan.integrateHeight,
+                model,
+                scan.depthMeters,
+            )
+            val stored = storeFrame(
+                frame.id.toLong(),
+                yuyv,
+                frame.width * 2,
+                frame.depth,
+                frame.width * 2,
+                frame.width,
+                frame.height,
+                frame.fx,
+                frame.fy,
+                frame.cx,
+                frame.cy,
+                frame.depthScale,
+            )
+            built.add(frame.id to Held(snap, frame.pose.copyOf(), stored))
+            if (eye == null) {
+                eye = ViewLens(frame.fx, frame.fy, frame.cx, frame.cy, frame.width, frame.height)
+            }
+        }
+        val doomed = synchronized(lock) {
+            val files = collectFullFiles()
+            ring.clear()
+            fullFiles.clear()
+            covered.clear()
+            missed.clear()
+            bare.clear()
+            held.clear()
+            for ((id, frame) in built) held[id] = frame
+            lens = eye
+            files
+        }
+        doomed.forEach { it.delete() }
+        val view = preview()
+        if (view != null) {
+            view.meshConfigure(scan.reviewVoxelCm / 100f, scan.depthMeters)
+            synchronized(lock) {
+                for ((id, frame) in held) {
+                    view.meshUpsert(
+                        id,
+                        frame.pose,
+                        frame.snap.depth,
+                        frame.snap.color,
+                        frame.snap.width,
+                        frame.snap.height,
+                        frame.snap.fx,
+                        frame.snap.fy,
+                        frame.snap.cx,
+                        frame.snap.cy,
+                        force = true,
+                    )
+                }
+            }
+        }
+        return built.size
+    }
+
     fun adoptPoses() {
         val view = preview() ?: return
         val poll = tracker.copyKeyframes()
         synchronized(lock) {
             for (id in covered.keys.toList()) view.meshErase(id)
             covered.clear()
+            val live = HashSet<Int>()
             for (keyframe in poll.frames) {
+                live.add(keyframe.id)
                 val heldFrame = held[keyframe.id] ?: continue
-                held[keyframe.id] = Held(heldFrame.snap, keyframe.pose.copyOf())
-                view.meshUpsert(
-                    keyframe.id,
-                    keyframe.pose,
-                    heldFrame.snap.depth,
-                    heldFrame.snap.color,
-                    heldFrame.snap.width,
-                    heldFrame.snap.height,
-                    heldFrame.snap.fx,
-                    heldFrame.snap.fy,
-                    heldFrame.snap.cx,
-                    heldFrame.snap.cy,
-                    force = true,
-                )
+                held[keyframe.id] = Held(heldFrame.snap, keyframe.pose.copyOf(), heldFrame.full)
+                upsertHeld(view, keyframe.id, held[keyframe.id]!!)
+            }
+            for ((id, frame) in held) {
+                if (id in live) continue
+                upsertHeld(view, id, frame)
             }
         }
+    }
+
+    private fun upsertHeld(view: VkPreview, id: Int, frame: Held) {
+        view.meshUpsert(
+            id,
+            frame.pose,
+            frame.snap.depth,
+            frame.snap.color,
+            frame.snap.width,
+            frame.snap.height,
+            frame.snap.fx,
+            frame.snap.fy,
+            frame.snap.cx,
+            frame.snap.cy,
+            force = true,
+        )
     }
 
     fun setTracking(active: Boolean) {
@@ -183,8 +364,34 @@ class MeshSync(
         val outH = scan.integrateHeight
         if (outW <= 0 || outH <= 0 || outW > width || outH > height) return
         val snap = downsample(color, colorStride, depth, depthStride, width, height, outW, outH, model, scan.depthMeters)
+        val bits = java.lang.Double.doubleToRawLongBits(timestampSec)
+        if (acceptFrames.get() && fullDir != null) {
+            val job = SaveJob(
+                saveEpoch.get(),
+                bits,
+                color,
+                colorStride,
+                depth,
+                depthStride,
+                width,
+                height,
+                model.fx.toFloat(),
+                model.fy.toFloat(),
+                model.cx.toFloat(),
+                model.cy.toFloat(),
+                model.depthFactor.toFloat(),
+            )
+            saving.add(bits)
+            if (!saveQueue.offer(job)) {
+                saving.remove(bits)
+                if (!loggedDrop) {
+                    loggedDrop = true
+                    Log.i(TAG, "frame save queue full, dropping a full frame")
+                }
+            }
+        }
         synchronized(lock) {
-            ring[java.lang.Double.doubleToRawLongBits(timestampSec)] = snap
+            ring[bits] = snap
             val iterator = ring.entries.iterator()
             while (ring.size > RING_KEEP && iterator.hasNext()) {
                 iterator.next()
@@ -197,9 +404,34 @@ class MeshSync(
         }
     }
 
-    private fun takeSnap(timestampSec: Double): Snap? {
+    private fun takeGrab(timestampSec: Double): Take? {
+        val key = matchKey(timestampSec) ?: return null
+        if (!fullFiles.containsKey(key) && saving.contains(key)) return Take.Later
+        val snap = ring.remove(key) ?: return null
+        return Take.Ready(Grab(snap, fullFiles.remove(key)))
+    }
+
+    private fun dropOlderThan(published: Double, doomed: MutableList<File>) {
+        publishedTime.set(published)
+        val snaps = ring.entries.iterator()
+        while (snaps.hasNext()) {
+            val time = java.lang.Double.longBitsToDouble(snaps.next().key)
+            if (time < published) snaps.remove()
+        }
+        val full = fullFiles.entries.iterator()
+        while (full.hasNext()) {
+            val entry = full.next()
+            val time = java.lang.Double.longBitsToDouble(entry.key)
+            if (time < published) {
+                doomed.add(entry.value.file)
+                full.remove()
+            }
+        }
+    }
+
+    private fun matchKey(timestampSec: Double): Long? {
         val bits = java.lang.Double.doubleToRawLongBits(timestampSec)
-        ring.remove(bits)?.let { return it }
+        if (ring.containsKey(bits)) return bits
         var bestKey = 0L
         var bestDt = 0.05
         var found = false
@@ -211,8 +443,7 @@ class MeshSync(
                 found = true
             }
         }
-        if (!found) return null
-        return ring.remove(bestKey)
+        return if (found) bestKey else null
     }
 
     private fun peekSnap(timestampSec: Double): Snap? {
@@ -252,6 +483,7 @@ class MeshSync(
         val view = preview() ?: return
         val poll = tracker.copyKeyframes()
         val current = poll.frames
+        val doomed = ArrayList<File>()
         synchronized(lock) {
             if (!acceptFrames.get()) {
                 trackedPose.set(null)
@@ -266,7 +498,10 @@ class MeshSync(
                     // Drop the tracking frame first, so the keyframe is not rejected as a duplicate of it.
                     dropCoveredNear(view, keyframe.pose)
                     val existing = held[keyframe.id]
-                    val snap = existing?.snap ?: takeSnap(keyframe.timestampSec)
+                    val taken = if (existing == null) takeGrab(keyframe.timestampSec) else null
+                    if (taken is Take.Later) continue
+                    val grab = (taken as? Take.Ready)?.grab
+                    val snap = existing?.snap ?: grab?.snap
                     if (snap == null) {
                         if (missed.add(keyframe.id)) {
                             Log.i(TAG, "keyframe ${keyframe.id} has no depth snap, ring ${ring.size}")
@@ -275,20 +510,18 @@ class MeshSync(
                     }
                     if (existing != null && !moved(existing.pose, keyframe.pose)) continue
                     if (!upsert(view, keyframe.id, keyframe.pose, snap)) continue
-                    held[keyframe.id] = Held(snap, keyframe.pose.copyOf())
+                    val full = existing?.full ?: grab?.full
+                    if (full == null && bare.add(keyframe.id)) {
+                        Log.i(TAG, "keyframe ${keyframe.id} has no full frame")
+                    }
+                    held[keyframe.id] = Held(snap, keyframe.pose.copyOf(), full)
                     upserts++
                 }
-                if (!published.isNaN()) {
-                    val iterator = ring.entries.iterator()
-                    while (iterator.hasNext()) {
-                        val time = java.lang.Double.longBitsToDouble(iterator.next().key)
-                        if (time < published) iterator.remove()
-                    }
-                }
+                if (!published.isNaN()) dropOlderThan(published, doomed)
                 if (poll.complete) {
                     val gone = held.keys.filter { it !in live }
                     for (id in gone) {
-                        held.remove(id)
+                        held.remove(id)?.full?.file?.let { doomed.add(it) }
                         view.meshErase(id)
                     }
                 }
@@ -303,6 +536,7 @@ class MeshSync(
                 )
             }
         }
+        doomed.forEach { it.delete() }
     }
 
     private fun dropCoveredNear(view: VkPreview, pose: FloatArray) {
@@ -389,12 +623,211 @@ class MeshSync(
 
     private class Tracked(val timestampSec: Double, val pose: FloatArray)
 
-    private class Held(val snap: Snap, val pose: FloatArray)
+    private class Grab(val snap: Snap, val full: Stored?)
+
+    private class Stored(
+        val file: File,
+        val width: Int,
+        val height: Int,
+        val colorStride: Int,
+        val depthStride: Int,
+        val fx: Float,
+        val fy: Float,
+        val cx: Float,
+        val cy: Float,
+        val depthScale: Float,
+    )
+
+    private class SaveJob(
+        val epoch: Int,
+        val bits: Long,
+        val color: ByteArray,
+        val colorStride: Int,
+        val depth: ByteArray,
+        val depthStride: Int,
+        val width: Int,
+        val height: Int,
+        val fx: Float,
+        val fy: Float,
+        val cx: Float,
+        val cy: Float,
+        val depthScale: Float,
+    )
+
+    private sealed class Take {
+        class Ready(val grab: Grab) : Take()
+        data object Later : Take()
+    }
+
+    private class Held(val snap: Snap, val pose: FloatArray, val full: Stored? = null)
+
+    private fun collectFullFiles(): List<File> {
+        val files = ArrayList<File>()
+        fullFiles.values.forEach { files.add(it.file) }
+        held.values.forEach { it.full?.file?.let(files::add) }
+        return files
+    }
+
+    private fun saveLoop() {
+        while (running.get()) {
+            val job = try {
+                saveQueue.poll(200, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                null
+            } ?: continue
+            try {
+                saveJob(job)
+            } catch (error: Exception) {
+                Log.w(TAG, "save frame: ${error.message}")
+            } finally {
+                saving.remove(job.bits)
+            }
+        }
+    }
+
+    private fun saveJob(job: SaveJob) {
+        val dir = fullDir ?: return
+        if (job.epoch != saveEpoch.get()) return
+        val time = java.lang.Double.longBitsToDouble(job.bits)
+        val published = publishedTime.get()
+        if (!published.isNaN() && time < published) return
+        dir.mkdirs()
+        val dest = File(dir, "${job.bits}.bin")
+        val tmp = File(dir, "${job.bits}.tmp")
+        writeStored(
+            tmp,
+            job.color,
+            job.colorStride,
+            job.depth,
+            job.depthStride,
+            job.width,
+            job.height,
+            job.fx,
+            job.fy,
+            job.cx,
+            job.cy,
+            job.depthScale,
+        )
+        if (!tmp.renameTo(dest)) {
+            tmp.copyTo(dest, overwrite = true)
+            tmp.delete()
+        }
+        val overflow = ArrayList<File>()
+        synchronized(lock) {
+            val publishedNow = publishedTime.get()
+            if (job.epoch != saveEpoch.get() || (!publishedNow.isNaN() && time < publishedNow)) {
+                dest.delete()
+                return
+            }
+            fullFiles[job.bits] = Stored(
+                dest,
+                job.width,
+                job.height,
+                job.colorStride,
+                job.depthStride,
+                job.fx,
+                job.fy,
+                job.cx,
+                job.cy,
+                job.depthScale,
+            )
+            while (fullFiles.size > FULL_DISK_KEEP) {
+                val oldest = fullFiles.entries.iterator()
+                if (!oldest.hasNext()) break
+                overflow.add(oldest.next().value.file)
+                oldest.remove()
+            }
+        }
+        overflow.forEach { it.delete() }
+    }
+
+    private fun storeFrame(
+        id: Long,
+        color: ByteArray,
+        colorStride: Int,
+        depth: ByteArray,
+        depthStride: Int,
+        width: Int,
+        height: Int,
+        fx: Float,
+        fy: Float,
+        cx: Float,
+        cy: Float,
+        depthScale: Float,
+    ): Stored {
+        val dir = fullDir ?: error("No frame directory")
+        dir.mkdirs()
+        val dest = File(dir, "kept-$id.bin")
+        writeStored(dest, color, colorStride, depth, depthStride, width, height, fx, fy, cx, cy, depthScale)
+        return Stored(dest, width, height, colorStride, depthStride, fx, fy, cx, cy, depthScale)
+    }
 
     companion object {
         private const val TAG = "pocket-mesh"
         private const val RING_KEEP = 1500
+        private const val FULL_DISK_KEEP = 160
         private const val COVER_ID_BASE = 1_000_000_000
+        private const val FRAME_MAGIC = 0x50534631
+
+        private class RawFrame(
+            val color: ByteArray,
+            val colorStride: Int,
+            val depth: ByteArray,
+            val depthStride: Int,
+        )
+
+        private fun writeStored(
+            dest: File,
+            color: ByteArray,
+            colorStride: Int,
+            depth: ByteArray,
+            depthStride: Int,
+            width: Int,
+            height: Int,
+            fx: Float,
+            fy: Float,
+            cx: Float,
+            cy: Float,
+            depthScale: Float,
+        ) {
+            DataOutputStream(FileOutputStream(dest).buffered()).use { out ->
+                out.writeInt(FRAME_MAGIC)
+                out.writeInt(width)
+                out.writeInt(height)
+                out.writeInt(colorStride)
+                out.writeInt(depthStride)
+                out.writeFloat(fx)
+                out.writeFloat(fy)
+                out.writeFloat(cx)
+                out.writeFloat(cy)
+                out.writeFloat(depthScale)
+                out.writeInt(color.size)
+                out.write(color)
+                out.writeInt(depth.size)
+                out.write(depth)
+            }
+        }
+
+        private fun readStored(file: File): RawFrame {
+            DataInputStream(FileInputStream(file).buffered()).use { input ->
+                val magic = input.readInt()
+                if (magic != FRAME_MAGIC) error("Bad frame file")
+                input.readInt()
+                input.readInt()
+                val colorStride = input.readInt()
+                val depthStride = input.readInt()
+                input.readFloat()
+                input.readFloat()
+                input.readFloat()
+                input.readFloat()
+                input.readFloat()
+                val color = ByteArray(input.readInt())
+                input.readFully(color)
+                val depth = ByteArray(input.readInt())
+                input.readFully(depth)
+                return RawFrame(color, colorStride, depth, depthStride)
+            }
+        }
 
         private fun downsample(
             color: ByteArray,
@@ -484,6 +917,65 @@ class MeshSync(
                 cy = model.cy.toFloat() * scaleY,
                 addedNs = System.nanoTime(),
             )
+        }
+
+        private fun rgbToYuyv(rgb: ByteArray, width: Int, height: Int): ByteArray {
+            val out = ByteArray(width * height * 2)
+            var i = 0
+            var o = 0
+            repeat(height) {
+                var x = 0
+                while (x < width) {
+                    val r0 = rgb[i].toInt() and 255
+                    val g0 = rgb[i + 1].toInt() and 255
+                    val b0 = rgb[i + 2].toInt() and 255
+                    val r1: Int
+                    val g1: Int
+                    val b1: Int
+                    if (x + 1 < width) {
+                        r1 = rgb[i + 3].toInt() and 255
+                        g1 = rgb[i + 4].toInt() and 255
+                        b1 = rgb[i + 5].toInt() and 255
+                        i += 6
+                    } else {
+                        r1 = r0
+                        g1 = g0
+                        b1 = b0
+                        i += 3
+                    }
+                    out[o++] = yuvLuma(r0, g0, b0)
+                    out[o++] = yuvChroma(r0, g0, b0, r1, g1, b1, chroma = true)
+                    out[o++] = yuvLuma(r1, g1, b1)
+                    out[o++] = yuvChroma(r0, g0, b0, r1, g1, b1, chroma = false)
+                    x += 2
+                }
+            }
+            return out
+        }
+
+        private fun yuvLuma(red: Int, green: Int, blue: Int): Byte {
+            val value = ((66 * red + 129 * green + 25 * blue + 128) shr 8) + 16
+            return value.coerceIn(0, 255).toByte()
+        }
+
+        private fun yuvChroma(
+            r0: Int,
+            g0: Int,
+            b0: Int,
+            r1: Int,
+            g1: Int,
+            b1: Int,
+            chroma: Boolean,
+        ): Byte {
+            val red = (r0 + r1) / 2
+            val green = (g0 + g1) / 2
+            val blue = (b0 + b1) / 2
+            val value = if (chroma) {
+                ((-38 * red - 74 * green + 112 * blue + 128) shr 8) + 128
+            } else {
+                ((112 * red - 94 * green - 18 * blue + 128) shr 8) + 128
+            }
+            return value.coerceIn(0, 255).toByte()
         }
 
         private fun yuv(luma: Int, u: Int, v: Int): Triple<Int, Int, Int> {

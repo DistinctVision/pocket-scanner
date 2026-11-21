@@ -7,11 +7,17 @@ import androidx.activity.addCallback
 import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.LaunchedEffect
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class RefineActivity : ComponentActivity() {
     private var session: RealSenseSession? = null
     private var preview: VkPreview? = null
     private var retained = false
+    private val createScan = registerForActivityResult(CreatePersistableDocument()) { uri ->
+        if (uri != null) session?.savePackage(uri)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,7 +46,17 @@ class RefineActivity : ComponentActivity() {
                     onSettings = { openSettings() },
                     onBack = { leave() },
                     onSplat = { created.noteSplatting() },
+                    onSave = {
+                        if (!CaptureRuntime.ui.saving) {
+                            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                            createScan.launch("scan-$stamp.pscan")
+                        }
+                    },
+                    onScans = { openScans(fromRefine = true) },
                     firstPose = { created.firstKeyframePose() },
+                    lens = { created.viewLens() },
+                    chunkCount = { preview?.chunkCount() ?: 0 },
+                    chunkPending = { preview?.chunkPending() ?: 0 },
                 )
             }
         }

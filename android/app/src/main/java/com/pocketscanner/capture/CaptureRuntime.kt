@@ -40,11 +40,21 @@ internal fun Activity.openSettings() {
     startMotion(Intent(this, SettingsActivity::class.java), R.anim.enter_from_bottom, R.anim.fade_hold)
 }
 
+internal fun Activity.openScans(fromRefine: Boolean) {
+    val intent = Intent(this, ScansActivity::class.java)
+        .putExtra(ScansActivity.EXTRA_FROM_REFINE, fromRefine)
+    startMotion(intent, R.anim.enter_from_bottom, R.anim.fade_hold)
+}
+
 internal fun Activity.finishBack() {
     finishMotion(R.anim.enter_from_left, R.anim.exit_to_right)
 }
 
 internal fun Activity.finishSettings() {
+    finishMotion(R.anim.fade_hold, R.anim.exit_to_bottom)
+}
+
+internal fun Activity.finishScans() {
     finishMotion(R.anim.fade_hold, R.anim.exit_to_bottom)
 }
 
