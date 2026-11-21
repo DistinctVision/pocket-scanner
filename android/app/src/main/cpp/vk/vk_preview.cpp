@@ -167,7 +167,7 @@ void Preview::uploadYuyv(const uint8_t* data, int bytes, int width, int height, 
     const uint32_t packed = static_cast<uint32_t>(width / 2);
     rowTexels = static_cast<uint32_t>(row / 4) == packed ? 0u : static_cast<uint32_t>(row / 4);
     std::memcpy(staging.mapped, data, static_cast<size_t>(need));
-    present(true, true);
+    present(true, true, false);
 }
 
 void Preview::uploadRgb(const uint8_t* data, int bytes, int width, int height, int stride, int format) {
@@ -187,7 +187,7 @@ void Preview::uploadRgb(const uint8_t* data, int bytes, int width, int height, i
     if (!ensureImages(width, height) || !ensureStaging(rgbaBytes)) return;
     rowTexels = 0;
     expandRgb(data, width, height, row, format, static_cast<uint8_t*>(staging.mapped));
-    present(true, false);
+    present(true, false, false);
 }
 
 void Preview::waitInFlight() {
@@ -295,6 +295,8 @@ void Preview::transition(VkCommandBuffer cmd, GpuImage& image, VkImageLayout nex
 
 void Preview::setMode(int mode) { volume.setMode(mode); }
 
+void Preview::setFrontier(bool enabled) { volume.setFrontier(enabled); }
+
 void Preview::setView(const float pose[16], float fx, float fy, float cx, float cy, int width, int height) {
     volume.setView(pose, fx, fy, cx, cy, width, height);
 }
@@ -308,17 +310,24 @@ void Preview::meshUpsert(int id, const float pose[16], const float* depth, const
 
 void Preview::meshErase(int id) { volume.erase(id); }
 
-void Preview::redraw() {
+int Preview::chunkCount() const { return volume.chunkCount(); }
+
+int Preview::chunkPending() const { return volume.chunkPending(); }
+
+int Preview::chunkCap() const { return volume.chunkCap(); }
+
+bool Preview::redraw() {
     waitInFlight();
-    present(false, false);
+    present(false, false, true);
+    return volume.pendingFresh();
 }
 
-bool Preview::present(bool upload, bool fromYuyv) {
+bool Preview::present(bool upload, bool fromYuyv, bool integrate) {
     if (swapchain == VK_NULL_HANDLE && !recreateSwapchain()) return false;
     if (swapchain == VK_NULL_HANDLE) return false;
     if (rgbaImage.image == VK_NULL_HANDLE && volume.mode() != 2) return false;
     if (descriptorsDirty && rgbaImage.image != VK_NULL_HANDLE) writeDescriptors();
-    volume.prepare();
+    if (integrate) volume.prepare(true);
 
     uint32_t index = 0;
     const VkResult acquired = vkAcquireNextImageKHR(
@@ -337,7 +346,7 @@ bool Preview::present(bool upload, bool fromYuyv) {
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(command, &begin);
-    volume.record(command);
+    if (integrate) volume.record(command);
 
     VkBufferImageCopy region{};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;

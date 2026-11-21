@@ -50,6 +50,11 @@ data class KeyframePose(
     val pose: FloatArray,
 )
 
+class KeyframePoll(
+    val frames: List<KeyframePose>,
+    val complete: Boolean,
+)
+
 class TrackSample(
     val state: String,
     val pose: FloatArray?,
@@ -61,6 +66,7 @@ class TrackSample(
     val height: Int,
     val fps: Float,
     val frameMs: Int,
+    val timestampSec: Double = 0.0,
 )
 
 /**
@@ -95,22 +101,23 @@ class StellaTracker(
         pending.set(null)
     }
 
-    fun copyKeyframes(): List<KeyframePose> {
+    fun copyKeyframes(): KeyframePoll {
         val native = handle
-        if (native == 0L) return emptyList()
-        val ids = IntArray(512)
-        val times = DoubleArray(512)
-        val poses = FloatArray(512 * 16)
+        if (native == 0L) return KeyframePoll(emptyList(), true)
+        val ids = IntArray(2048)
+        val times = DoubleArray(2048)
+        val poses = FloatArray(2048 * 16)
         val count = synchronized(nativeLock) {
             if (handle == 0L) 0 else nativeCopyKeyframes(handle, ids, times, poses)
         }
-        return List(count) { index ->
+        val frames = List(count) { index ->
             KeyframePose(
                 id = ids[index],
                 timestampSec = times[index],
                 pose = poses.copyOfRange(index * 16, index * 16 + 16),
             )
         }.filter { it.id >= 0 }
+        return KeyframePoll(frames, count < ids.size)
     }
 
     fun configure(next: SlamCamera?) {
@@ -250,10 +257,10 @@ class StellaTracker(
             Log.i(TAG, "$state ${"%.1f".format(shownFps)} fps ${elapsedMs.toInt()} ms")
         }
         val pose = if (poseBuf[0] == 1f) poseBuf.copyOfRange(1, 17) else null
-        report(state, pose, elapsedMs.toInt())
+        report(state, pose, elapsedMs.toInt(), frame.timestampSec)
     }
 
-    private fun report(state: String, pose: FloatArray? = null, frameMs: Int = 0) {
+    private fun report(state: String, pose: FloatArray? = null, frameMs: Int = 0, timestampSec: Double = 0.0) {
         val model = camera.get()
         onSample(
             TrackSample(
@@ -267,6 +274,7 @@ class StellaTracker(
                 height = model?.h ?: 0,
                 fps = shownFps,
                 frameMs = frameMs,
+                timestampSec = timestampSec,
             ),
         )
     }
@@ -284,12 +292,22 @@ class StellaTracker(
 
     private fun vocabFile(): File {
         val out = File(context.filesDir, "orb_vocab.fbow")
-        if (out.length() > 1_000_000L) {
+        val stamp = File(context.filesDir, "orb_vocab.stamp")
+        // The first launch copies the asset into filesDir. A later install must
+        // replace it: the broken file differs by two bytes, so a size check keeps it.
+        if (stamp.takeIf { it.isFile }?.readText()?.trim() == VOCAB_STAMP && out.length() > 1_000_000L) {
             return out
         }
+        val tmp = File(context.filesDir, "orb_vocab.fbow.tmp")
         context.assets.open("orb_vocab.fbow").use { input ->
-            out.outputStream().use { input.copyTo(it) }
+            tmp.outputStream().use { input.copyTo(it) }
         }
+        if (!tmp.renameTo(out)) {
+            tmp.copyTo(out, overwrite = true)
+            tmp.delete()
+        }
+        stamp.writeText(VOCAB_STAMP)
+        Log.i(TAG, "vocab replaced (${out.length()} bytes)")
         return out
     }
 
@@ -377,5 +395,6 @@ class StellaTracker(
 
     companion object {
         private const val TAG = "pocket-slam"
+        private const val VOCAB_STAMP = "2"
     }
 }

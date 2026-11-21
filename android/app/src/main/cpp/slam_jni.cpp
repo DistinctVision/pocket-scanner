@@ -139,12 +139,21 @@ Java_com_pocketscanner_capture_StellaTracker_nativeCopyKeyframes(
     if (cap <= 0 || env->GetArrayLength(poses) < cap * 16) return 0;
     std::vector<std::shared_ptr<stella_vslam::data::keyframe>> keyframes;
     tracker->slam->get_map_publisher()->get_keyframes(keyframes);
-    const int count = std::min(static_cast<int>(keyframes.size()), static_cast<int>(cap));
+    const int total = static_cast<int>(keyframes.size());
+    const int count = std::min(total, static_cast<int>(cap));
+    const int begin = total - count;
+    if (begin > 0) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOGE("keyframe list truncated at %d of %d", cap, total);
+        }
+    }
     std::vector<jint> idOut(count);
     std::vector<jdouble> timeOut(count);
     std::vector<jfloat> poseOut(static_cast<size_t>(count) * 16);
     for (int i = 0; i < count; ++i) {
-        const auto& keyframe = keyframes[i];
+        const auto& keyframe = keyframes[static_cast<size_t>(begin + i)];
         if (!keyframe || keyframe->will_be_erased()) {
             idOut[i] = -1;
             continue;

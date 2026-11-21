@@ -2,6 +2,7 @@
 
 #include "vk_device.h"
 
+#include <atomic>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -22,12 +23,18 @@ struct Volume {
     void erase(int id);
     void setView(const float pose[16], float fx, float fy, float cx, float cy, int width, int height);
     void setMode(int mode);
+    void setFrontier(bool enabled);
 
     // Fill host staging. Call after the previous frame's fence has signaled.
-    void prepare();
+    // allowOld is for the idle redraw. A camera frame never recalculates old chunks.
+    void prepare(bool allowOld);
+    bool pendingFresh() const;
     void record(VkCommandBuffer cmd);
     void draw(VkCommandBuffer cmd, float fitX, float fitY);
 
+    int chunkCount() const;
+    int chunkPending() const;
+    int chunkCap() const;
     int mode() const { return viewMode; }
 
 private:
@@ -40,28 +47,50 @@ private:
         std::vector<float> depth;
         std::vector<uint8_t> color;
         std::vector<int> slots;
+        bool retired = false;
     };
     struct Chunk {
         int x = 0, y = 0, z = 0;
         bool live = false;
         std::vector<int> kfs;
         bool meshed = false;
+        bool drawn = false;
+        bool pendingFree = false;
+        bool cleared = false;
+    };
+    struct Op {
+        int slot = -1;
+        int kfId = -1;
+        int mode = 1;
+        float pose[16]{};
+        // Add of a keyframe that has no earlier op on this chunk. Pose updates
+        // enqueue the subtract first, so their add is not leading.
+        bool leads = false;
     };
     struct Flush {
         int slot = -1;
-        int packed[8]{};
-        int kfIds[8]{};
-        int kfCount = 0;
-        float origin[3]{};
+        int kfId = -1;
+        int mode = 1;
+        int packed = 0;
+        float pose[16]{};
+        bool clearBefore = false;
+        bool march = false;
+        bool leads = false;
     };
 
     int findKf(int id) const;
     int allocKf();
     int chunkSlot(int x, int y, int z, bool create);
-    void markChunks(Kf& kf);
-    void unlink(Kf& kf);
-    void freeKf(Kf& kf);
-    bool poseClose(const float* a, const float* b) const;
+    void relink(Kf& kf, const float* oldPose);
+    void removeKfFromChunk(int slot, Kf& kf, const float* pose);
+    void enqueue(int slot, int kfId, int mode, const float* pose);
+    void freeChunk(int slot);
+    void reap();
+    bool poseClose(const float* a, const float* b, float maxTrans, float maxRot) const;
+    bool retargetUndrawn(int slot, int kfId, const float* pose);
+    bool redundant(int slot, const float* pose, int selfId) const;
+    bool bakeOldest();
+    const float* poseOf(int id) const;
     void bindStorage(ComputeKernel& kernel, int binding, VkBuffer buffer, VkDeviceSize bytes) const;
 
     VkCore* core = nullptr;
@@ -90,8 +119,19 @@ private:
     std::vector<Kf> keyframes;
     std::vector<Chunk> chunks;
     std::unordered_map<int64_t, int> chunkIndex;
-    Flush flushes[2]{};
+    struct BakedPose {
+        float pose[16]{};
+    };
+    std::unordered_map<int, BakedPose> baked;
+    std::vector<Op> ops;
+    Flush flushes[16]{};
     int flushCount = 0;
+    std::vector<int> picked;
+    bool showFrontier = false;
+    int flushCursor = 0;
+    bool loggedFull = false;
+    bool loggedBake = false;
+    std::atomic<int> liveChunks{0};
     float viewPose[16]{};
     float viewFx = 0, viewFy = 0, viewCx = 0, viewCy = 0;
     int viewW = 0, viewH = 0;

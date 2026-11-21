@@ -94,7 +94,12 @@ class RealSenseSession(
     private var catalog: List<StreamRequest> = emptyList()
     private var preview: VkPreview? = null
     private val previewKind = AtomicInteger(0)
+    private val colorLockedToPose = AtomicBoolean(false)
+    private val previewColors = ArrayDeque<PreviewColor>()
+    private val previewColorLock = Any()
+    private var loggedPreviewMiss = false
     private val settings = AtomicReference(ScanSettings())
+    private val recordFrames = AtomicBoolean(false)
 
     @Volatile
     private var mesh: MeshSync? = null
@@ -115,6 +120,17 @@ class RealSenseSession(
         view?.meshConfigure(scan.voxelCm / 100f, scan.depthMeters)
         view?.setMode(previewKind.get())
     }
+
+    fun setFrontier(enabled: Boolean) {
+        preview?.setFrontier(enabled)
+    }
+
+    fun setRecording(enabled: Boolean) {
+        recordFrames.set(enabled)
+        mesh?.setRecording(enabled)
+    }
+
+    fun recordedCount(): Int = mesh?.recordedCount() ?: 0
 
     fun setPreviewKind(kind: Int) {
         previewKind.set(kind)
@@ -187,6 +203,38 @@ class RealSenseSession(
 
     private fun loop() {
         val tracker = StellaTracker(context) { sample ->
+            val pose = sample.pose
+            if (pose != null && sample.state == "tracking") {
+                mesh?.setTracking(true)
+                mesh?.track(sample.timestampSec, pose)
+            } else {
+                mesh?.setTracking(false)
+            }
+            if (pose != null && previewKind.get() == 0) {
+                val frame = takePreview(sample.timestampSec)
+                val view = preview
+                if (frame != null && view != null && view.submitPoseFrame(
+                        frame.data,
+                        frame.width,
+                        frame.height,
+                        frame.stride,
+                        pose,
+                        sample.fx,
+                        sample.fy,
+                        sample.cx,
+                        sample.cy,
+                        sample.width,
+                        sample.height,
+                    )
+                ) {
+                    colorLockedToPose.set(true)
+                } else if (frame == null && !loggedPreviewMiss) {
+                    loggedPreviewMiss = true
+                    Log.i(TAG, "pose has no matching preview frame")
+                }
+            } else if (pose == null) {
+                colorLockedToPose.set(false)
+            }
             publish { it.copy(track = sample) }
         }
         val align = Align(StreamType.COLOR)
@@ -212,7 +260,9 @@ class RealSenseSession(
         }
         rs.setDevicesChangedCallback(listener)
         trackerRef = tracker
-        val meshSync = MeshSync(tracker) { preview }
+        val dump = java.io.File(context.getExternalFilesDir(null), "mesh-dump")
+        val meshSync = MeshSync(tracker, { preview }, dump)
+        meshSync.setRecording(recordFrames.get())
         mesh = meshSync
         meshSync.start()
         try {
@@ -689,7 +739,8 @@ class RealSenseSession(
                 val format = color.profile.use { it.format }
                 val now = System.nanoTime()
                 val kind = previewKind.get()
-                val wantPreview = format == StreamFormat.YUYV && kind == 0 && now >= nextColorPreviewNs
+                val wantPreview = format == StreamFormat.YUYV && kind == 0 &&
+                    !colorLockedToPose.get() && now >= nextColorPreviewNs
                 val wantSnapshot = snapshot.get()
                 val raw = if (wantPreview || wantSnapshot || format != StreamFormat.YUYV) {
                     ByteArray(color.dataSize).also { color.getData(it) }
@@ -761,6 +812,47 @@ class RealSenseSession(
         }
     }
 
+    private class PreviewColor(
+        val timestampSec: Double,
+        val data: ByteArray,
+        val width: Int,
+        val height: Int,
+        val stride: Int,
+    )
+
+    private fun rememberPreview(timestampSec: Double, data: ByteArray, width: Int, height: Int, stride: Int) {
+        synchronized(previewColorLock) {
+            previewColors.addLast(PreviewColor(timestampSec, data, width, height, stride))
+            while (previewColors.size > 8) previewColors.removeAt(0)
+        }
+    }
+
+    private fun takePreview(timestampSec: Double): PreviewColor? {
+        synchronized(previewColorLock) {
+            if (previewColors.isEmpty()) return null
+            val bits = java.lang.Double.doubleToRawLongBits(timestampSec)
+            var index = previewColors.indexOfFirst {
+                java.lang.Double.doubleToRawLongBits(it.timestampSec) == bits
+            }
+            if (index < 0) {
+                var best = -1
+                var bestDt = 0.05
+                previewColors.forEachIndexed { i, frame ->
+                    val dt = kotlin.math.abs(frame.timestampSec - timestampSec)
+                    if (dt < bestDt) {
+                        bestDt = dt
+                        best = i
+                    }
+                }
+                index = best
+            }
+            if (index < 0) return null
+            val frame = previewColors[index]
+            repeat(index + 1) { previewColors.removeAt(0) }
+            return frame
+        }
+    }
+
     private fun offerAligned(frames: FrameSet, align: Align, tracker: StellaTracker) {
         var aligned: FrameSet? = null
         var ownsAligned = false
@@ -783,6 +875,7 @@ class RealSenseSession(
             colorFrame.getData(colorBytes)
             depthFrame.getData(depthBytes)
             val timestampSec = colorFrame.timestamp / 1000.0
+            rememberPreview(timestampSec, colorBytes, colorVideo.width, colorVideo.height, colorVideo.stride)
             mesh?.note(
                 timestampSec = timestampSec,
                 color = colorBytes,

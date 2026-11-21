@@ -3,10 +3,14 @@
 // sheet. A triangle that touches an unknown corner is the frontier.
 
 struct Voxel {
-    float tsdf;
+    float sumTsdf;
     float weight;
-    uint color;
-    uint pad;
+    float sumR;
+    float sumG;
+    float sumB;
+    float pad0;
+    float pad1;
+    float pad2;
 };
 
 struct Vert {
@@ -52,6 +56,11 @@ struct McPush {
     int slot;
     int maxVerts;
     int maxIndices;
+    // 0 emits the measured surface. 1 emits only the unknown-edge triangles.
+    int frontier;
+    int pad0;
+    int pad1;
+    int pad2;
 };
 
 [[vk::push_constant]]
@@ -374,19 +383,22 @@ void marching(uint3 tid : SV_DispatchThreadID) {
     float s[8];
     uint colors[8];
     float3 at[8];
-    bool unknown = false;
+    bool unknownCorner[8];
     int mask = 0;
     [unroll]
     for (int i = 0; i < 8; ++i) {
         int3 c = kCorner[i];
         Voxel voxel = voxels[voxelAt(cx + c.x, cy + c.y, cz + c.z)];
-        if (voxel.weight <= 0.0) {
+        unknownCorner[i] = voxel.weight <= 0.0;
+        if (unknownCorner[i]) {
             s[i] = 1.0;
             colors[i] = 0;
-            unknown = true;
         } else {
-            s[i] = voxel.tsdf;
-            colors[i] = voxel.color;
+            s[i] = clamp(voxel.sumTsdf / voxel.weight, -1.0, 1.0);
+            uint r = uint(clamp(voxel.sumR / voxel.weight, 0.0, 255.0));
+            uint g = uint(clamp(voxel.sumG / voxel.weight, 0.0, 255.0));
+            uint b = uint(clamp(voxel.sumB / voxel.weight, 0.0, 255.0));
+            colors[i] = r | (g << 8) | (b << 16);
             if (s[i] <= 0.0) {
                 mask |= 1 << i;
             }
@@ -397,7 +409,6 @@ void marching(uint3 tid : SV_DispatchThreadID) {
     if (mask == 0 || mask == 255) {
         return;
     }
-    bool frontier = unknown;
 
     [unroll]
     for (int t = 0; t < 16; t += 3) {
@@ -406,6 +417,14 @@ void marching(uint3 tid : SV_DispatchThreadID) {
             break;
         }
         int edges[3] = {e0, kTri[mask][t + 1], kTri[mask][t + 2]};
+        bool frontier = false;
+        [unroll]
+        for (int e = 0; e < 3; ++e) {
+            frontier = frontier || unknownCorner[kEdgeA[edges[e]]] || unknownCorner[kEdgeB[edges[e]]];
+        }
+        if ((frontier ? 1 : 0) != pc.frontier) {
+            continue;
+        }
         uint base;
         InterlockedAdd(triDraw[pc.slot].vertexCount, 3, base);
         if (base + 3 > uint(pc.maxVerts)) {

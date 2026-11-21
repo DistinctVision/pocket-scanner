@@ -1,12 +1,18 @@
-// One thread per voxel. mode 0 clears the chunk. mode 1 blends one keyframe
-// into the truncation band only. Voxels in front of that band stay empty,
-// so the room interior does not become chunks.
+// One thread per voxel. mode 0 clears the chunk. mode 1 adds a keyframe and
+// mode 2 subtracts it. The voxel stores the weighted sum of the normalized
+// signed distance; marching cubes clamps that average. Samples stay inside
+// the band: a short side toward the camera, a longer side into the unseen
+// volume behind the surface.
 
 struct Voxel {
-    float tsdf;
+    float sumTsdf;
     float weight;
-    uint color;
-    uint pad;
+    float sumR;
+    float sumG;
+    float sumB;
+    float pad0;
+    float pad1;
+    float pad2;
 };
 
 [[vk::binding(0, 0)]]
@@ -36,10 +42,6 @@ IntegratePush pc;
 
 static const int kN = 9;
 
-uint packRgb(uint packed) {
-    return packed | 0xff000000;
-}
-
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void integrate(uint3 tid : SV_DispatchThreadID) {
@@ -48,11 +50,7 @@ void integrate(uint3 tid : SV_DispatchThreadID) {
     }
     int index = pc.voxelBase + int(tid.x);
     if (pc.mode == 0) {
-        Voxel cleared;
-        cleared.tsdf = 0;
-        cleared.weight = 0;
-        cleared.color = 0;
-        cleared.pad = 0;
+        Voxel cleared = {0, 0, 0, 0, 0, 0, 0, 0};
         voxels[index] = cleared;
         return;
     }
@@ -81,33 +79,52 @@ void integrate(uint3 tid : SV_DispatchThreadID) {
     if (u < 0 || v < 0 || u >= dw || v >= dh) {
         return;
     }
-    float depth = depthM[pc.depthBase + v * dw + u];
     float maxDepth = pc.params.y;
+    int sampleU = u;
+    int sampleV = v;
+    float depth = depthM[pc.depthBase + v * dw + u];
     if (depth <= 0.05 || depth > maxDepth) {
-        return;
+        depth = 0.0;
+        int best = 3;
+        for (int oy = -1; oy <= 1; ++oy) {
+            for (int ox = -1; ox <= 1; ++ox) {
+                int su = u + ox;
+                int sv = v + oy;
+                if (su < 0 || sv < 0 || su >= dw || sv >= dh) {
+                    continue;
+                }
+                float candidate = depthM[pc.depthBase + sv * dw + su];
+                int dist = abs(ox) + abs(oy);
+                if (candidate > 0.05 && candidate <= maxDepth && dist < best) {
+                    depth = candidate;
+                    sampleU = su;
+                    sampleV = sv;
+                    best = dist;
+                }
+            }
+        }
+        if (depth <= 0.05) {
+            return;
+        }
     }
-    float trunc = pc.params.x;
+    float voxelSize = pc.originSize.w;
+    float truncNear = voxelSize * 2.0;
+    float truncFar = voxelSize * 6.0;
     float sdf = depth - cam.z;
-    if (sdf < -trunc || sdf > trunc) {
+    if (sdf > truncNear || sdf < -truncFar) {
         return;
     }
-    float sample = clamp(sdf / trunc, -1.0, 1.0);
+    float sample = clamp(sdf / truncFar, -1.0, 1.0);
+    float sign = pc.mode == 2 ? -1.0 : 1.0;
     Voxel voxel = voxels[index];
-    float weight = 1.0;
-    float sum = voxel.weight + weight;
-    voxel.tsdf = (voxel.tsdf * voxel.weight + sample * weight) / sum;
-    uint next = colorRgb[pc.colorBase + v * dw + u];
-    if (voxel.weight <= 0.0) {
-        voxel.color = packRgb(next);
-    } else {
-        float keep = voxel.weight / sum;
-        float add = weight / sum;
-        uint old = voxel.color;
-        uint r = uint(clamp(float(old & 255) * keep + float(next & 255) * add, 0.0, 255.0));
-        uint g = uint(clamp(float((old >> 8) & 255) * keep + float((next >> 8) & 255) * add, 0.0, 255.0));
-        uint b = uint(clamp(float((old >> 16) & 255) * keep + float((next >> 16) & 255) * add, 0.0, 255.0));
-        voxel.color = r | (g << 8) | (b << 16) | 0xff000000;
+    uint next = colorRgb[pc.colorBase + sampleV * dw + sampleU];
+    voxel.sumTsdf += sample * sign;
+    voxel.weight += sign;
+    voxel.sumR += float(next & 255) * sign;
+    voxel.sumG += float((next >> 8) & 255) * sign;
+    voxel.sumB += float((next >> 16) & 255) * sign;
+    if (voxel.weight <= 0.5) {
+        voxel = {0, 0, 0, 0, 0, 0, 0, 0};
     }
-    voxel.weight = min(sum, 32.0);
     voxels[index] = voxel;
 }

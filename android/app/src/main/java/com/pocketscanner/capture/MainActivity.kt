@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Row
+import androidx.compose.ui.Alignment
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -38,12 +39,14 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.SideEffect
@@ -85,7 +88,13 @@ class MainActivity : ComponentActivity() {
                     },
                     onSelect = { session?.selectProfile(it) },
                     onApply = { session?.applyScan(it) },
+                    onFrontier = { session?.setFrontier(it) },
                     onSnapshot = { session?.requestSnapshot() },
+                    chunkCount = { preview?.chunkCount() ?: 0 },
+                    chunkPending = { preview?.chunkPending() ?: 0 },
+                    chunkCap = { preview?.chunkCap() ?: 0 },
+                    onRecord = { session?.setRecording(it) },
+                    recordedCount = { session?.recordedCount() ?: 0 },
                 )
             }
         }
@@ -149,14 +158,35 @@ private fun CaptureScaffold(
     onView: (FloatArray, Float, Float, Float, Float, Int, Int) -> Unit,
     onSelect: (String) -> Unit,
     onApply: (ScanSettings) -> Unit,
+    onFrontier: (Boolean) -> Unit,
     onSnapshot: () -> Unit,
+    chunkCount: () -> Int,
+    chunkPending: () -> Int,
+    chunkCap: () -> Int,
+    onRecord: (Boolean) -> Unit,
+    recordedCount: () -> Int,
 ) {
     val scheme = MaterialTheme.colorScheme
     var mode by remember { mutableStateOf(PreviewMode.Color) }
     var marker by remember { mutableStateOf<Marker?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
     var applied by remember { mutableStateOf(ScanSettings()) }
+    var showFrontier by remember { mutableStateOf(false) }
     var resetEpoch by remember { mutableIntStateOf(0) }
+    var chunks by remember { mutableIntStateOf(0) }
+    var pendingChunks by remember { mutableIntStateOf(0) }
+    var chunkLimit by remember { mutableIntStateOf(0) }
+    var recording by remember { mutableStateOf(false) }
+    var recorded by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            chunks = chunkCount()
+            pendingChunks = chunkPending()
+            chunkLimit = chunkCap()
+            recorded = recordedCount()
+            delay(250)
+        }
+    }
     val trail = remember { androidx.compose.runtime.mutableStateListOf<Vec3>() }
     LaunchedEffect(resetEpoch) {
         marker = null
@@ -166,7 +196,9 @@ private fun CaptureScaffold(
         val sample = ui.track
         val current = sample?.pose
         if (current != null) {
-            onView(current, sample.fx, sample.fy, sample.cx, sample.cy, sample.width, sample.height)
+            if (mode != PreviewMode.Color) {
+                onView(current, sample.fx, sample.fy, sample.cx, sample.cy, sample.width, sample.height)
+            }
             val camera = cameraPosition(current)
             val last = trail.lastOrNull()
             if (last == null || last.distanceTo(camera) > 0.05f) {
@@ -202,6 +234,29 @@ private fun CaptureScaffold(
             Text(ui.deviceLine, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
         Text(captureLine(ui), color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        Text(
+            if (chunkLimit > 0) "Chunks $chunks / $chunkLimit, $pendingChunks waiting" else "Chunks $chunks",
+            color = scheme.onSurface,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                if (recording) "Recording $recorded frames" else "Record frames",
+                color = scheme.onSurface,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Switch(
+                checked = recording,
+                onCheckedChange = {
+                    recording = it
+                    onRecord(it)
+                },
+            )
+        }
         ui.track?.let { sample ->
             Text(trackLine(sample), color = scheme.primary, style = MaterialTheme.typography.bodyMedium)
         }
@@ -258,6 +313,11 @@ private fun CaptureScaffold(
                 ui = ui,
                 applied = applied,
                 onSelect = onSelect,
+                showFrontier = showFrontier,
+                onFrontier = {
+                    showFrontier = it
+                    onFrontier(it)
+                },
                 onApply = {
                     applied = it
                     resetEpoch++
@@ -368,6 +428,8 @@ private fun ProfileMenu(
 private fun SettingsPanel(
     ui: CaptureUi,
     applied: ScanSettings,
+    showFrontier: Boolean,
+    onFrontier: (Boolean) -> Unit,
     onSelect: (String) -> Unit,
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
@@ -408,6 +470,21 @@ private fun SettingsPanel(
         ChoiceRow("Features", listOf(300, 500, 800), minSize, { "$it" }) { minSize = it }
         ChoiceRow("Pyramid", listOf(4, 6, 8), levels, { "$it" }) { levels = it }
         ChoiceRow("Depth", listOf(3, 6, 10), depth, { "$it m" }) { depth = it }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Unscanned edge", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    "Amber outline. Applies immediately and does not restart tracking.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(checked = showFrontier, onCheckedChange = onFrontier)
+        }
         Spacer(Modifier.height(4.dp))
         Button(
             onClick = {

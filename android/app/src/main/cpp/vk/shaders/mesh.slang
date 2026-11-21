@@ -27,17 +27,15 @@ VsOut meshVert(uint vid : SV_VertexID, float3 inPos : POSITION, float4 inColor :
     cam.x = pc.row0.x * d.x + pc.row1.x * d.y + pc.row2.x * d.z;
     cam.y = pc.row0.y * d.x + pc.row1.y * d.y + pc.row2.y * d.z;
     cam.z = pc.row0.z * d.x + pc.row1.z * d.y + pc.row2.z * d.z;
-    if (cam.z < 0.05) {
-        o.pos = float4(2.0, 2.0, 0.0, 1.0);
-        o.color = inColor;
-        return o;
-    }
-    float u = pc.fitIntr.z * cam.x / cam.z + pc.centerSize.x;
-    float v = pc.fitIntr.w * cam.y / cam.z + pc.centerSize.y;
-    float nx = (u / pc.centerSize.z) * 2.0 - 1.0;
-    float ny = (v / pc.centerSize.w) * 2.0 - 1.0;
-    float depth = clamp(cam.z / max(pc.extra.x, 0.1), 0.0, 1.0);
-    o.pos = float4(nx * pc.fitIntr.x, ny * pc.fitIntr.y, depth, 1.0);
+    // Keep w = z so the rasterizer clips the edge on the camera plane.
+    // Sending the vertex to a corner instead draws the line across the whole view.
+    float w = cam.z;
+    float width = max(pc.centerSize.z, 1.0);
+    float height = max(pc.centerSize.w, 1.0);
+    float xClip = pc.fitIntr.x * (2.0 * pc.fitIntr.z * cam.x + (2.0 * pc.centerSize.x - width) * w) / width;
+    float yClip = pc.fitIntr.y * (2.0 * pc.fitIntr.w * cam.y + (2.0 * pc.centerSize.y - height) * w) / height;
+    float zNdc = clamp(w / max(pc.extra.x, 0.1), 0.0, 1.0);
+    o.pos = float4(xClip, yClip, zNdc * w, w);
     o.color = inColor;
     return o;
 }

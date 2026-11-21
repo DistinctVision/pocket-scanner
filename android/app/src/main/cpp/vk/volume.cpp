@@ -10,8 +10,10 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <unordered_set>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "pocket-mesh", __VA_ARGS__)
@@ -21,9 +23,9 @@ namespace {
 
 constexpr int kGrid = 8;
 constexpr int kVoxels = 9 * 9 * 9;
-constexpr int kMaxChunks = 384;
-constexpr int kMaxVerts = 1024;
-constexpr int kMaxLineIndices = 2048;
+constexpr int kMaxChunks = 8000;
+constexpr int kMaxVerts = 4096;
+constexpr int kMaxLineIndices = 8192;
 constexpr int kKfPerChunk = 8;
 constexpr int kFlushChunks = 2;
 constexpr int kMaxImage = 320 * 240;
@@ -49,6 +51,8 @@ struct McPush {
     int32_t slot;
     int32_t maxVerts;
     int32_t maxIndices;
+    int32_t frontier;
+    int32_t pad0, pad1, pad2;
 };
 
 struct MeshPush {
@@ -61,7 +65,7 @@ struct MeshPush {
 };
 
 static_assert(sizeof(IntegratePush) == 112, "integrate push");
-static_assert(sizeof(McPush) == 32, "mc push");
+static_assert(sizeof(McPush) == 48, "mc push");
 static_assert(sizeof(MeshPush) == 96, "mesh push");
 
 int64_t packKey(int x, int y, int z) {
@@ -194,7 +198,7 @@ bool Volume::init(VkCore* device) {
     if (!core->compute(marching_spv, sizeof(marching_spv), cubeBindings, 5, sizeof(McPush), marching)) {
         return false;
     }
-    const VkDeviceSize voxelBytes = static_cast<VkDeviceSize>(kMaxChunks) * kVoxels * 16;
+    const VkDeviceSize voxelBytes = static_cast<VkDeviceSize>(kMaxChunks) * kVoxels * 32;
     const VkDeviceSize vertBytes = static_cast<VkDeviceSize>(kMaxChunks) * kMaxVerts * 16;
     const VkDeviceSize lineBytes = static_cast<VkDeviceSize>(kMaxChunks) * kMaxLineIndices * 4;
     const VkDeviceSize imageBytes = static_cast<VkDeviceSize>(kKfPerChunk * kFlushChunks) * kMaxImage * 4;
@@ -310,6 +314,7 @@ void Volume::shutdown() {
     keyframes.clear();
     chunks.clear();
     chunkIndex.clear();
+    liveChunks.store(0, std::memory_order_relaxed);
     shadedPipeline = wirePipeline = VK_NULL_HANDLE;
     meshLayout = VK_NULL_HANDLE;
     ready = false;
@@ -322,9 +327,16 @@ void Volume::configure(float size, float depthMeters) {
     keyframes.clear();
     chunks.clear();
     chunkIndex.clear();
+    ops.clear();
+    picked.clear();
     flushCount = 0;
+    flushCursor = 0;
     imageW = 0;
     imageH = 0;
+    baked.clear();
+    loggedFull = false;
+    loggedBake = false;
+    liveChunks.store(0, std::memory_order_relaxed);
     LOGI("reset voxel %.1f cm depth %.1f m", voxelSize * 100.f, maxDepth);
 }
 
@@ -357,7 +369,13 @@ int Volume::chunkSlot(int x, int y, int z, bool create) {
         }
     }
     if (freeSlot < 0) {
-        if (static_cast<int>(chunks.size()) >= kMaxChunks) return -1;
+        if (static_cast<int>(chunks.size()) >= kMaxChunks) {
+            if (!loggedFull) {
+                loggedFull = true;
+                LOGE("chunk cap %d, new areas will not grow", kMaxChunks);
+            }
+            return -1;
+        }
         chunks.emplace_back();
         freeSlot = static_cast<int>(chunks.size()) - 1;
     }
@@ -368,11 +386,199 @@ int Volume::chunkSlot(int x, int y, int z, bool create) {
     chunk.z = z;
     chunk.live = true;
     chunkIndex[key] = freeSlot;
+    liveChunks.fetch_add(1, std::memory_order_relaxed);
     return freeSlot;
 }
 
-void Volume::markChunks(Kf& kf) {
-    const float trunc = voxelSize * 2.f;
+int Volume::chunkCount() const {
+    return liveChunks.load(std::memory_order_relaxed);
+}
+
+int Volume::chunkPending() const {
+    int pending = 0;
+    for (const Chunk& chunk : chunks) {
+        if (chunk.live && !chunk.drawn) pending++;
+    }
+    return pending;
+}
+
+int Volume::chunkCap() const {
+    return kMaxChunks;
+}
+
+namespace {
+
+constexpr float kPoseTrans = 0.25f;
+constexpr float kPoseRot = 12.f * 3.14159265f / 180.f;
+constexpr float kLinkTrans = 0.10f;
+constexpr float kLinkRot = 5.f * 3.14159265f / 180.f;
+
+void insertSorted(std::vector<int>& ids, int id) {
+    const auto place = std::lower_bound(ids.begin(), ids.end(), id);
+    if (place != ids.end() && *place == id) return;
+    ids.insert(place, id);
+}
+
+} // namespace
+
+bool Volume::poseClose(const float* a, const float* b, float maxTrans, float maxRot) const {
+    const float dx = a[3] - b[3];
+    const float dy = a[7] - b[7];
+    const float dz = a[11] - b[11];
+    if (dx * dx + dy * dy + dz * dz > maxTrans * maxTrans) return false;
+    float trace = 0.f;
+    for (int col = 0; col < 3; ++col) {
+        trace += a[col] * b[col] + a[4 + col] * b[4 + col] + a[8 + col] * b[8 + col];
+    }
+    const float cosine = std::clamp((trace - 1.f) * 0.5f, -1.f, 1.f);
+    return std::acos(cosine) < maxRot;
+}
+
+const float* Volume::poseOf(int id) const {
+    const int index = findKf(id);
+    if (index >= 0) return keyframes[index].pose;
+    const auto found = baked.find(id);
+    if (found == baked.end()) return nullptr;
+    return found->second.pose;
+}
+
+bool Volume::bakeOldest() {
+    int best = -1;
+    int bestId = std::numeric_limits<int>::max();
+    int fallback = -1;
+    int fallbackId = std::numeric_limits<int>::max();
+    for (int i = 0; i < static_cast<int>(keyframes.size()); ++i) {
+        if (!keyframes[i].live) continue;
+        const int id = keyframes[i].id;
+        if (id < fallbackId) {
+            fallbackId = id;
+            fallback = i;
+        }
+        bool pending = false;
+        for (const Op& op : ops) {
+            if (op.kfId == id) pending = true;
+        }
+        if (!pending && id < bestId) {
+            bestId = id;
+            best = i;
+        }
+    }
+    if (best < 0) best = fallback;
+    if (best < 0) return false;
+    Kf& kf = keyframes[best];
+    const int id = kf.id;
+    ops.erase(std::remove_if(ops.begin(), ops.end(), [id](const Op& op) { return op.kfId == id; }), ops.end());
+    BakedPose saved{};
+    std::memcpy(saved.pose, kf.pose, sizeof(saved.pose));
+    baked[id] = saved;
+    kf.depth.clear();
+    kf.color.clear();
+    kf.depth.shrink_to_fit();
+    kf.color.shrink_to_fit();
+    kf.slots.clear();
+    kf.live = false;
+    kf.retired = false;
+    if (!loggedBake) {
+        loggedBake = true;
+        LOGI("keyframe store full (%d), baking the oldest into the mesh", maxKeyframes);
+    }
+    return true;
+}
+
+bool Volume::redundant(int slot, const float* pose, int selfId) const {
+    if (slot < 0 || slot >= static_cast<int>(chunks.size()) || !chunks[slot].live) return false;
+    for (int id : chunks[slot].kfs) {
+        if (id == selfId) continue;
+        const float* other = poseOf(id);
+        if (other != nullptr && poseClose(other, pose, kLinkTrans, kLinkRot)) return true;
+    }
+    return false;
+}
+
+bool Volume::retargetUndrawn(int slot, int kfId, const float* pose) {
+    if (slot < 0 || slot >= static_cast<int>(chunks.size()) || chunks[slot].drawn || pose == nullptr) return false;
+    int kept = -1;
+    for (int i = static_cast<int>(ops.size()) - 1; i >= 0; --i) {
+        if (ops[i].slot != slot || ops[i].kfId != kfId) continue;
+        if (kept < 0) {
+            ops[i].mode = 1;
+            std::memcpy(ops[i].pose, pose, sizeof(ops[i].pose));
+            kept = i;
+        } else {
+            ops.erase(ops.begin() + i);
+        }
+    }
+    return kept >= 0;
+}
+
+void Volume::enqueue(int slot, int kfId, int mode, const float* pose) {
+    if (slot < 0 || slot >= static_cast<int>(chunks.size()) || !chunks[slot].live || pose == nullptr) return;
+    Op op;
+    op.slot = slot;
+    op.kfId = kfId;
+    op.mode = mode;
+    std::memcpy(op.pose, pose, sizeof(op.pose));
+    op.leads = mode == 1;
+    if (op.leads) {
+        for (const Op& queued : ops) {
+            if (queued.slot == slot && queued.kfId == kfId) {
+                op.leads = false;
+                break;
+            }
+        }
+    }
+    ops.push_back(op);
+    chunks[slot].meshed = false;
+    if (mode == 1) chunks[slot].pendingFree = false;
+}
+
+void Volume::freeChunk(int slot) {
+    if (slot < 0 || slot >= static_cast<int>(chunks.size())) return;
+    Chunk& chunk = chunks[slot];
+    if (chunk.live) {
+        chunkIndex.erase(packKey(chunk.x, chunk.y, chunk.z));
+        liveChunks.fetch_sub(1, std::memory_order_relaxed);
+    }
+    chunk = Chunk{};
+}
+
+void Volume::reap() {
+    for (Kf& kf : keyframes) {
+        if (!kf.retired) continue;
+        bool pending = false;
+        for (const Op& op : ops) {
+            if (op.kfId == kf.id) pending = true;
+        }
+        if (pending) continue;
+        kf.live = false;
+        kf.retired = false;
+        kf.depth.clear();
+        kf.color.clear();
+        kf.slots.clear();
+    }
+    for (int slot = 0; slot < static_cast<int>(chunks.size()); ++slot) {
+        if (!chunks[slot].pendingFree) continue;
+        bool pending = false;
+        for (const Op& op : ops) {
+            if (op.slot == slot) pending = true;
+        }
+        if (pending) continue;
+        freeChunk(slot);
+    }
+}
+
+void Volume::removeKfFromChunk(int slot, Kf& kf, const float* pose) {
+    if (slot < 0 || slot >= static_cast<int>(chunks.size()) || !chunks[slot].live) return;
+    enqueue(slot, kf.id, 2, pose);
+    Chunk& chunk = chunks[slot];
+    auto& list = chunk.kfs;
+    list.erase(std::remove(list.begin(), list.end(), kf.id), list.end());
+    if (list.empty()) chunk.pendingFree = true;
+}
+
+void Volume::relink(Kf& kf, const float* oldPose) {
+    const float truncNear = voxelSize * 2.f;
+    const float truncFar = voxelSize * 6.f;
     const float span = voxelSize * static_cast<float>(kGrid);
     std::unordered_set<int64_t> keys;
     const int step = 4;
@@ -380,95 +586,93 @@ void Volume::markChunks(Kf& kf) {
         for (int x = 0; x < kf.width; x += step) {
             const float depth = kf.depth[static_cast<size_t>(y) * kf.width + x];
             if (depth <= 0.05f || depth > maxDepth) continue;
-            const float px = (static_cast<float>(x) - kf.cx) / kf.fx * depth;
-            const float py = (static_cast<float>(y) - kf.cy) / kf.fy * depth;
-            float world[3] = {
-                kf.pose[0] * px + kf.pose[1] * py + kf.pose[2] * depth + kf.pose[3],
-                kf.pose[4] * px + kf.pose[5] * py + kf.pose[6] * depth + kf.pose[7],
-                kf.pose[8] * px + kf.pose[9] * py + kf.pose[10] * depth + kf.pose[11],
-            };
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        const float sx = world[0] + dx * trunc;
-                        const float sy = world[1] + dy * trunc;
-                        const float sz = world[2] + dz * trunc;
-                        keys.insert(packKey(
-                            static_cast<int>(std::floor(sx / span)),
-                            static_cast<int>(std::floor(sy / span)),
-                            static_cast<int>(std::floor(sz / span))));
-                    }
-                }
+            // Walk the truncation band along the ray. A face test of six voxels
+            // reaches sideways across an almost empty neighbor: at 8 cm the band
+            // is 48 cm and the chunk is 64 cm, so the first view allocated shells
+            // with no surface. Those shells stayed undrawn and the mesh pass
+            // never got back to the chunks that actually hold the new wall.
+            const float t0 = std::max(0.05f, depth - truncNear);
+            const float t1 = std::min(maxDepth, depth + truncFar);
+            const float ox = (static_cast<float>(x) - kf.cx) / kf.fx;
+            const float oy = (static_cast<float>(y) - kf.cy) / kf.fy;
+            const float march = std::max(voxelSize * 0.5f, 1e-3f);
+            const int n = std::max(1, static_cast<int>(std::ceil((t1 - t0) / march)));
+            for (int s = 0; s <= n; ++s) {
+                const float t = t0 + (t1 - t0) * (static_cast<float>(s) / static_cast<float>(n));
+                const float px = ox * t;
+                const float py = oy * t;
+                const float worldX = kf.pose[0] * px + kf.pose[1] * py + kf.pose[2] * t + kf.pose[3];
+                const float worldY = kf.pose[4] * px + kf.pose[5] * py + kf.pose[6] * t + kf.pose[7];
+                const float worldZ = kf.pose[8] * px + kf.pose[9] * py + kf.pose[10] * t + kf.pose[11];
+                const int ix = static_cast<int>(std::floor(worldX / span));
+                const int iy = static_cast<int>(std::floor(worldY / span));
+                const int iz = static_cast<int>(std::floor(worldZ / span));
+                keys.insert(packKey(ix, iy, iz));
             }
         }
     }
-    kf.slots.clear();
+
+    std::vector<int> desired;
+    desired.reserve(keys.size());
     for (int64_t key : keys) {
+        const auto found = chunkIndex.find(key);
+        if (found != chunkIndex.end() && redundant(found->second, kf.pose, kf.id)) continue;
         const int x = static_cast<int>(static_cast<int32_t>(key & 0x1fffff) << 11) >> 11;
         const int y = static_cast<int>(static_cast<int32_t>((key >> 21) & 0x1fffff) << 11) >> 11;
         const int z = static_cast<int>(static_cast<int32_t>((key >> 42) & 0x1fffff) << 11) >> 11;
         const int slot = chunkSlot(x, y, z, true);
-        if (slot < 0) continue;
-        kf.slots.push_back(slot);
-        auto& list = chunks[slot].kfs;
-        if (std::find(list.begin(), list.end(), kf.id) == list.end()) list.push_back(kf.id);
-        chunks[slot].meshed = false;
+        if (slot >= 0) desired.push_back(slot);
     }
-}
+    std::sort(desired.begin(), desired.end());
+    desired.erase(std::unique(desired.begin(), desired.end()), desired.end());
 
-void Volume::unlink(Kf& kf) {
-    for (int slot : kf.slots) {
-        if (slot < 0 || slot >= static_cast<int>(chunks.size())) continue;
-        auto& list = chunks[slot].kfs;
-        list.erase(std::remove(list.begin(), list.end(), kf.id), list.end());
-        if (list.empty()) {
-            const int64_t key = packKey(chunks[slot].x, chunks[slot].y, chunks[slot].z);
-            chunkIndex.erase(key);
-            chunks[slot].live = false;
-            chunks[slot].meshed = false;
+    std::vector<int> previous = kf.slots;
+    std::sort(previous.begin(), previous.end());
+    for (int slot : previous) {
+        if (std::binary_search(desired.begin(), desired.end(), slot)) continue;
+        removeKfFromChunk(slot, kf, oldPose != nullptr ? oldPose : kf.pose);
+    }
+    for (int slot : desired) {
+        const bool kept = std::binary_search(previous.begin(), previous.end(), slot);
+        insertSorted(chunks[slot].kfs, kf.id);
+        if (kept && oldPose != nullptr) {
+            if (retargetUndrawn(slot, kf.id, kf.pose)) continue;
+            enqueue(slot, kf.id, 2, oldPose);
         }
+        enqueue(slot, kf.id, 1, kf.pose);
     }
-    kf.slots.clear();
-}
-
-bool Volume::poseClose(const float* a, const float* b) const {
-    const float dx = a[3] - b[3];
-    const float dy = a[7] - b[7];
-    const float dz = a[11] - b[11];
-    if (dx * dx + dy * dy + dz * dz > (0.5f * voxelSize) * (0.5f * voxelSize)) return false;
-    // Rdelta = R_b^T * R_a, trace of the relative rotation.
-    float trace = 0.f;
-    for (int col = 0; col < 3; ++col) {
-        trace += a[col] * b[col] + a[4 + col] * b[4 + col] + a[8 + col] * b[8 + col];
-    }
-    const float cosine = std::clamp((trace - 1.f) * 0.5f, -1.f, 1.f);
-    return std::acos(cosine) < (2.f * 3.14159265f / 180.f);
+    kf.slots = std::move(desired);
 }
 
 void Volume::upsert(int id, const float pose[16], const float* depth, const uint8_t* rgb,
                     int width, int height, float fx, float fy, float cx, float cy) {
     if (!ready || width <= 0 || height <= 0 || width * height > kMaxImage) return;
+    if (baked.find(id) != baked.end()) return;
     if (imageW == 0) {
         imageW = width;
         imageH = height;
         const int bytes = width * height * 8;
-        maxKeyframes = std::clamp(32 * 1024 * 1024 / std::max(bytes, 1), 16, 128);
+        maxKeyframes = std::clamp(96 * 1024 * 1024 / std::max(bytes, 1), 16, 512);
     }
     if (width != imageW || height != imageH) return;
     int index = findKf(id);
-    if (index >= 0 && poseClose(keyframes[index].pose, pose)) return;
-    if (index < 0) {
+    float oldPose[16];
+    const bool update = index >= 0;
+    if (update) {
+        if (poseClose(keyframes[index].pose, pose, kPoseTrans, kPoseRot)) return;
+        std::memcpy(oldPose, keyframes[index].pose, sizeof(oldPose));
+    } else {
         index = allocKf();
+        if (index < 0 && bakeOldest()) index = allocKf();
         if (index < 0) {
             LOGE("keyframe cap %d", maxKeyframes);
             return;
         }
-    } else {
-        unlink(keyframes[index]);
     }
     Kf& kf = keyframes[index];
     kf.id = id;
     kf.live = true;
+    kf.retired = false;
     std::memcpy(kf.pose, pose, sizeof(kf.pose));
     kf.fx = fx;
     kf.fy = fy;
@@ -478,17 +682,17 @@ void Volume::upsert(int id, const float pose[16], const float* depth, const uint
     kf.height = height;
     kf.depth.assign(depth, depth + width * height);
     kf.color.assign(rgb, rgb + width * height * 3);
-    markChunks(kf);
+    relink(kf, update ? oldPose : nullptr);
 }
 
 void Volume::erase(int id) {
     const int index = findKf(id);
     if (index < 0) return;
-    unlink(keyframes[index]);
-    keyframes[index].live = false;
-    keyframes[index].depth.clear();
-    keyframes[index].color.clear();
-    keyframes[index].slots.clear();
+    Kf& kf = keyframes[index];
+    const std::vector<int> slots = kf.slots;
+    for (int slot : slots) removeKfFromChunk(slot, kf, kf.pose);
+    kf.slots.clear();
+    kf.retired = true;
 }
 
 void Volume::setView(const float pose[16], float fx, float fy, float cx, float cy, int width, int height) {
@@ -504,48 +708,215 @@ void Volume::setView(const float pose[16], float fx, float fy, float cx, float c
 
 void Volume::setMode(int mode) { viewMode = mode; }
 
-void Volume::prepare() {
+void Volume::setFrontier(bool enabled) {
+    if (showFrontier == enabled) return;
+    showFrontier = enabled;
+    for (int slot = 0; slot < static_cast<int>(chunks.size()); ++slot) {
+        if (!chunks[slot].live || !chunks[slot].drawn) continue;
+        bool queued = false;
+        for (const Op& op : ops) {
+            if (op.slot == slot && op.mode == 3) queued = true;
+        }
+        if (queued) continue;
+        Op op;
+        op.slot = slot;
+        op.kfId = -1;
+        op.mode = 3;
+        ops.push_back(op);
+        chunks[slot].meshed = false;
+    }
+}
+
+bool Volume::pendingFresh() const {
+    for (const Op& op : ops) {
+        if (op.slot < 0 || op.slot >= static_cast<int>(chunks.size())) continue;
+        if (!chunks[op.slot].live) continue;
+        // Leading adds still need a fast pass: they are the new surface inside a chunk
+        // that was already drawn, and the redraw stays slow until this returns false.
+        if (!chunks[op.slot].drawn || op.leads) return true;
+    }
+    return false;
+}
+
+void Volume::prepare(bool allowOld) {
     flushCount = 0;
-    if (!ready || imageW == 0) return;
+    picked.clear();
+    if (!ready || imageW == 0 || ops.empty()) return;
     const int pixels = imageW * imageH;
-    const int budget = kKfPerChunk * kFlushChunks;
-    if (stageDepth.mapped == nullptr || stageDepth.size < static_cast<VkDeviceSize>(budget) * pixels * 4) return;
-    int packed = 0;
+    constexpr int kMaxOps = 16;
+    if (stageDepth.mapped == nullptr || stageDepth.size < static_cast<VkDeviceSize>(kMaxOps) * pixels * 4) return;
     auto* depthOut = static_cast<float*>(stageDepth.mapped);
     auto* colorOut = static_cast<uint8_t*>(stageColor.mapped);
-    for (int slot = 0; slot < static_cast<int>(chunks.size()) && flushCount < kFlushChunks; ++slot) {
-        Chunk& chunk = chunks[slot];
-        if (!chunk.live || chunk.kfs.empty() || chunk.meshed) continue;
-        Flush& flush = flushes[flushCount];
-        flush.slot = slot;
-        flush.kfCount = 0;
-        const float span = voxelSize * static_cast<float>(kGrid);
-        flush.origin[0] = chunk.x * span;
-        flush.origin[1] = chunk.y * span;
-        flush.origin[2] = chunk.z * span;
-        const int begin = std::max(0, static_cast<int>(chunk.kfs.size()) - kKfPerChunk);
-        for (int i = begin; i < static_cast<int>(chunk.kfs.size()) && packed < budget; ++i) {
-            const int kfIndex = findKf(chunk.kfs[i]);
-            if (kfIndex < 0) continue;
-            const Kf& kf = keyframes[kfIndex];
-            std::memcpy(depthOut + packed * pixels, kf.depth.data(), pixels * sizeof(float));
-            uint32_t* packedColor = reinterpret_cast<uint32_t*>(colorOut) + packed * pixels;
-            for (int p = 0; p < pixels; ++p) {
-                const uint8_t* rgb = kf.color.data() + p * 3;
-                packedColor[p] = rgb[0] | (uint32_t(rgb[1]) << 8) | (uint32_t(rgb[2]) << 16);
-            }
-            flush.packed[flush.kfCount] = packed;
-            flush.kfIds[flush.kfCount] = kf.id;
-            flush.kfCount++;
-            packed++;
+    int packedId[kMaxOps];
+    int packedCount = 0;
+    bool clearSeen[kMaxChunks]{};
+    auto pack = [&](int kfId) -> int {
+        for (int i = 0; i < packedCount; ++i) {
+            if (packedId[i] == kfId) return i;
         }
+        if (packedCount >= kMaxOps) return -1;
+        const int index = findKf(kfId);
+        if (index < 0 || static_cast<int>(keyframes[index].depth.size()) < pixels) return -1;
+        const Kf& kf = keyframes[index];
+        std::memcpy(depthOut + packedCount * pixels, kf.depth.data(), static_cast<size_t>(pixels) * sizeof(float));
+        uint32_t* packedColor = reinterpret_cast<uint32_t*>(colorOut) + packedCount * pixels;
+        for (int p = 0; p < pixels; ++p) {
+            const uint8_t* rgb = kf.color.data() + p * 3;
+            packedColor[p] = rgb[0] | (uint32_t(rgb[1]) << 8) | (uint32_t(rgb[2]) << 16);
+        }
+        packedId[packedCount] = kfId;
+        return packedCount++;
+    };
+    auto fresh = [&](int slot) {
+        return slot >= 0 && slot < static_cast<int>(chunks.size()) && chunks[slot].live && !chunks[slot].drawn;
+    };
+    struct SlotOps {
+        int slot = -1;
+        int first = 0;
+        int last = 0;
+        bool undrawn = false;
+    };
+    std::vector<SlotOps> slotOps;
+    std::unordered_map<int, int> slotPos;
+    for (int i = 0; i < static_cast<int>(ops.size()); ++i) {
+        const int slot = ops[i].slot;
+        const auto found = slotPos.find(slot);
+        if (found == slotPos.end()) {
+            slotPos.emplace(slot, static_cast<int>(slotOps.size()));
+            slotOps.push_back(SlotOps{slot, i, i, fresh(slot)});
+        } else {
+            slotOps[found->second].last = i;
+        }
+    }
+    std::sort(slotOps.begin(), slotOps.end(), [](const SlotOps& a, const SlotOps& b) {
+        if (a.undrawn != b.undrawn) return a.undrawn && !b.undrawn;
+        // Newest undrawn first: an older backlog was keeping the camera's new chunks unmeshed.
+        if (a.undrawn) return a.first > b.first;
+        return a.first < b.first;
+    });
+    bool anyFresh = false;
+    std::vector<int> urgent;
+    for (int i = 0; i < static_cast<int>(ops.size()); ++i) {
+        const Op& op = ops[i];
+        if (op.slot < 0 || op.slot >= static_cast<int>(chunks.size()) || !chunks[op.slot].live) continue;
+        if (!chunks[op.slot].drawn) anyFresh = true;
+        else if (op.leads) urgent.push_back(i);
+    }
+    if (!anyFresh && urgent.empty() && !allowOld) return;
+    const int budget = anyFresh || !urgent.empty() ? 16 : 2;
+    const int perSlot = anyFresh || !urgent.empty() ? 1 : 2;
+    std::vector<int> order;
+    order.reserve(static_cast<size_t>(budget));
+    if (!anyFresh && !urgent.empty()) {
+        // Newest new surface first. These adds have no earlier op of the same
+        // keyframe, so they commute with the pose-update backlog and can be shown
+        // before that backlog, which otherwise drains at two ops per 200 ms.
+        std::sort(urgent.begin(), urgent.end(), [](int a, int b) { return a > b; });
+        std::unordered_set<int> seen;
+        for (int index : urgent) {
+            if (static_cast<int>(order.size()) >= budget) break;
+            if (!seen.insert(ops[index].slot).second) continue;
+            order.push_back(index);
+        }
+    } else {
+        for (const SlotOps& info : slotOps) {
+            if (anyFresh && !info.undrawn) continue;
+            if (static_cast<int>(order.size()) >= budget) break;
+            int taken = 0;
+            for (int i = info.first; i <= info.last && taken < perSlot; ++i) {
+                if (ops[i].slot != info.slot) continue;
+                if (ops[i].mode == 2) {
+                    int add = -1;
+                    for (int j = i + 1; j < static_cast<int>(ops.size()); ++j) {
+                        if (ops[j].slot == info.slot && ops[j].kfId == ops[i].kfId && ops[j].mode == 1) {
+                            add = j;
+                            break;
+                        }
+                    }
+                    // A subtract without its add punches a hole into the voxels, and the
+                    // next march of this chunk would show it.
+                    if (add < 0 || taken + 2 > perSlot || static_cast<int>(order.size()) + 2 > budget) break;
+                    order.push_back(i);
+                    order.push_back(add);
+                    taken += 2;
+                    i = add;
+                    continue;
+                }
+                order.push_back(i);
+                taken++;
+            }
+        }
+    }
+    for (int index : order) {
+        if (flushCount >= budget) break;
+        const Op& op = ops[index];
+        const bool slotOk = op.slot >= 0 && op.slot < static_cast<int>(chunks.size()) && chunks[op.slot].live;
+        if (!slotOk) {
+            picked.push_back(index);
+            continue;
+        }
+        int packed = 0;
+        if (op.mode != 3) {
+            packed = pack(op.kfId);
+            if (packed < 0) {
+                const int kf = findKf(op.kfId);
+                const bool gone = kf < 0 || static_cast<int>(keyframes[kf].depth.size()) < pixels;
+                if (gone) picked.push_back(index);
+                continue;
+            }
+        }
+        Flush& flush = flushes[flushCount];
+        flush.slot = op.slot;
+        flush.mode = op.mode;
+        flush.packed = packed;
+        flush.kfId = op.kfId;
+        std::memcpy(flush.pose, op.pose, sizeof(flush.pose));
+        flush.clearBefore = op.mode != 3 && !chunks[op.slot].cleared && !clearSeen[op.slot];
+        if (op.mode != 3) clearSeen[op.slot] = true;
+        flush.march = false;
+        flush.leads = op.leads;
         flushCount++;
+        picked.push_back(index);
+    }
+    for (int i = 0; i < flushCount; ++i) {
+        bool later = false;
+        for (int j = i + 1; j < flushCount; ++j) {
+            if (flushes[j].slot == flushes[i].slot) later = true;
+        }
+        flushes[i].march = !later;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    static auto lastLog = now;
+    if (now - lastLog >= std::chrono::seconds(1)) {
+        lastLog = now;
+        int live = 0;
+        int drawn = 0;
+        int fresh = 0;
+        for (const Chunk& chunk : chunks) {
+            if (!chunk.live) continue;
+            live++;
+            if (chunk.drawn) drawn++;
+        }
+        for (const Op& op : ops) {
+            if (op.slot < 0 || op.slot >= static_cast<int>(chunks.size())) continue;
+            if (chunks[op.slot].live && !chunks[op.slot].drawn) fresh++;
+        }
+        int urgentLeft = 0;
+        for (const Op& op : ops) {
+            if (op.leads && op.slot >= 0 && op.slot < static_cast<int>(chunks.size()) &&
+                chunks[op.slot].live && chunks[op.slot].drawn) {
+                urgentLeft++;
+            }
+        }
+        LOGI("chunks live=%d drawn=%d freshOps=%d urgent=%d queued=%zu cap=%d",
+             live, drawn, fresh, urgentLeft, ops.size(), kMaxChunks);
     }
 }
 
 void Volume::record(VkCommandBuffer cmd) {
-    if (!ready || flushCount == 0) return;
+    if (!ready) return;
     const int pixels = imageW * imageH;
+    if (flushCount > 0) {
     auto copyImage = [&](int packedIndex) {
         VkBufferCopy region{};
         region.srcOffset = static_cast<VkDeviceSize>(packedIndex) * pixels * 4;
@@ -555,7 +926,7 @@ void Volume::record(VkCommandBuffer cmd) {
         vkCmdCopyBuffer(cmd, stageColor.buffer, colorImage.buffer, 1, &region);
     };
     for (int i = 0; i < flushCount; ++i) {
-        for (int k = 0; k < flushes[i].kfCount; ++k) copyImage(flushes[i].packed[k]);
+        if (flushes[i].mode != 3) copyImage(flushes[i].packed);
     }
     barrier(cmd, depthImage.buffer, depthImage.size, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -564,51 +935,76 @@ void Volume::record(VkCommandBuffer cmd) {
 
     for (int i = 0; i < flushCount; ++i) {
         const Flush& flush = flushes[i];
-        IntegratePush clear{};
-        clear.origin[0] = flush.origin[0];
-        clear.origin[1] = flush.origin[1];
-        clear.origin[2] = flush.origin[2];
-        clear.voxelSize = voxelSize;
-        clear.voxelBase = flush.slot * kVoxels;
-        clear.mode = 0;
+        if (flush.slot < 0 || flush.slot >= static_cast<int>(chunks.size())) continue;
+        Chunk& chunk = chunks[flush.slot];
+        const float span = voxelSize * static_cast<float>(kGrid);
+        const float originX = chunk.x * span;
+        const float originY = chunk.y * span;
+        const float originZ = chunk.z * span;
+        if (flush.mode != 3) {
+        const int kfIndex = findKf(flush.kfId);
+        if (kfIndex < 0) continue;
+        const Kf& kf = keyframes[kfIndex];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, integrate.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, integrate.layout, 0, 1, &integrate.set, 0, nullptr);
-        vkCmdPushConstants(cmd, integrate.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(clear), &clear);
-        vkCmdDispatch(cmd, (kVoxels + 63) / 64, 1, 1);
-        barrier(cmd, voxels.buffer, voxels.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        for (int k = 0; k < flush.kfCount; ++k) {
-            const int packed = flush.packed[k];
-            const int kfIndex = findKf(flush.kfIds[k]);
-            if (kfIndex < 0) continue;
-            const Kf& kf = keyframes[kfIndex];
-            IntegratePush push{};
-            rowsOf(kf.pose, push.row0, push.row1, push.row2);
-            push.origin[0] = flush.origin[0];
-            push.origin[1] = flush.origin[1];
-            push.origin[2] = flush.origin[2];
-            push.voxelSize = voxelSize;
-            push.fx = kf.fx;
-            push.fy = kf.fy;
-            push.cx = kf.cx;
-            push.cy = kf.cy;
-            push.trunc = voxelSize * 2.f;
-            push.maxDepth = maxDepth;
-            push.depthW = static_cast<float>(imageW);
-            push.depthH = static_cast<float>(imageH);
-            push.voxelBase = flush.slot * kVoxels;
-            push.mode = 1;
-            push.depthBase = packed * pixels;
-            push.colorBase = packed * pixels;
-            vkCmdPushConstants(cmd, integrate.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        if (flush.clearBefore) {
+            IntegratePush clear{};
+            clear.origin[0] = originX;
+            clear.origin[1] = originY;
+            clear.origin[2] = originZ;
+            clear.voxelSize = voxelSize;
+            clear.voxelBase = flush.slot * kVoxels;
+            clear.mode = 0;
+            vkCmdPushConstants(cmd, integrate.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(clear), &clear);
             vkCmdDispatch(cmd, (kVoxels + 63) / 64, 1, 1);
             barrier(cmd, voxels.buffer, voxels.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            chunk.cleared = true;
+        }
+        IntegratePush push{};
+        rowsOf(flush.pose, push.row0, push.row1, push.row2);
+        push.origin[0] = originX;
+        push.origin[1] = originY;
+        push.origin[2] = originZ;
+        push.voxelSize = voxelSize;
+        push.fx = kf.fx;
+        push.fy = kf.fy;
+        push.cx = kf.cx;
+        push.cy = kf.cy;
+        push.trunc = voxelSize * 6.f;
+        push.maxDepth = maxDepth;
+        push.depthW = static_cast<float>(imageW);
+        push.depthH = static_cast<float>(imageH);
+        push.voxelBase = flush.slot * kVoxels;
+        push.mode = flush.mode;
+        push.depthBase = flush.packed * pixels;
+        push.colorBase = flush.packed * pixels;
+        vkCmdPushConstants(cmd, integrate.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (kVoxels + 63) / 64, 1, 1);
+        barrier(cmd, voxels.buffer, voxels.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        }
+        if (!flush.march) continue;
+        bool more = false;
+        for (int n = 0; n < static_cast<int>(ops.size()); ++n) {
+            if (ops[n].slot != flush.slot) continue;
+            if (std::find(picked.begin(), picked.end(), n) == picked.end()) more = true;
+        }
+        if (flush.mode == 2) {
+            bool addPending = false;
+            for (int n = 0; n < static_cast<int>(ops.size()); ++n) {
+                if (std::find(picked.begin(), picked.end(), n) != picked.end()) continue;
+                if (ops[n].slot == flush.slot && ops[n].kfId == flush.kfId && ops[n].mode == 1) addPending = true;
+            }
+            if (addPending) {
+                chunk.meshed = false;
+                continue;
+            }
         }
         McPush mc{};
-        mc.origin[0] = flush.origin[0];
-        mc.origin[1] = flush.origin[1];
-        mc.origin[2] = flush.origin[2];
+        mc.origin[0] = chunk.x * span;
+        mc.origin[1] = chunk.y * span;
+        mc.origin[2] = chunk.z * span;
         mc.voxelSize = voxelSize;
         mc.voxelBase = flush.slot * kVoxels;
         mc.slot = flush.slot;
@@ -622,10 +1018,25 @@ void Volume::record(VkCommandBuffer cmd) {
                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         barrier(cmd, lineDraw.buffer, lineDraw.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, marching.pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, marching.layout, 0, 1, &marching.set, 0, nullptr);
-        vkCmdPushConstants(cmd, marching.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mc), &mc);
-        vkCmdDispatch(cmd, (512 + 63) / 64, 1, 1);
+        auto march = [&](int pass) {
+            mc.frontier = pass;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, marching.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, marching.layout, 0, 1, &marching.set, 0, nullptr);
+            vkCmdPushConstants(cmd, marching.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mc), &mc);
+            vkCmdDispatch(cmd, (512 + 63) / 64, 1, 1);
+        };
+        march(0);
+        if (showFrontier) {
+            barrier(cmd, vertices.buffer, vertices.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            barrier(cmd, lineIndices.buffer, lineIndices.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            barrier(cmd, triDraw.buffer, triDraw.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            barrier(cmd, lineDraw.buffer, lineDraw.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            march(1);
+        }
         barrier(cmd, triDraw.buffer, triDraw.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         barrier(cmd, lineDraw.buffer, lineDraw.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -634,7 +1045,8 @@ void Volume::record(VkCommandBuffer cmd) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, clampDraw.layout, 0, 1, &clampDraw.set, 0, nullptr);
         vkCmdPushConstants(cmd, clampDraw.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mc), &mc);
         vkCmdDispatch(cmd, 1, 1, 1);
-        chunks[flush.slot].meshed = true;
+        chunk.drawn = true;
+        chunk.meshed = !more;
     }
     barrier(cmd, vertices.buffer, vertices.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
@@ -644,6 +1056,21 @@ void Volume::record(VkCommandBuffer cmd) {
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
     barrier(cmd, lineDraw.buffer, lineDraw.size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    }
+    if (!picked.empty()) {
+        std::vector<char> drop(ops.size(), 0);
+        for (int index : picked) {
+            if (index >= 0 && index < static_cast<int>(drop.size())) drop[index] = 1;
+        }
+        std::vector<Op> rest;
+        rest.reserve(ops.size());
+        for (int i = 0; i < static_cast<int>(ops.size()); ++i) {
+            if (!drop[i]) rest.push_back(ops[i]);
+        }
+        ops.swap(rest);
+        picked.clear();
+        reap();
+    }
 }
 
 void Volume::draw(VkCommandBuffer cmd, float fitX, float fitY) {
@@ -668,7 +1095,7 @@ void Volume::draw(VkCommandBuffer cmd, float fitX, float fitY) {
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertices.buffer, &offset);
     if (viewMode == 0) vkCmdBindIndexBuffer(cmd, lineIndices.buffer, 0, VK_INDEX_TYPE_UINT32);
     for (int slot = 0; slot < static_cast<int>(chunks.size()); ++slot) {
-        if (!chunks[slot].live || !chunks[slot].meshed) continue;
+        if (!chunks[slot].live || !chunks[slot].drawn) continue;
         if (viewMode == 0) {
             vkCmdDrawIndexedIndirect(cmd, lineDraw.buffer, static_cast<VkDeviceSize>(slot) * 20, 1, 20);
         } else {

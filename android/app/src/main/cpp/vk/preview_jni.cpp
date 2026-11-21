@@ -48,6 +48,12 @@ JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSetMode(
     if (preview != nullptr) preview->setMode(mode);
 }
 
+JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSetFrontier(
+    JNIEnv*, jobject, jlong handle, jboolean enabled) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview != nullptr) preview->setFrontier(enabled == JNI_TRUE);
+}
+
 JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSetView(
     JNIEnv* env, jobject, jlong handle, jfloatArray pose, jfloat fx, jfloat fy, jfloat cx, jfloat cy,
     jint width, jint height) {
@@ -91,9 +97,25 @@ JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeMeshErase(
     if (preview != nullptr) preview->meshErase(id);
 }
 
-JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeRedraw(JNIEnv*, jobject, jlong handle) {
+JNIEXPORT jint JNICALL Java_com_pocketscanner_capture_VkPreview_nativeChunkCount(JNIEnv*, jobject, jlong handle) {
     auto* preview = reinterpret_cast<Preview*>(handle);
-    if (preview != nullptr) preview->redraw();
+    return preview == nullptr ? 0 : preview->chunkCount();
+}
+
+JNIEXPORT jint JNICALL Java_com_pocketscanner_capture_VkPreview_nativeChunkPending(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    return preview == nullptr ? 0 : preview->chunkPending();
+}
+
+JNIEXPORT jint JNICALL Java_com_pocketscanner_capture_VkPreview_nativeChunkCap(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    return preview == nullptr ? 0 : preview->chunkCap();
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeRedraw(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr) return JNI_FALSE;
+    return preview->redraw() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeDestroy(JNIEnv*, jobject, jlong handle) {
