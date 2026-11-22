@@ -27,6 +27,7 @@
 #include <utility>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <vector>
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "pocket-splat", __VA_ARGS__)
@@ -76,14 +77,15 @@ struct ParamPush {
 };
 struct GridPush {
     int width, height, view, views, backward, pad0, pad1, pad2;
+    float tv;
 };
 struct AdamPush {
     int count, step;
-    float lrMean, lrColor, lrOp, lrQuat, lrScale, pad;
+    float lrMean, lrColor, lrOp, lrQuat, lrScale, eps, beta1, beta2;
 };
 struct GridAdamPush {
     int offset, count, step;
-    float lr;
+    float lr, beta1, beta2, eps;
 };
 struct SsimPush {
     int width, height, backward;
@@ -348,16 +350,19 @@ bool SplatTrainer::uploadGaussians(const float* verts, float voxel) {
     std::vector<Gauss> host(count);
     // Opacity starts at 0.5, so the 1/255 contour sits at this many standard deviations.
     // That contour reaches three quarters of the way to the next voxel.
-    const float contour = std::sqrt(2.f * std::log(127.5f));
-    const float sigma = std::max(voxel * 0.75f / contour, 1e-4f);
+    const float opacity = std::min(1.f - 1e-4f, std::max(1e-4f, hyper.seedOpacity));
+    const float contour = std::sqrt(2.f * std::log(255.f * opacity));
+    const float sigma = std::max(voxel * hyper.seedContour / contour, 1e-4f);
     const float tangent = std::log(sigma);
-    const float thin = std::log(std::max(sigma * 0.1f, 1e-4f));
+    const float thin = std::log(std::max(sigma * hyper.seedThin, 1e-4f));
+    const float opacityLogit = std::log(opacity / (1.f - opacity));
     for (int i = 0; i < count; ++i) {
         const float* v = verts + i * 9;
         Gauss g{};
         g.meanOp[0] = v[0];
         g.meanOp[1] = v[1];
         g.meanOp[2] = v[2];
+        g.meanOp[3] = opacityLogit;
         g.colorPad[0] = v[6];
         g.colorPad[1] = v[7];
         g.colorPad[2] = v[8];
@@ -392,7 +397,7 @@ bool SplatTrainer::uploadGaussians(const float* verts, float voxel) {
     }
     const float dx = maxX - minX, dy = maxY - minY, dz = maxZ - minZ;
     extent = std::sqrt(dx * dx + dy * dy + dz * dz);
-    if (extent < 1.f) extent = 1.f;
+    if (extent < hyper.extentFloor) extent = hyper.extentFloor;
     Buffer stage{};
     if (!core->buffer(host.size() * sizeof(Gauss), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, kHost, stage)) return false;
     std::memcpy(stage.mapped, host.data(), host.size() * sizeof(Gauss));
@@ -437,12 +442,72 @@ bool SplatTrainer::uploadIdentity() {
     return ok;
 }
 
-bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, int w, int h, int cap) {
+namespace {
+
+std::string num(double value) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.8g", value);
+    for (char* p = buf; *p != '\0'; ++p) {
+        if (*p == ',') *p = '.';
+    }
+    return buf;
+}
+
+} // namespace
+
+std::string SplatHyper::json() const {
+    std::ostringstream out;
+    out << "{\"lrMean\":" << num(lrMean)
+        << ",\"lrMeanEnd\":" << num(lrMeanEnd)
+        << ",\"lrScale\":" << num(lrScale)
+        << ",\"lrQuat\":" << num(lrQuat)
+        << ",\"lrOpacity\":" << num(lrOpacity)
+        << ",\"lrColor\":" << num(lrColor)
+        << ",\"lrGrid\":" << num(lrGrid)
+        << ",\"lrGridStart\":" << num(lrGridStart)
+        << ",\"lrGridEnd\":" << num(lrGridEnd)
+        << ",\"gridWarmMax\":" << gridWarmMax
+        << ",\"gridWarmDivisor\":" << gridWarmDivisor
+        << ",\"beta1\":" << num(beta1)
+        << ",\"beta2\":" << num(beta2)
+        << ",\"adamEps\":" << num(adamEps)
+        << ",\"ssimWeight\":" << num(ssimWeight)
+        << ",\"tvLambda\":" << num(tvLambda)
+        << ",\"densifyFrom\":" << densifyFrom
+        << ",\"densifyUntil\":" << densifyUntil
+        << ",\"densifyInterval\":" << densifyInterval
+        << ",\"gradThreshold\":" << num(gradThreshold)
+        << ",\"percentDense\":" << num(percentDense)
+        << ",\"pruneScale\":" << num(pruneScale)
+        << ",\"minOpacity\":" << num(minOpacity)
+        << ",\"splitFactor\":" << num(splitFactor)
+        << ",\"cloneShift\":" << num(cloneShift)
+        << ",\"opacityResetEvery\":" << opacityResetEvery
+        << ",\"opacityReset\":" << num(opacityReset)
+        << ",\"minKeep\":" << minKeep
+        << ",\"seedOpacity\":" << num(seedOpacity)
+        << ",\"seedContour\":" << num(seedContour)
+        << ",\"seedThin\":" << num(seedThin)
+        << ",\"extentFloor\":" << num(extentFloor)
+        << ",\"budget\":" << budget
+        << ",\"meanSteps\":" << meanSteps
+        << ",\"gridSteps\":" << gridSteps
+        << ",\"extent\":" << num(extent)
+        << "}";
+    return out.str();
+}
+
+bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, int w, int h, int cap, int meanHorizon, int gridHorizon) {
     destroy();
     if (n < 3 || viewCount < 1 || w < 16 || h < 16) return false;
     count = n;
     capacity = n;
     budget = std::max(n, cap);
+    meanSteps = std::max(1, meanHorizon);
+    gridSteps = std::max(1, gridHorizon);
+    hyper.budget = budget;
+    hyper.meanSteps = meanSteps;
+    hyper.gridSteps = gridSteps;
     views = viewCount;
     width = w;
     height = h;
@@ -455,6 +520,8 @@ bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, i
         destroy();
         return false;
     }
+    hyper.extent = extent;
+    hyperRecord = hyper.json();
     LOGI("splat %d gaussians, budget %d, extent %.2f m, %d views, %dx%d", count, budget, extent, views, width, height);
     return true;
 }
@@ -876,7 +943,10 @@ void SplatTrainer::bindPopulation() {
 }
 
 bool SplatTrainer::densify() {
-    if (gaussStep < 500 || gaussStep > 15000 || gaussStep % 100 != 0) return true;
+    if (gaussStep < hyper.densifyFrom || gaussStep > hyper.densifyUntil || hyper.densifyInterval < 1 ||
+        gaussStep % hyper.densifyInterval != 0) {
+        return true;
+    }
     auto clearStats = [&]() {
         if (!submit(core, [&](VkCommandBuffer cmd) { vkCmdFillBuffer(cmd, gpu->densify.buffer, 0, VK_WHOLE_SIZE, 0); })) {
             LOGI("splat densify stats clear failed");
@@ -892,9 +962,9 @@ bool SplatTrainer::densify() {
         LOGI("splat densify kept %d", count);
         return clearStats();
     }
-    const float splitAt = 0.01f * extent;
-    const float hugeAt = 0.1f * extent;
-    const bool resetOpacity = gaussStep % 3000 == 0;
+    const float splitAt = hyper.percentDense * extent;
+    const float hugeAt = hyper.pruneScale * extent;
+    const bool resetOpacity = hyper.opacityResetEvery > 0 && gaussStep % hyper.opacityResetEvery == 0;
     auto opacity = [](float logit) {
         const float x = std::max(-20.f, std::min(20.f, logit));
         return 1.f / (1.f + std::exp(-x));
@@ -907,12 +977,12 @@ bool SplatTrainer::densify() {
     for (int i = 0; i < count; ++i) {
         const float scale = maxScale(values[i]);
         const bool huge = scale > hugeAt;
-        const bool faint = opacity(values[i].meanOp[3]) < 0.005f;
+        const bool faint = opacity(values[i].meanOp[3]) < hyper.minOpacity;
         if (!huge) ++notHuge;
         if (!huge && !faint) ++kept;
     }
-    const bool dropHuge = notHuge >= 64;
-    const bool dropFaint = kept >= 64;
+    const bool dropHuge = notHuge >= hyper.minKeep;
+    const bool dropFaint = kept >= hyper.minKeep;
     bool edited = resetOpacity;
     std::vector<Gauss> nextG, nextM, nextV;
     nextG.reserve(static_cast<size_t>(count) + 1024);
@@ -936,7 +1006,7 @@ bool SplatTrainer::densify() {
         Gauss g = values[i];
         const float scale = maxScale(g);
         const bool huge = scale > hugeAt;
-        const bool faint = opacity(g.meanOp[3]) < 0.005f;
+        const bool faint = opacity(g.meanOp[3]) < hyper.minOpacity;
         if ((dropHuge && huge) || (dropFaint && faint)) {
             edited = true;
             continue;
@@ -945,7 +1015,7 @@ bool SplatTrainer::densify() {
         const float viewSum = row[0];
         const float hits = row[1];
         const float average = hits > 0.f ? viewSum / hits : 0.f;
-        const bool want = average > 0.0002f;
+        const bool want = average > hyper.gradThreshold;
         const bool room = static_cast<int>(nextG.size()) + 2 <= budget;
         const bool grow = want && room;
         if (grow) edited = true;
@@ -977,7 +1047,7 @@ bool SplatTrainer::densify() {
             float firstOffset[3];
             sample(firstOffset);
             sample(local);
-            const float shrink = std::log(1.6f);
+            const float shrink = std::log(std::max(hyper.splitFactor, 1.01f));
             g.scalePad[0] -= shrink;
             g.scalePad[1] -= shrink;
             g.scalePad[2] -= shrink;
@@ -994,7 +1064,7 @@ bool SplatTrainer::densify() {
             const float wx = row[4], wy = row[5], wz = row[6];
             const float len = std::sqrt(wx * wx + wy * wy + wz * wz);
             if (len < 1e-8f) {
-                const float axis[3] = {scale * 0.5f, 0.f, 0.f};
+                const float axis[3] = {scale * hyper.cloneShift, 0.f, 0.f};
                 rotate(g.quat, axis, local);
             } else {
                 const float step = std::min(len / hits, scale);
@@ -1011,7 +1081,8 @@ bool SplatTrainer::densify() {
     }
     if (nextG.size() < 3 || !edited) return clearStats();
     if (resetOpacity) {
-        const float logit = std::log(0.01f / 0.99f);
+        const float reset = std::min(1.f - 1e-4f, std::max(1e-4f, hyper.opacityReset));
+        const float logit = std::log(reset / (1.f - reset));
         for (size_t i = 0; i < nextG.size(); ++i) {
             nextG[i].meanOp[3] = logit;
             nextM[i].meanOp[3] = 0.f;
@@ -1089,6 +1160,7 @@ bool SplatTrainer::step(const float* rgb, const float pose[16], float fx, float 
     grid.view = view;
     grid.views = views;
     grid.backward = 0;
+    grid.tv = hyper.tvLambda;
     if (!submit(core, [&](VkCommandBuffer cmd) {
             dispatch(cmd, gpu->slice, &grid, sizeof(grid), (width + 7) / 8, (height + 7) / 8);
             barrier(cmd, gpu->corrected.buffer, gpu->corrected.size);
@@ -1100,7 +1172,7 @@ bool SplatTrainer::step(const float* rgb, const float pose[16], float fx, float 
     SsimPush ssim{};
     ssim.width = width;
     ssim.height = height;
-    ssim.scale = -0.2f / (static_cast<float>(pixels) * 3.f);
+    ssim.scale = -hyper.ssimWeight / (static_cast<float>(pixels) * 3.f);
     BackPush back{};
     back.tilesX = tilesX;
     back.tilesY = tilesY;
@@ -1146,11 +1218,15 @@ bool SplatTrainer::step(const float* rgb, const float pose[16], float fx, float 
         AdamPush adam{};
         adam.count = count;
         adam.step = gaussStep;
-        adam.lrMean = 1.6e-4f;
-        adam.lrColor = 2.5e-3f;
-        adam.lrOp = 5e-2f;
-        adam.lrQuat = 1e-3f;
-        adam.lrScale = 5e-3f;
+        const float meanProgress = std::min(1.f, static_cast<float>(gaussStep) / static_cast<float>(hyper.meanSteps));
+        adam.lrMean = hyper.lrMean * std::pow(hyper.lrMeanEnd, meanProgress);
+        adam.lrColor = hyper.lrColor;
+        adam.lrOp = hyper.lrOpacity;
+        adam.lrQuat = hyper.lrQuat;
+        adam.lrScale = hyper.lrScale;
+        adam.eps = hyper.adamEps;
+        adam.beta1 = hyper.beta1;
+        adam.beta2 = hyper.beta2;
         if (!submit(core, [&](VkCommandBuffer cmd) {
                 dispatch(cmd, gpu->adam, &adam, sizeof(adam), (count + 63) / 64, 1);
             })) {
@@ -1163,7 +1239,22 @@ bool SplatTrainer::step(const float* rgb, const float pose[16], float fx, float 
     gridAdam.offset = view * kGridCell;
     gridAdam.count = kGridCell;
     gridAdam.step = gridStep;
-    gridAdam.lr = 2e-3f;
+    const int warmCap = std::max(1, hyper.gridWarmMax);
+    const int warmDiv = std::max(1, hyper.gridWarmDivisor);
+    const int warm = std::max(1, std::min(warmCap, hyper.gridSteps / warmDiv));
+    float gridLr = hyper.lrGrid;
+    if (gridStep <= warm) {
+        const float u = static_cast<float>(gridStep) / static_cast<float>(warm);
+        gridLr *= hyper.lrGridStart + (1.f - hyper.lrGridStart) * u;
+    } else {
+        const float span = static_cast<float>(std::max(1, hyper.gridSteps - warm));
+        const float u = std::min(1.f, static_cast<float>(gridStep - warm) / span);
+        gridLr *= std::pow(hyper.lrGridEnd, u);
+    }
+    gridAdam.lr = gridLr;
+    gridAdam.beta1 = hyper.beta1;
+    gridAdam.beta2 = hyper.beta2;
+    gridAdam.eps = hyper.adamEps;
     if (!submit(core, [&](VkCommandBuffer cmd) {
             dispatch(cmd, gpu->adamGrid, &gridAdam, sizeof(gridAdam), (kGridCell + 63) / 64, 1);
         })) {

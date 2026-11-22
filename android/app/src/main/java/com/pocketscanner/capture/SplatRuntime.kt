@@ -20,6 +20,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
@@ -104,9 +105,14 @@ internal object SplatRuntime {
             fail(context, "No frames to train")
             return
         }
-        writeRun(dir, settings)
+        val every = settings.validationEvery.coerceAtLeast(1)
+        val valPasses = if (validation.isEmpty()) 0 else settings.epochs / every
+        val meanSteps = (settings.epochs * train.size).coerceAtLeast(1)
+        val gridSteps = (meanSteps + valPasses * validation.size).coerceAtLeast(1)
+        writeRun(dir, settings, meanSteps, gridSteps)
         val viewIndex = usable.mapIndexed { index, frame -> frame.id to index }.toMap()
-        val seeded = preview.splatInitFromSeed(usable.size, width, height, settings.gaussBudget)
+        val seeded = preview.splatInitFromSeed(usable.size, width, height, settings.gaussBudget, meanSteps, gridSteps)
+        if (seeded) writeHyper(dir, settings, preview.splatHyperJson())
         if (!seeded) {
             session.resumeAfterSplat()
             fail(context, "The GPU trainer did not start")
@@ -119,7 +125,6 @@ internal object SplatRuntime {
         valDir.mkdirs()
         val trainSeries = ArrayList<TrainMetric>()
         val valSeries = ArrayList<TrainMetric>()
-        val every = settings.validationEvery.coerceAtLeast(1)
         val video = File(dir, "video.mp4")
         var finishedEpochs = 0
         var failed = false
@@ -313,10 +318,20 @@ internal object SplatRuntime {
         publish { it.copy(log = (it.log + line).takeLast(12)) }
     }
 
-    private fun writeRun(dir: File, settings: ScanSettings) {
+    private fun writeRun(dir: File, settings: ScanSettings, meanSteps: Int, gridSteps: Int) {
         File(dir, "run.json").writeText(
-            """{"epochs":${settings.epochs},"validation":${settings.validation},"percent":${settings.validationPercent},"every":${settings.validationEvery},"budget":${settings.gaussBudget},"videoSeconds":${settings.videoSeconds},"lrMean":1.6e-4,"lrScale":5.0e-3,"lrQuat":1.0e-3,"lrOpacity":5.0e-2,"lrColor":2.5e-3,"lrGrid":2.0e-3}""",
+            """{"epochs":${settings.epochs},"validation":${settings.validation},"percent":${settings.validationPercent},"every":${settings.validationEvery},"budget":${settings.gaussBudget},"videoSeconds":${settings.videoSeconds},"meanSteps":$meanSteps,"gridSteps":$gridSteps}""",
         )
+    }
+
+    private fun writeHyper(dir: File, settings: ScanSettings, training: String) {
+        val json = runCatching { JSONObject(training) }.getOrElse { JSONObject() }
+        json.put("epochs", settings.epochs)
+        json.put("validation", settings.validation)
+        json.put("validationPercent", settings.validationPercent)
+        json.put("validationEvery", settings.validationEvery)
+        json.put("videoSeconds", settings.videoSeconds)
+        File(dir, "hyperparameters.json").writeText(json.toString(2))
     }
 
     private fun append(file: File, epoch: Int, split: String, metric: TrainMetric) {

@@ -20,18 +20,20 @@ struct AdamPush {
     float lrOp;
     float lrQuat;
     float lrScale;
-    float pad;
+    float eps;
+    float beta1;
+    float beta2;
 };
 
 [[vk::push_constant]]
 AdamPush pc;
 
-float adam1(float v, float g, inout float m, inout float vel, float lr, float b1, float b2, float bc1, float bc2) {
+float adam1(float v, float g, inout float m, inout float vel, float lr, float b1, float b2, float bc1, float bc2, float eps) {
     m = b1 * m + (1.0 - b1) * g;
     vel = b2 * vel + (1.0 - b2) * g * g;
     float mh = m / bc1;
     float vh = vel / bc2;
-    return v - lr * mh / (sqrt(vh) + 1e-8);
+    return v - lr * mh / (sqrt(vh) + eps);
 }
 
 [shader("compute")]
@@ -42,20 +44,20 @@ void adamGauss(uint3 tid : SV_DispatchThreadID) {
     Gauss g = grad[tid.x];
     Gauss m = moment[tid.x];
     Gauss s = vel[tid.x];
-    float b1 = 0.9;
-    float b2 = 0.999;
+    float b1 = pc.beta1;
+    float b2 = pc.beta2;
     float bc1 = 1.0 - pow(b1, float(pc.step));
     float bc2 = 1.0 - pow(b2, float(pc.step));
     [unroll]
     for (int k = 0; k < 3; ++k) {
-        v.meanOp[k] = adam1(v.meanOp[k], g.meanOp[k], m.meanOp[k], s.meanOp[k], pc.lrMean, b1, b2, bc1, bc2);
-        v.colorPad[k] = adam1(v.colorPad[k], g.colorPad[k], m.colorPad[k], s.colorPad[k], pc.lrColor, b1, b2, bc1, bc2);
-        v.scalePad[k] = adam1(v.scalePad[k], g.scalePad[k], m.scalePad[k], s.scalePad[k], pc.lrScale, b1, b2, bc1, bc2);
+        v.meanOp[k] = adam1(v.meanOp[k], g.meanOp[k], m.meanOp[k], s.meanOp[k], pc.lrMean, b1, b2, bc1, bc2, pc.eps);
+        v.colorPad[k] = adam1(v.colorPad[k], g.colorPad[k], m.colorPad[k], s.colorPad[k], pc.lrColor, b1, b2, bc1, bc2, pc.eps);
+        v.scalePad[k] = adam1(v.scalePad[k], g.scalePad[k], m.scalePad[k], s.scalePad[k], pc.lrScale, b1, b2, bc1, bc2, pc.eps);
     }
-    v.meanOp.w = adam1(v.meanOp.w, g.meanOp.w, m.meanOp.w, s.meanOp.w, pc.lrOp, b1, b2, bc1, bc2);
+    v.meanOp.w = adam1(v.meanOp.w, g.meanOp.w, m.meanOp.w, s.meanOp.w, pc.lrOp, b1, b2, bc1, bc2, pc.eps);
     [unroll]
     for (int k = 0; k < 4; ++k) {
-        v.quat[k] = adam1(v.quat[k], g.quat[k], m.quat[k], s.quat[k], pc.lrQuat, b1, b2, bc1, bc2);
+        v.quat[k] = adam1(v.quat[k], g.quat[k], m.quat[k], s.quat[k], pc.lrQuat, b1, b2, bc1, bc2, pc.eps);
     }
     v.quat = v.quat * rsqrt(max(dot(v.quat, v.quat), 1e-12));
     v.colorPad.xyz = saturate(v.colorPad.xyz);

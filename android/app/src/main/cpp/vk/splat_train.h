@@ -3,7 +3,55 @@
 #include "vk_device.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
+
+// Every training knob lives here. The run writes this record next to the metrics.
+struct SplatHyper {
+    float lrMean = 1.6e-4f;
+    float lrMeanEnd = 0.01f;
+    float lrScale = 5e-3f;
+    float lrQuat = 1e-3f;
+    float lrOpacity = 5e-2f;
+    float lrColor = 2.5e-3f;
+    float lrGrid = 2e-3f;
+    float lrGridStart = 0.01f;
+    float lrGridEnd = 0.01f;
+    int gridWarmMax = 1000;
+    int gridWarmDivisor = 5;
+
+    float beta1 = 0.9f;
+    float beta2 = 0.999f;
+    float adamEps = 1e-15f;
+
+    float ssimWeight = 0.2f;
+    float tvLambda = 0.01f;
+
+    int densifyFrom = 500;
+    int densifyUntil = 15000;
+    int densifyInterval = 100;
+    float gradThreshold = 1e-2f;
+    float percentDense = 0.01f;
+    float pruneScale = 0.1f;
+    float minOpacity = 0.005f;
+    float splitFactor = 1.6f;
+    float cloneShift = 0.5f;
+    int opacityResetEvery = 3000;
+    float opacityReset = 0.01f;
+    int minKeep = 64;
+
+    float seedOpacity = 0.5f;
+    float seedContour = 0.75f;
+    float seedThin = 0.1f;
+    float extentFloor = 1.f;
+
+    int budget = 0;
+    int meanSteps = 1;
+    int gridSteps = 1;
+    float extent = 1.f;
+
+    std::string json() const;
+};
 
 // One training run. The preview thread owns the Vulkan queue, so every call
 // happens there. Gaussians stay on the device for the whole run.
@@ -11,7 +59,7 @@ struct SplatTrainer {
     explicit SplatTrainer(VkCore* core);
     ~SplatTrainer();
 
-    bool init(const float* verts, int count, float voxel, int views, int width, int height, int budget);
+    bool init(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps);
     // metricsAfter is the validation pass: the grid steps, then the numbers are read.
     bool step(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy,
               int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[3]);
@@ -21,6 +69,7 @@ struct SplatTrainer {
     void destroy();
 
     int gaussianCount() const { return count; }
+    const char* hyperJson() const { return hyperRecord.c_str(); }
     int viewWidth() const { return width; }
     int viewHeight() const { return height; }
 
@@ -58,7 +107,11 @@ private:
     int gridStep = 0;
     int budget = 0;
     int capacity = 0;
+    int meanSteps = 1;
+    int gridSteps = 1;
     float extent = 1.f;
+    SplatHyper hyper;
+    std::string hyperRecord;
     char error[160] = {};
 
 public:

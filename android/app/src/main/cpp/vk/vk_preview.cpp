@@ -891,10 +891,10 @@ bool Preview::captureSeedFromFile(const char* path, int cap) {
     return true;
 }
 
-bool Preview::splatInitFromSeed(int views, int width, int height, int budget) {
+bool Preview::splatInitFromSeed(int views, int width, int height, int budget, int meanSteps, int gridSteps) {
     if (seed.size() < 27) return false;
     if (splat == nullptr) splat = new SplatTrainer(&core);
-    const bool ok = splat->init(seed.data(), static_cast<int>(seed.size() / 9), seedVoxelSize, views, width, height, budget);
+    const bool ok = splat->init(seed.data(), static_cast<int>(seed.size() / 9), seedVoxelSize, views, width, height, budget, meanSteps, gridSteps);
     seed.clear();
     seed.shrink_to_fit();
     return ok;
@@ -902,9 +902,9 @@ bool Preview::splatInitFromSeed(int views, int width, int height, int budget) {
 
 void Preview::dropMesh() { volume.dropHeavy(); }
 
-bool Preview::splatInit(const float* verts, int count, float voxel, int views, int width, int height, int budget) {
+bool Preview::splatInit(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps) {
     if (splat == nullptr) splat = new SplatTrainer(&core);
-    return splat->init(verts, count, voxel, views, width, height, budget);
+    return splat->init(verts, count, voxel, views, width, height, budget, meanSteps, gridSteps);
 }
 
 bool Preview::splatStep(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy, int view,
@@ -921,6 +921,8 @@ bool Preview::splatRead(uint8_t* rgb) { return splat != nullptr && splat->readCo
 bool Preview::splatWritePly(const char* path) { return splat != nullptr && splat->writePly(path); }
 
 const char* Preview::splatError() const { return splat == nullptr ? "" : splat->lastError(); }
+
+const char* Preview::splatHyper() const { return splat == nullptr ? "{}" : splat->hyperJson(); }
 
 int Preview::splatGaussianCount() const { return splat == nullptr ? 0 : splat->gaussianCount(); }
 

@@ -27,6 +27,7 @@ struct GridPush {
     int pad0;
     int pad1;
     int pad2;
+    float tv;
 };
 
 [[vk::push_constant]]
@@ -176,6 +177,6 @@ void gridTv(uint3 tid : SV_DispatchThreadID) {
     if (x > 0) g += sign(v - grid[cellIndex(view, c, l, y, x - 1)]);
     if (y > 0) g += sign(v - grid[cellIndex(view, c, l, y - 1, x)]);
     if (l > 0) g += sign(v - grid[cellIndex(view, c, l - 1, y, x)]);
-    int q = int(clamp(g * 0.01 * kGradScale, -2000000000.0, 2000000000.0));
+    int q = int(clamp(g * pc.tv * kGradScale, -2000000000.0, 2000000000.0));
     if (q != 0) InterlockedAdd(gridGrad[cellIndex(view, c, l, y, x)], q);
 }

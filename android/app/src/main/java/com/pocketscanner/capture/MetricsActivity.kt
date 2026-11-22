@@ -9,8 +9,11 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -33,6 +36,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -136,6 +140,12 @@ private fun RunList(
 @Composable
 private fun RunDetail(dir: File, live: TrainUi, onBack: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
+    var fullImage by remember { mutableStateOf<ImageBitmap?>(null) }
+    var fullVideo by remember { mutableStateOf(false) }
+    BackHandler(enabled = fullImage != null || fullVideo) {
+        fullImage = null
+        fullVideo = false
+    }
     val pair = remember(dir, live.epoch, live.fraction) { SplatRuntime.readMetrics(dir) }
     val lines = buildList {
         if (pair.first.isNotEmpty()) add(series("Train", Color(0xFF8AB4F8), pair.first))
@@ -145,6 +155,7 @@ private fun RunDetail(dir: File, live: TrainUi, onBack: () -> Unit) {
         File(dir, "val").listFiles { file -> file.isFile && file.name.endsWith(".png") }?.sortedBy { it.name } ?: emptyList()
     }
     val video = File(dir, "video.mp4")
+    Box(modifier = Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -174,20 +185,28 @@ private fun RunDetail(dir: File, live: TrainUi, onBack: () -> Unit) {
                         Image(
                             bitmap = bitmap.asImageBitmap(),
                             contentDescription = file.nameWithoutExtension,
-                            modifier = Modifier.width(160.dp).height(120.dp),
+                            modifier = Modifier
+                                .width(160.dp)
+                                .height(120.dp)
+                                .clickable { fullImage = bitmap.asImageBitmap() },
                             contentScale = ContentScale.Fit,
                         )
                     }
                 }
             }
         }
-        Text("Video", color = scheme.onSurface, style = MaterialTheme.typography.titleSmall)
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Video", color = scheme.onSurface, style = MaterialTheme.typography.titleSmall)
+            if (video.isFile && video.length() >= 32) {
+                TextButton(onClick = { fullVideo = true }) { Text("Full screen") }
+            }
+        }
         if (!video.isFile || video.length() < 32) {
             Text(
                 "No video yet. It is written after a validation pass, once the scan has at least two frames.",
                 color = scheme.onSurfaceVariant,
             )
-        } else {
+        } else if (!fullVideo) {
             AndroidView(
                 modifier = Modifier.fillMaxWidth().height(220.dp),
                 factory = { viewContext ->
@@ -202,6 +221,42 @@ private fun RunDetail(dir: File, live: TrainUi, onBack: () -> Unit) {
                 onRelease = { it.stopPlayback() },
             )
         }
+    }
+        fullImage?.let { bitmap -> FullscreenImage(bitmap) { fullImage = null } }
+        if (fullVideo) FullscreenVideo(video) { fullVideo = false }
+    }
+}
+
+@Composable
+internal fun FullscreenImage(bitmap: ImageBitmap, onClose: () -> Unit) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black).belowSystemBars().clickable(onClick = onClose)) {
+        Image(
+            bitmap = bitmap,
+            contentDescription = "Full screen",
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentScale = ContentScale.Fit,
+        )
+        TextButton(onClick = onClose, modifier = Modifier.padding(12.dp)) { Text("Close") }
+    }
+}
+
+@Composable
+internal fun FullscreenVideo(file: File, onClose: () -> Unit) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black).belowSystemBars()) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { viewContext ->
+                VideoView(viewContext).apply {
+                    setVideoURI(Uri.fromFile(file))
+                    setOnPreparedListener { player ->
+                        player.isLooping = true
+                        start()
+                    }
+                }
+            },
+            onRelease = { it.stopPlayback() },
+        )
+        TextButton(onClick = onClose, modifier = Modifier.padding(12.dp)) { Text("Close") }
     }
 }
 

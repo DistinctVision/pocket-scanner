@@ -7,11 +7,14 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -101,6 +105,8 @@ private fun TrainScreen(ui: TrainUi, onStop: () -> Unit, onBack: () -> Unit, onM
     val scheme = MaterialTheme.colorScheme
     var compare by remember { mutableStateOf<File?>(null) }
     var open by remember { mutableStateOf(false) }
+    var fullImage by remember { mutableStateOf<ImageBitmap?>(null) }
+    BackHandler(enabled = fullImage != null) { fullImage = null }
     val context = LocalContext.current
     val others = remember(ui.runDir) {
         SplatRuntime.runs(context).filter { it.absolutePath != ui.runDir }
@@ -112,6 +118,7 @@ private fun TrainScreen(ui: TrainUi, onStop: () -> Unit, onBack: () -> Unit, onM
         if (compared != null && compared.first.isNotEmpty()) add(plot("Compare train", Color(0xFFF6C945), compared.first))
         if (compared != null && compared.second.isNotEmpty()) add(plot("Compare val", Color(0xFF81C995), compared.second))
     }
+    Box(modifier = Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -151,7 +158,11 @@ private fun TrainScreen(ui: TrainUi, onStop: () -> Unit, onBack: () -> Unit, onM
         }
         MetricColumn(lines = lines, height = 160.dp)
         ui.image?.let { image ->
-            Image(bitmap = image.asImageBitmap(), contentDescription = "Validation", modifier = Modifier.fillMaxWidth())
+            Image(
+                bitmap = image.asImageBitmap(),
+                contentDescription = "Validation",
+                modifier = Modifier.fillMaxWidth().clickable { fullImage = image.asImageBitmap() },
+            )
         }
         ui.log.forEach { line ->
             Text(line, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
@@ -164,6 +175,8 @@ private fun TrainScreen(ui: TrainUi, onStop: () -> Unit, onBack: () -> Unit, onM
             }
             TextButton(onClick = onMetrics, modifier = Modifier.weight(1f)) { Text("Metrics") }
         }
+    }
+        fullImage?.let { bitmap -> FullscreenImage(bitmap) { fullImage = null } }
     }
 }
 
