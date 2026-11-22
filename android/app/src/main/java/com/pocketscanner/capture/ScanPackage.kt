@@ -70,15 +70,49 @@ internal class PackageFrame(
     val depth: ByteArray,
 )
 
-internal class ScanDocument(
+internal class ScanHeader(
     val voxelCm: Int,
     val reviewVoxelCm: Int,
     val depthScale: Float,
-    val frames: List<PackageFrame>,
 )
 
 internal object ScanPackage {
-    fun write(dest: OutputStream, scan: ScanSettings, shots: List<ShotMeta>, load: (ShotMeta) -> PackageShot) {
+    fun cachedMesh(context: Context): File = File(context.getExternalFilesDir(null), "packages/loaded-mesh.bin")
+
+    /** Copies mesh.bin into an already saved package. The original stays unchanged if the write fails. */
+    fun attachMesh(context: Context, uri: Uri, mesh: File) {
+        val dir = File(context.getExternalFilesDir(null), "packages")
+        dir.mkdirs()
+        val source = File(dir, "mesh-src.pscan")
+        val rewritten = File(dir, "mesh-out.pscan")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            source.outputStream().use { input.copyTo(it) }
+        } ?: error("The scan file could not be opened")
+        ZipFile(source).use { zip ->
+            ZipOutputStream(rewritten.outputStream().buffered()).use { out ->
+                val entries = zip.entries()
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    if (entry.name == "mesh.bin") continue
+                    out.putNextEntry(ZipEntry(entry.name))
+                    zip.getInputStream(entry).use { it.copyTo(out) }
+                    out.closeEntry()
+                }
+                out.putNextEntry(ZipEntry("mesh.bin"))
+                mesh.inputStream().use { it.copyTo(out) }
+                out.closeEntry()
+            }
+        }
+        val output = context.contentResolver.openOutputStream(uri, "wt")
+            ?: error("The scan file is not writable")
+        output.use { stream ->
+            rewritten.inputStream().use { it.copyTo(stream) }
+        }
+        rewritten.delete()
+        source.delete()
+    }
+
+    fun write(dest: OutputStream, scan: ScanSettings, shots: List<ShotMeta>, mesh: File?, load: (ShotMeta) -> PackageShot) {
         val depthScale = shots.first().depthScale
         val manifest = JSONObject()
         manifest.put("format", "pocket-scan")
@@ -111,10 +145,17 @@ internal object ScanPackage {
                 putBytes(zip, "frames/${shot.id}.png", png(shot))
                 putBytes(zip, "frames/${shot.id}.z16", packDepth(shot))
             }
+            if (mesh != null && mesh.isFile && mesh.length() > 16) {
+                val entry = ZipEntry("mesh.bin")
+                entry.method = ZipEntry.DEFLATED
+                zip.putNextEntry(entry)
+                mesh.inputStream().use { it.copyTo(zip) }
+                zip.closeEntry()
+            }
         }
     }
 
-    fun read(context: Context, uri: Uri): ScanDocument {
+    fun read(context: Context, uri: Uri, prepare: (ScanHeader) -> Unit, accept: (PackageFrame) -> Unit) {
         val kept = File(context.getExternalFilesDir(null), "packages/loaded.pscan")
         kept.parentFile?.mkdirs()
         val input = context.contentResolver.openInputStream(uri)
@@ -123,13 +164,30 @@ internal object ScanPackage {
             kept.outputStream().use { stream.copyTo(it) }
         }
         ZipFile(kept).use { zip ->
+            val meshOut = cachedMesh(context)
+            val meshEntry = zip.getEntry("mesh.bin")
+            if (meshEntry != null) {
+                meshOut.parentFile?.mkdirs()
+                zip.getInputStream(meshEntry).use { input ->
+                    meshOut.outputStream().use { input.copyTo(it) }
+                }
+            } else {
+                meshOut.delete()
+            }
             val manifestEntry = zip.getEntry("manifest.json") ?: error("Not a scan package")
             val manifest = JSONObject(zip.getInputStream(manifestEntry).bufferedReader().readText())
             if (manifest.optString("format") != "pocket-scan") error("Not a scan package")
             if (manifest.optInt("version") != 1) error("Unsupported scan package")
             val depthScale = manifest.getDouble("depthScale").toFloat()
+            prepare(
+                ScanHeader(
+                    manifest.optInt("voxelCm", 8),
+                    manifest.optInt("reviewVoxelCm", 2),
+                    depthScale,
+                ),
+            )
             val listed = manifest.getJSONArray("frames")
-            val frames = ArrayList<PackageFrame>(listed.length())
+            var count = 0
             for (index in 0 until listed.length()) {
                 val frame = listed.getJSONObject(index)
                 val id = frame.getInt("id")
@@ -144,8 +202,7 @@ internal object ScanPackage {
                 val png = entryBytes(zip, colorName)
                 val z16 = entryBytes(zip, depthName)
                 if (z16.size != width * height * 2) error("Frame $id depth size")
-                val rgb = rgb(png, width, height)
-                frames.add(
+                accept(
                     PackageFrame(
                         id,
                         width,
@@ -156,18 +213,13 @@ internal object ScanPackage {
                         frame.getDouble("cy").toFloat(),
                         depthScale,
                         pose,
-                        rgb,
+                        rgb(png, width, height),
                         z16,
                     ),
                 )
+                count++
             }
-            if (frames.isEmpty()) error("The package has no frames")
-            return ScanDocument(
-                manifest.optInt("voxelCm", 8),
-                manifest.optInt("reviewVoxelCm", 2),
-                depthScale,
-                frames,
-            )
+            if (count == 0) error("The package has no frames")
         }
     }
 

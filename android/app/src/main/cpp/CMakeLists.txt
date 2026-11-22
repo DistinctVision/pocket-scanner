@@ -84,7 +84,7 @@ function(slang_shader source entry stage symbol)
         COMMAND ${SLANGC} "${source}" -target spirv -profile spirv_1_3 -stage ${stage} -entry ${entry}
                 -matrix-layout-row-major -o "${spv}"
         COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/vk/spv_to_c.py" "${spv}" "${header}" "${symbol}"
-        DEPENDS "${source}" "${CMAKE_CURRENT_SOURCE_DIR}/vk/spv_to_c.py"
+        DEPENDS "${source}" "${CMAKE_CURRENT_SOURCE_DIR}/vk/spv_to_c.py" "${SHADER_DIR}/splat_common.slang"
         VERBATIM)
 endfunction()
 
@@ -94,19 +94,48 @@ slang_shader("${SHADER_DIR}/marching.slang" clampDraw compute clamp_draw_spv)
 slang_shader("${SHADER_DIR}/marching.slang" marching compute marching_spv)
 slang_shader("${SHADER_DIR}/mesh.slang" meshVert vertex mesh_vert_spv)
 slang_shader("${SHADER_DIR}/mesh.slang" meshFrag fragment mesh_frag_spv)
+slang_shader("${SHADER_DIR}/splat_project.slang" project compute splat_project_spv)
+slang_shader("${SHADER_DIR}/splat_tile.slang" clearTiles compute splat_clear_spv)
+slang_shader("${SHADER_DIR}/splat_tile.slang" binSplats compute splat_bin_spv)
+slang_shader("${SHADER_DIR}/splat_tile.slang" sortTiles compute splat_sort_spv)
+slang_shader("${SHADER_DIR}/splat_blend.slang" blendForward compute splat_blend_spv)
+slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackward compute splat_back_spv)
+slang_shader("${SHADER_DIR}/splat_params.slang" paramGrad compute splat_params_spv)
+slang_shader("${SHADER_DIR}/bilagrid.slang" sliceGrid compute bilagrid_slice_spv)
+slang_shader("${SHADER_DIR}/bilagrid.slang" gridTv compute bilagrid_tv_spv)
+slang_shader("${SHADER_DIR}/splat_adam.slang" adamGauss compute splat_adam_spv)
+slang_shader("${SHADER_DIR}/splat_adam_grid.slang" adamGrid compute splat_adam_grid_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" ssimForward compute ssim_fwd_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" ssimBackward compute ssim_back_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" reduceLoss compute ssim_reduce_spv)
 list(APPEND SHADER_HEADERS
     "${SHADER_OUT}/integrate_spv.h"
     "${SHADER_OUT}/clear_draw_spv.h"
     "${SHADER_OUT}/clamp_draw_spv.h"
     "${SHADER_OUT}/marching_spv.h"
     "${SHADER_OUT}/mesh_vert_spv.h"
-    "${SHADER_OUT}/mesh_frag_spv.h")
+    "${SHADER_OUT}/mesh_frag_spv.h"
+    "${SHADER_OUT}/splat_project_spv.h"
+    "${SHADER_OUT}/splat_clear_spv.h"
+    "${SHADER_OUT}/splat_bin_spv.h"
+    "${SHADER_OUT}/splat_sort_spv.h"
+    "${SHADER_OUT}/splat_blend_spv.h"
+    "${SHADER_OUT}/splat_back_spv.h"
+    "${SHADER_OUT}/splat_params_spv.h"
+    "${SHADER_OUT}/bilagrid_slice_spv.h"
+    "${SHADER_OUT}/bilagrid_tv_spv.h"
+    "${SHADER_OUT}/splat_adam_spv.h"
+    "${SHADER_OUT}/splat_adam_grid_spv.h"
+    "${SHADER_OUT}/ssim_fwd_spv.h"
+    "${SHADER_OUT}/ssim_back_spv.h"
+    "${SHADER_OUT}/ssim_reduce_spv.h")
 
 add_library(pocket_vk SHARED
     vk/vk_device.cpp
     vk/vk_preview.cpp
     vk/preview_jni.cpp
     vk/volume.cpp
+    vk/splat_train.cpp
     ${SHADER_HEADERS})
 set_source_files_properties(${SHADER_HEADERS} PROPERTIES HEADER_FILE_ONLY TRUE)
 target_include_directories(pocket_vk PRIVATE "${SHADER_OUT}")

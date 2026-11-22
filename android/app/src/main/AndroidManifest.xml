@@ -5,6 +5,9 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:allowBackup="false"
@@ -14,6 +17,7 @@
         android:icon="@android:drawable/ic_menu_camera"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:largeHeap="true"
         android:theme="@style/Theme.Capture">
         <meta-data
             android:name="android.game_mode_config"
@@ -46,6 +50,18 @@
             android:name=".ScansActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
+        <activity
+            android:name=".TrainActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
+            android:name=".MetricsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <service
+            android:name=".TrainService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.files"

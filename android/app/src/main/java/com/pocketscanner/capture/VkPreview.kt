@@ -98,6 +98,8 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
 
     fun chunkPending(): Int = shownPending.get()
 
+    fun chunkUndrawn(): Int = shownUndrawn.get()
+
     fun chunkCap(): Int = shownCap.get()
 
     fun meshConfigure(voxelSize: Float, maxDepth: Float): Boolean {
@@ -230,6 +232,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private fun publishChunks(handle: Long) {
         shownChunks.set(nativeChunkCount(handle))
         shownPending.set(nativeChunkPending(handle))
+        shownUndrawn.set(nativeChunkUndrawn(handle))
         shownCap.set(nativeChunkCap(handle))
     }
 
@@ -290,13 +293,107 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeMeshErase(handle: Long, id: Int)
     private external fun nativeChunkCount(handle: Long): Int
     private external fun nativeChunkPending(handle: Long): Int
+    private external fun nativeChunkUndrawn(handle: Long): Int
     private external fun nativeChunkCap(handle: Long): Int
     private external fun nativeRedraw(handle: Long): Boolean
+    private external fun nativeCopySurface(handle: Long, voxelOut: FloatArray): FloatArray?
+    private external fun nativeSaveMesh(handle: Long, path: String): Boolean
+    private external fun nativeLoadMesh(handle: Long, path: String, depthMeters: Float): Boolean
+    private external fun nativeDropQueue(handle: Long)
+    private external fun nativeCaptureSeed(handle: Long): Boolean
+    private external fun nativeSeedVoxel(handle: Long): Float
+    private external fun nativeSplatInitFromSeed(handle: Long, views: Int, width: Int, height: Int): Boolean
+    private external fun nativeDropMesh(handle: Long)
+    private external fun nativeSplatInit(
+        handle: Long, verts: FloatArray, voxel: Float, views: Int, width: Int, height: Int,
+    ): Boolean
+    private external fun nativeSplatStep(
+        handle: Long, rgb: FloatArray, pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float,
+        view: Int, updateGauss: Boolean, updateGrid: Boolean, metricsAfter: Boolean, metrics: FloatArray,
+    ): Boolean
+    private external fun nativeSplatRender(
+        handle: Long, pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float, corrected: Boolean,
+    ): ByteArray?
+    private external fun nativeSplatWritePly(handle: Long, path: String): Boolean
+
+    fun copySurface(): Pair<FloatArray, Float>? = onGpu(null) { view, handle ->
+        if (handle == 0L) return@onGpu null
+        val voxel = FloatArray(1)
+        val data = view.nativeCopySurface(handle, voxel) ?: return@onGpu null
+        data to voxel[0]
+    }
+
+    fun saveMesh(path: String): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeSaveMesh(handle, path)
+    }
+
+    fun loadMesh(path: String, depthMeters: Float): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeLoadMesh(handle, path, depthMeters)
+    }
+
+    fun dropQueue() {
+        onGpu(Unit) { view, handle ->
+            if (handle != 0L) view.nativeDropQueue(handle)
+        }
+    }
+
+    fun captureSeed(): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeCaptureSeed(handle)
+    }
+
+    fun seedVoxel(): Float = onGpu(0f) { view, handle ->
+        if (handle == 0L) 0f else view.nativeSeedVoxel(handle)
+    }
+
+    fun splatInitFromSeed(views: Int, width: Int, height: Int): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeSplatInitFromSeed(handle, views, width, height)
+    }
+
+    fun dropMesh() {
+        onGpu(Unit) { view, handle ->
+            if (handle != 0L) view.nativeDropMesh(handle)
+        }
+    }
+
+    fun splatInit(verts: FloatArray, voxel: Float, views: Int, width: Int, height: Int): Boolean =
+        onGpu(false) { view, handle ->
+            handle != 0L && view.nativeSplatInit(handle, verts, voxel, views, width, height)
+        }
+
+    fun splatStep(
+        rgb: FloatArray,
+        pose: FloatArray,
+        fx: Float,
+        fy: Float,
+        cx: Float,
+        cy: Float,
+        view: Int,
+        updateGauss: Boolean,
+        updateGrid: Boolean,
+        metricsAfter: Boolean,
+    ): FloatArray? = onGpu(null) { gpu, handle ->
+        if (handle == 0L) return@onGpu null
+        val metrics = FloatArray(3)
+        val ok = gpu.nativeSplatStep(
+            handle, rgb, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics,
+        )
+        if (ok) metrics else null
+    }
+
+    fun splatRender(pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float, corrected: Boolean): ByteArray? =
+        onGpu(null) { view, handle ->
+            if (handle == 0L) null else view.nativeSplatRender(handle, pose, fx, fy, cx, cy, corrected)
+        }
+
+    fun splatWritePly(path: String): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeSplatWritePly(handle, path)
+    }
 
     companion object {
         const val TAG = "pocket-vk"
         private val shownChunks = AtomicInteger(0)
         private val shownPending = AtomicInteger(0)
+        private val shownUndrawn = AtomicInteger(0)
         private val shownCap = AtomicInteger(0)
         private val gate = Any()
         @Volatile private var sharedHandle = 0L
@@ -325,7 +422,29 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
             }
         }
 
+        internal fun current(): VkPreview? = anchor
+
         private fun engine(): Handler? = loop
+
+        internal fun <T> onGpu(fallback: T, body: (VkPreview, Long) -> T): T {
+            val handler = loop ?: return fallback
+            val view = anchor ?: return fallback
+            if (Looper.myLooper() == handler.looper) return body(view, sharedHandle)
+            val box = AtomicReference(fallback)
+            val done = CountDownLatch(1)
+            handler.post {
+                try {
+                    val current = anchor ?: view
+                    box.set(body(current, sharedHandle))
+                } catch (error: Throwable) {
+                    Log.e(TAG, "gpu", error)
+                } finally {
+                    done.countDown()
+                }
+            }
+            done.await(180, TimeUnit.SECONDS)
+            return box.get()
+        }
 
         private fun engineLoop(): Handler {
             synchronized(gate) {

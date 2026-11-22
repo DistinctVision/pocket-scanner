@@ -5,6 +5,7 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.LaunchedEffect
 import java.text.SimpleDateFormat
@@ -20,6 +21,7 @@ class RefineActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onBackPressedDispatcher.addCallback(this) { leave() }
@@ -45,7 +47,10 @@ class RefineActivity : ComponentActivity() {
                     },
                     onSettings = { openSettings() },
                     onBack = { leave() },
-                    onSplat = { created.noteSplatting() },
+                    onSplat = {
+                        startActivity(android.content.Intent(this, TrainActivity::class.java))
+                        finish()
+                    },
                     onSave = {
                         if (!CaptureRuntime.ui.saving) {
                             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
@@ -57,6 +62,8 @@ class RefineActivity : ComponentActivity() {
                     lens = { created.viewLens() },
                     chunkCount = { preview?.chunkCount() ?: 0 },
                     chunkPending = { preview?.chunkPending() ?: 0 },
+                    chunkUndrawn = { preview?.chunkUndrawn() ?: 1 },
+                    onMeshIdle = { created.cacheReviewMesh() },
                 )
             }
         }

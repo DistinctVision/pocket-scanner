@@ -2,6 +2,7 @@
 
 #include "vk_device.h"
 #include "volume.h"
+#include "splat_train.h"
 
 #include <android/native_window.h>
 
@@ -27,7 +28,25 @@ struct Preview {
     bool redraw();
     int chunkCount() const;
     int chunkPending() const;
+    int chunkUndrawn() const;
     int chunkCap() const;
+    int copySurface(std::vector<float>& interleaved, float& voxel);
+    bool saveMesh(const char* path);
+    bool loadMesh(const char* path, float depthMeters);
+    void dropQueue();
+    void dropMesh();
+    // Keeps the measured surface in this process. The Java heap never sees the vertices.
+    bool captureSeed();
+    float seedVoxel() const { return seedVoxelSize; }
+    bool splatInitFromSeed(int views, int width, int height);
+    bool splatInit(const float* verts, int count, float voxel, int views, int width, int height);
+    bool splatStep(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy,
+                   int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[3]);
+    bool splatRender(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb);
+    bool splatRead(uint8_t* rgb);
+    bool splatWritePly(const char* path);
+    int splatWidth() const;
+    int splatHeight() const;
     void destroy();
 
 private:
@@ -59,6 +78,9 @@ private:
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
     VkImageView depthView = VK_NULL_HANDLE;
     Volume volume;
+    SplatTrainer* splat = nullptr;
+    std::vector<float> seed;
+    float seedVoxelSize = 0.f;
     VkDescriptorSetLayout graphicsSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout graphicsLayout = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;

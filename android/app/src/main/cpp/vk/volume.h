@@ -34,7 +34,16 @@ struct Volume {
 
     int chunkCount() const;
     int chunkPending() const;
+    int chunkUndrawn() const;
     int chunkCap() const;
+    // Host xyz, normal, rgb for each measured vertex. Call on the Vulkan thread.
+    int copySurface(std::vector<float>& interleaved, float& voxel) const;
+    // Finished review mesh, next to the scan. A later open draws this instead of integrating again.
+    bool saveMesh(const char* path) const;
+    bool loadMesh(const char* path, float depthMeters);
+    void dropQueue();
+    void dropHeavy();
+    bool ensureBuffers();
     int mode() const { return viewMode; }
 
 private:

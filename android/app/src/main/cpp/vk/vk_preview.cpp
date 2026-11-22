@@ -361,6 +361,8 @@ int Preview::chunkCount() const { return volume.chunkCount(); }
 
 int Preview::chunkPending() const { return volume.chunkPending(); }
 
+int Preview::chunkUndrawn() const { return volume.chunkUndrawn(); }
+
 int Preview::chunkCap() const { return volume.chunkCap(); }
 
 bool Preview::redraw() {
@@ -849,7 +851,71 @@ void Preview::destroyGraphics() {
     renderPass = VK_NULL_HANDLE;
 }
 
+int Preview::copySurface(std::vector<float>& interleaved, float& voxel) {
+    waitInFlight();
+    return volume.copySurface(interleaved, voxel);
+}
+
+bool Preview::saveMesh(const char* path) {
+    waitInFlight();
+    return volume.saveMesh(path);
+}
+
+bool Preview::loadMesh(const char* path, float depthMeters) {
+    waitInFlight();
+    return volume.loadMesh(path, depthMeters);
+}
+
+void Preview::dropQueue() { volume.dropQueue(); }
+
+bool Preview::captureSeed() {
+    waitInFlight();
+    seed.clear();
+    const int count = volume.copySurface(seed, seedVoxelSize);
+    if (count < 3) {
+        seed.clear();
+        seed.shrink_to_fit();
+        return false;
+    }
+    return true;
+}
+
+bool Preview::splatInitFromSeed(int views, int width, int height) {
+    if (seed.size() < 27) return false;
+    if (splat == nullptr) splat = new SplatTrainer(&core);
+    const bool ok = splat->init(seed.data(), static_cast<int>(seed.size() / 9), seedVoxelSize, views, width, height);
+    seed.clear();
+    seed.shrink_to_fit();
+    return ok;
+}
+
+void Preview::dropMesh() { volume.dropHeavy(); }
+
+bool Preview::splatInit(const float* verts, int count, float voxel, int views, int width, int height) {
+    if (splat == nullptr) splat = new SplatTrainer(&core);
+    return splat->init(verts, count, voxel, views, width, height);
+}
+
+bool Preview::splatStep(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy, int view,
+                        bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[3]) {
+    return splat != nullptr && splat->step(rgb, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics);
+}
+
+bool Preview::splatRender(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb) {
+    return splat != nullptr && splat->render(pose, fx, fy, cx, cy, rgb);
+}
+
+bool Preview::splatRead(uint8_t* rgb) { return splat != nullptr && splat->readCorrected(rgb); }
+
+bool Preview::splatWritePly(const char* path) { return splat != nullptr && splat->writePly(path); }
+
+int Preview::splatWidth() const { return splat == nullptr ? 0 : splat->viewWidth(); }
+
+int Preview::splatHeight() const { return splat == nullptr ? 0 : splat->viewHeight(); }
+
 void Preview::destroy() {
+    delete splat;
+    splat = nullptr;
     if (core.device != VK_NULL_HANDLE) vkDeviceWaitIdle(core.device);
     fencePending = false;
     destroySwapchain();

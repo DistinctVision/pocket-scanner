@@ -122,6 +122,11 @@ JNIEXPORT jint JNICALL Java_com_pocketscanner_capture_VkPreview_nativeChunkPendi
     return preview == nullptr ? 0 : preview->chunkPending();
 }
 
+JNIEXPORT jint JNICALL Java_com_pocketscanner_capture_VkPreview_nativeChunkUndrawn(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    return preview == nullptr ? 0 : preview->chunkUndrawn();
+}
+
 JNIEXPORT jint JNICALL Java_com_pocketscanner_capture_VkPreview_nativeChunkCap(JNIEnv*, jobject, jlong handle) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     return preview == nullptr ? 0 : preview->chunkCap();
@@ -131,6 +136,120 @@ JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeRedraw
     auto* preview = reinterpret_cast<Preview*>(handle);
     if (preview == nullptr) return JNI_FALSE;
     return preview->redraw() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jfloatArray JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCopySurface(
+    JNIEnv* env, jobject, jlong handle, jfloatArray voxelOut) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr) return nullptr;
+    std::vector<float> data;
+    float voxel = 0.f;
+    preview->copySurface(data, voxel);
+    if (voxelOut != nullptr && env->GetArrayLength(voxelOut) > 0) env->SetFloatArrayRegion(voxelOut, 0, 1, &voxel);
+    jfloatArray out = env->NewFloatArray(static_cast<jsize>(data.size()));
+    if (out != nullptr && !data.empty()) env->SetFloatArrayRegion(out, 0, static_cast<jsize>(data.size()), data.data());
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSaveMesh(
+    JNIEnv* env, jobject, jlong handle, jstring path) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr || path == nullptr) return JNI_FALSE;
+    const char* chars = env->GetStringUTFChars(path, nullptr);
+    bool ok = chars != nullptr && preview->saveMesh(chars);
+    if (chars != nullptr) env->ReleaseStringUTFChars(path, chars);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeLoadMesh(
+    JNIEnv* env, jobject, jlong handle, jstring path, jfloat depthMeters) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr || path == nullptr) return JNI_FALSE;
+    const char* chars = env->GetStringUTFChars(path, nullptr);
+    bool ok = chars != nullptr && preview->loadMesh(chars, depthMeters);
+    if (chars != nullptr) env->ReleaseStringUTFChars(path, chars);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeDropMesh(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview != nullptr) preview->dropMesh();
+}
+
+JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeDropQueue(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview != nullptr) preview->dropQueue();
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptureSeed(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    return preview != nullptr && preview->captureSeed() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jfloat JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSeedVoxel(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    return preview == nullptr ? 0.f : preview->seedVoxel();
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatInitFromSeed(
+    JNIEnv*, jobject, jlong handle, jint views, jint width, jint height) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    return preview != nullptr && preview->splatInitFromSeed(views, width, height) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatInit(
+    JNIEnv* env, jobject, jlong handle, jfloatArray verts, jfloat voxel, jint views, jint width, jint height) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr || verts == nullptr) return JNI_FALSE;
+    jfloat* values = env->GetFloatArrayElements(verts, nullptr);
+    int count = env->GetArrayLength(verts) / 9;
+    bool ok = values != nullptr && preview->splatInit(values, count, voxel, views, width, height);
+    if (values != nullptr) env->ReleaseFloatArrayElements(verts, values, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatStep(
+    JNIEnv* env, jobject, jlong handle, jfloatArray rgb, jfloatArray pose, jfloat fx, jfloat fy, jfloat cx, jfloat cy,
+    jint view, jboolean updateGauss, jboolean updateGrid, jboolean metricsAfter, jfloatArray metrics) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr || rgb == nullptr || pose == nullptr || metrics == nullptr) return JNI_FALSE;
+    jfloat poseValues[16];
+    env->GetFloatArrayRegion(pose, 0, 16, poseValues);
+    jfloat* image = env->GetFloatArrayElements(rgb, nullptr);
+    float out[3]{};
+    bool ok = image != nullptr && preview->splatStep(image, poseValues, fx, fy, cx, cy, view, updateGauss == JNI_TRUE,
+                                                      updateGrid == JNI_TRUE, metricsAfter == JNI_TRUE, out);
+    if (image != nullptr) env->ReleaseFloatArrayElements(rgb, image, JNI_ABORT);
+    env->SetFloatArrayRegion(metrics, 0, 3, out);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jbyteArray JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatRender(
+    JNIEnv* env, jobject, jlong handle, jfloatArray pose, jfloat fx, jfloat fy, jfloat cx, jfloat cy, jboolean corrected) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr || pose == nullptr) return nullptr;
+    int pixels = preview->splatWidth() * preview->splatHeight();
+    if (pixels <= 0) return nullptr;
+    jfloat poseValues[16];
+    env->GetFloatArrayRegion(pose, 0, 16, poseValues);
+    std::vector<uint8_t> rgb(static_cast<size_t>(pixels) * 3);
+    bool ok = corrected == JNI_TRUE
+        ? preview->splatRead(rgb.data())
+        : preview->splatRender(poseValues, fx, fy, cx, cy, rgb.data());
+    if (!ok) return nullptr;
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(rgb.size()));
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgb.size()), reinterpret_cast<const jbyte*>(rgb.data()));
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatWritePly(
+    JNIEnv* env, jobject, jlong handle, jstring path) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr || path == nullptr) return JNI_FALSE;
+    const char* chars = env->GetStringUTFChars(path, nullptr);
+    bool ok = chars != nullptr && preview->splatWritePly(chars);
+    if (chars != nullptr) env->ReleaseStringUTFChars(path, chars);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeDestroy(JNIEnv*, jobject, jlong handle) {

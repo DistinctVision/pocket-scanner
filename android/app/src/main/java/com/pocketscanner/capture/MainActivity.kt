@@ -36,7 +36,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -135,6 +139,7 @@ class MainActivity : ComponentActivity() {
                     recordedCount = { session?.recordedCount() ?: 0 },
                     recording = session?.recordingEnabled() == true,
                     onScans = { openScans(fromRefine = false) },
+                    onRuns = { startActivity(android.content.Intent(this, MetricsActivity::class.java)) },
                 )
             }
         }
@@ -249,6 +254,7 @@ private fun ScanScreen(
     recordedCount: () -> Int,
     recording: Boolean,
     onScans: () -> Unit,
+    onRuns: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
     var mode by remember { mutableStateOf(PreviewMode.Color) }
@@ -327,6 +333,14 @@ private fun ScanScreen(
                         onClick = {
                             scope.launch { drawerState.close() }
                             onScans()
+                        },
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Runs") },
+                        selected = false,
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            onRuns()
                         },
                     )
                     Row(
@@ -513,6 +527,16 @@ private fun ScanChrome(
 }
 
 @Composable
+internal fun Modifier.belowSystemBars(): Modifier {
+    return windowInsetsPadding(
+        WindowInsets.safeDrawing
+            .union(WindowInsets.statusBars)
+            .union(WindowInsets.navigationBars)
+            .union(WindowInsets.displayCutout),
+    )
+}
+
+@Composable
 internal fun RefineScreen(
     ui: CaptureUi,
     onPreview: (VkPreview) -> Unit,
@@ -527,6 +551,8 @@ internal fun RefineScreen(
     lens: () -> ViewLens?,
     chunkCount: () -> Int,
     chunkPending: () -> Int,
+    chunkUndrawn: () -> Int,
+    onMeshIdle: () -> Boolean,
 ) {
     val scheme = MaterialTheme.colorScheme
     val refining = ui.phase == "refining"
@@ -536,10 +562,22 @@ internal fun RefineScreen(
     val gestures = remember { LookGestures(lookHolder, lookTick) }
     var meshChunks by remember { mutableIntStateOf(0) }
     var meshPending by remember { mutableIntStateOf(0) }
+    var meshUndrawn by remember { mutableIntStateOf(1) }
+    LaunchedEffect(ui.phase, meshUndrawn, meshChunks) {
+        if (ui.phase != "review" || meshUndrawn > 0 || meshChunks <= 0) return@LaunchedEffect
+        delay(1500)
+        if (meshUndrawn > 0 || meshChunks <= 0) return@LaunchedEffect
+        while (true) {
+            val saved = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { onMeshIdle() }
+            if (saved) break
+            delay(2000)
+        }
+    }
     LaunchedEffect(Unit) {
         while (true) {
             meshChunks = chunkCount()
             meshPending = chunkPending()
+            meshUndrawn = chunkUndrawn()
             delay(250)
         }
     }
@@ -570,7 +608,7 @@ internal fun RefineScreen(
         drawerContent = {
             ModalDrawerSheet {
                 Column(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 28.dp),
+                    modifier = Modifier.belowSystemBars().padding(horizontal = 12.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(
@@ -617,7 +655,7 @@ internal fun RefineScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .belowSystemBars()
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.SpaceBetween,
         ) {
@@ -665,7 +703,7 @@ internal fun RefineScreen(
                         FilledTonalButton(onClick = onBack, modifier = Modifier.weight(1f)) { Text("Back") }
                         Button(
                             onClick = onSplat,
-                            enabled = ui.framesOnDisk,
+                            enabled = ui.framesOnDisk && meshPending == 0,
                             modifier = Modifier.weight(1f),
                         ) { Text("Start splatting") }
                     }
@@ -917,6 +955,7 @@ internal fun SettingsPanel(
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
     onRefine: (Boolean, Int) -> Unit,
+    onSplatting: (Int, Boolean, Int) -> Unit,
     onClose: () -> Unit,
 ) {
     var voxel by remember { mutableIntStateOf(applied.voxelCm) }
@@ -926,6 +965,9 @@ internal fun SettingsPanel(
     var depth by remember { mutableIntStateOf(applied.depthMeters.toInt()) }
     var closeLoops by remember { mutableStateOf(applied.closeLoops) }
     var reviewVoxel by remember { mutableIntStateOf(applied.reviewVoxelCm) }
+    var epochs by remember { mutableIntStateOf(applied.epochs) }
+    var validation by remember { mutableStateOf(applied.validation) }
+    var validationPercent by remember { mutableIntStateOf(applied.validationPercent) }
     val scheme = MaterialTheme.colorScheme
     Column(
         modifier = Modifier
@@ -984,6 +1026,9 @@ internal fun SettingsPanel(
                         depthMeters = depth.toFloat(),
                         reviewVoxelCm = reviewVoxel,
                         closeLoops = closeLoops,
+                        epochs = epochs,
+                        validation = validation,
+                        validationPercent = validationPercent,
                     ),
                 )
             },
@@ -1022,16 +1067,43 @@ internal fun SettingsPanel(
             onRefine(closeLoops, it)
         }
         Text(
-            "Finer than the live scan mesh. 2 cm can fill the chunk budget in a large room.",
+            "Default is 4 cm. 2 cm can fill the chunk budget in a large room.",
             color = scheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
         Text("Splatting", color = scheme.onSurface, style = MaterialTheme.typography.titleMedium)
         Text(
-            "Splatting settings will be added with that window.",
+            "Used by the next training run. Changing these does not restart tracking.",
             color = scheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
+        Text("Epochs $epochs", style = MaterialTheme.typography.labelLarge)
+        androidx.compose.material3.Slider(
+            value = epochs.toFloat(),
+            onValueChange = {
+                epochs = it.toInt().coerceIn(1, 500)
+                onSplatting(epochs, validation, validationPercent)
+            },
+            valueRange = 1f..500f,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Validation", style = MaterialTheme.typography.labelLarge)
+            Switch(
+                checked = validation,
+                onCheckedChange = {
+                    validation = it
+                    onSplatting(epochs, validation, validationPercent)
+                },
+            )
+        }
+        ChoiceRow("Validation share", listOf(5, 8, 10), validationPercent, { "$it%" }) {
+            validationPercent = it
+            onSplatting(epochs, validation, it)
+        }
     }
 }
 

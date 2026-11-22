@@ -16,14 +16,29 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.acos
 
+data class TrainFrame(
+    val id: Int,
+    val pose: FloatArray,
+    val width: Int,
+    val height: Int,
+    val fx: Float,
+    val fy: Float,
+    val cx: Float,
+    val cy: Float,
+    val rgb: File,
+)
+
 data class ScanSettings(
     val voxelCm: Int = 8,
     val integrateWidth: Int = 160,
     val minSize: Int = 500,
     val pyramidLevels: Int = 6,
     val depthMeters: Float = 6f,
-    val reviewVoxelCm: Int = 2,
+    val reviewVoxelCm: Int = 4,
     val closeLoops: Boolean = true,
+    val epochs: Int = 100,
+    val validation: Boolean = false,
+    val validationPercent: Int = 8,
 ) {
     val integrateHeight: Int get() = integrateWidth * 3 / 4
 
@@ -164,11 +179,92 @@ class MeshSync(
 
     fun storedLens(): ViewLens? = synchronized(lock) { lens }
 
+    fun exportTraining(dest: File): List<TrainFrame> {
+        dest.mkdirs()
+        val shots = synchronized(lock) {
+            ring.clear()
+            held.entries
+                .filter { it.key < COVER_ID_BASE && it.value.full != null }
+                .sortedBy { it.key }
+                .map { it.key to it.value }
+        }
+        val written = ArrayList<TrainFrame>(shots.size)
+        for ((id, frame) in shots) {
+            val full = frame.full ?: continue
+            try {
+                val raw = readStored(full.file)
+                val rgb = if (raw.colorStride >= full.width * 3 && raw.color.size >= full.width * full.height * 3) {
+                    raw.color
+                } else {
+                    yuyvToRgb(raw.color, full.width, full.height)
+                }
+                val file = File(dest, "$id.rgb")
+                file.writeBytes(rgb)
+                written.add(
+                    TrainFrame(
+                        id,
+                        frame.pose.copyOf(),
+                        full.width,
+                        full.height,
+                        full.fx,
+                        full.fy,
+                        full.cx,
+                        full.cy,
+                        file,
+                    ),
+                )
+            } catch (error: Exception) {
+                Log.w(TAG, "export $id: ${error.message}")
+            }
+        }
+        return written
+    }
+
+    /** Drops the working frames after a training run has its own copies. */
+    fun releaseTrainingSources() {
+        acceptFrames.set(false)
+        saveEpoch.incrementAndGet()
+        val doomed = synchronized(lock) {
+            val files = collectFullFiles()
+            ring.clear()
+            fullFiles.clear()
+            held.clear()
+            covered.clear()
+            missed.clear()
+            bare.clear()
+            files
+        }
+        doomed.forEach { it.delete() }
+    }
+
+    private fun yuyvToRgb(yuyv: ByteArray, width: Int, height: Int): ByteArray {
+        val out = ByteArray(width * height * 3)
+        var i = 0
+        var o = 0
+        val pairs = minOf(width * height / 2, yuyv.size / 4)
+        repeat(pairs) {
+            val y0 = yuyv[i].toInt() and 255
+            val u = yuyv[i + 1].toInt() and 255
+            val y1 = yuyv[i + 2].toInt() and 255
+            val v = yuyv[i + 3].toInt() and 255
+            i += 4
+            val first = yuv(y0, u, v)
+            val second = yuv(y1, u, v)
+            out[o++] = first.first.toByte()
+            out[o++] = first.second.toByte()
+            out[o++] = first.third.toByte()
+            out[o++] = second.first.toByte()
+            out[o++] = second.second.toByte()
+            out[o++] = second.third.toByte()
+        }
+        return out
+    }
+
     fun oldestPose(): FloatArray? = synchronized(lock) {
         held.entries.filter { it.key < COVER_ID_BASE }.minByOrNull { it.key }?.value?.pose?.copyOf()
     }
 
-    fun writePackage(dest: java.io.OutputStream, scan: ScanSettings): Int {
+    fun writePackage(dest: java.io.OutputStream, scan: ScanSettings, mesh: File?): Int {
         val shots = synchronized(lock) {
             held.entries
                 .filter { it.key < COVER_ID_BASE && it.value.full != null }
@@ -190,7 +286,7 @@ class MeshSync(
                 }
         }
         if (shots.isEmpty()) return 0
-        ScanPackage.write(dest, scan, shots) { meta ->
+        ScanPackage.write(dest, scan, shots, mesh) { meta ->
             val raw = readStored(meta.file)
             PackageShot(
                 meta.id,
@@ -211,13 +307,13 @@ class MeshSync(
         return shots.size
     }
 
-    internal fun restore(doc: ScanDocument): Int {
+    internal fun restore(rebuildMesh: Boolean, feed: ((PackageFrame) -> Unit) -> Unit): Int {
         saveEpoch.incrementAndGet()
-        val scan = settings.get()
-        val built = ArrayList<Pair<Int, Held>>(doc.frames.size)
+        val built = ArrayList<Pair<Int, Held>>()
         var eye: ViewLens? = null
-        for (frame in doc.frames) {
-            if (frame.id >= COVER_ID_BASE) continue
+        feed { frame ->
+            val scan = settings.get()
+            if (frame.id >= COVER_ID_BASE) return@feed
             val yuyv = rgbToYuyv(frame.rgb, frame.width, frame.height)
             val model = SlamCamera(
                 w = frame.width,
@@ -266,6 +362,7 @@ class MeshSync(
                 eye = ViewLens(frame.fx, frame.fy, frame.cx, frame.cy, frame.width, frame.height)
             }
         }
+        val scan = settings.get()
         val doomed = synchronized(lock) {
             val files = collectFullFiles()
             ring.clear()
@@ -279,6 +376,7 @@ class MeshSync(
             files
         }
         doomed.forEach { it.delete() }
+        if (!rebuildMesh) return built.size
         val view = preview()
         if (view != null) {
             view.meshConfigure(scan.reviewVoxelCm / 100f, scan.depthMeters)

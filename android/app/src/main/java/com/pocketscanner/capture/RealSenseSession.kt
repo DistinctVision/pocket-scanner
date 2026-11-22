@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
+import android.widget.Toast
 import com.intel.realsense.librealsense.Align
 import com.intel.realsense.librealsense.CameraInfo
 import com.intel.realsense.librealsense.Colorizer
@@ -31,6 +32,7 @@ import com.intel.realsense.librealsense.UsbUtilities
 import com.intel.realsense.librealsense.VideoFrame
 import com.intel.realsense.librealsense.VideoStreamProfile
 import java.io.File
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -86,6 +88,11 @@ private data class VideoMode(
  * One camera thread owns the pipeline. The Vulkan preview draws YUYV color and
  * colorized depth; MJPEG is decoded to a bitmap because it is not a live view.
  */
+data class SplatPrepared(
+    val voxel: Float,
+    val frames: List<TrainFrame>,
+)
+
 class RealSenseSession(
     private val context: Context,
     private val onUi: (CaptureUi) -> Unit,
@@ -111,6 +118,9 @@ class RealSenseSession(
     private val volumeConfigured = AtomicBoolean(false)
     private val scanning = AtomicBoolean(false)
     private val scanDir = File(context.getExternalFilesDir(null), "scan-frames")
+    private val meshCacheGate = Any()
+    private val meshFrozen = AtomicBoolean(false)
+    private val packageUri = AtomicReference<Uri?>(null)
 
     @Volatile
     private var mesh: MeshSync? = null
@@ -167,7 +177,7 @@ class RealSenseSession(
             try {
                 val stream = app.contentResolver.openOutputStream(uri)
                     ?: error("Could not open the file")
-                val count = stream.use { mesh?.writePackage(it, settings.get()) ?: 0 }
+                val count = stream.use { mesh?.writePackage(it, settings.get(), File(scanDir, "mesh.bin")) ?: 0 }
                 if (count <= 0) {
                     try {
                         DocumentsContract.deleteDocument(app.contentResolver, uri)
@@ -177,6 +187,9 @@ class RealSenseSession(
                     return@Thread
                 }
                 ScanLibrary.persist(app, uri)
+                packageUri.set(uri)
+                val mesh = File(scanDir, "mesh.bin")
+                if (mesh.isFile) mesh.copyTo(meshSidecar(uri), overwrite = true)
                 val name = ScanLibrary.displayName(app, uri)
                 ScanLibrary.remember(app, uri, name, count)
                 publish { it.copy(saving = false, saveLine = "Saved $count frames", framesOnDisk = true) }
@@ -190,19 +203,37 @@ class RealSenseSession(
     fun loadPackage(uri: Uri, onReady: (Boolean) -> Unit) {
         val restorePhase = ui.phase
         scanning.set(false)
+        packageUri.set(uri)
+        meshFrozen.set(false)
         mesh?.setTracking(false)
         publish { it.copy(phase = "refining", refineDetail = "Loading", refineProgress = 0.2f, saveLine = "") }
         val app = context
         Thread({
             try {
-                val doc = ScanPackage.read(app, uri)
-                val tuned = settings.get().copy(
-                    voxelCm = doc.voxelCm,
-                    reviewVoxelCm = doc.reviewVoxelCm,
-                )
-                settings.set(tuned)
-                mesh?.replaceSettings(tuned)
-                val count = mesh?.restore(doc) ?: 0
+                val count = mesh?.restore(rebuildMesh = false) { accept ->
+                    ScanPackage.read(app, uri, { header ->
+                        val tuned = settings.get().copy(
+                            voxelCm = header.voxelCm,
+                            reviewVoxelCm = header.reviewVoxelCm,
+                        )
+                        settings.set(tuned)
+                        mesh?.replaceSettings(tuned)
+                    }, accept)
+                } ?: 0
+                val depth = settings.get().depthMeters
+                val cached = listOf(ScanPackage.cachedMesh(app), meshSidecar(uri))
+                    .filter { it.isFile && it.length() > 16 }
+                    .maxByOrNull { it.lastModified() }
+                val shown = cached != null && preview?.loadMesh(cached.absolutePath, depth) == true
+                val beside = File(scanDir, "mesh.bin")
+                if (shown) {
+                    meshFrozen.set(true)
+                    scanDir.mkdirs()
+                    cached.copyTo(beside, overwrite = true)
+                } else {
+                    beside.delete()
+                    mesh?.rebuild(settings.get().reviewVoxelCm)
+                }
                 ScanLibrary.persist(app, uri)
                 ScanLibrary.remember(app, uri, ScanLibrary.displayName(app, uri), count)
                 publish {
@@ -215,7 +246,7 @@ class RealSenseSession(
                     )
                 }
                 main.post { onReady(true) }
-            } catch (error: Exception) {
+            } catch (error: Throwable) {
                 Log.e(TAG, "load package", error)
                 publish {
                     it.copy(
@@ -276,6 +307,8 @@ class RealSenseSession(
 
     fun beginScan(wipe: Boolean) {
         if (wipe) {
+            packageUri.set(null)
+            meshFrozen.set(false)
             applyScan(settings.get())
             publish { it.copy(framesOnDisk = false, saveLine = "", refineDetail = "") }
         }
@@ -287,11 +320,15 @@ class RealSenseSession(
         val next = settings.get().copy(closeLoops = closeLoops, reviewVoxelCm = reviewVoxelCm)
         settings.set(next)
         mesh?.replaceSettings(next)
-        if (ui.phase == "review") mesh?.rebuild(reviewVoxelCm)
+        if (ui.phase == "review") {
+            meshFrozen.set(false)
+            mesh?.rebuild(reviewVoxelCm)
+        }
     }
 
     fun stopAndRefine(): Boolean {
         if (!scanning.getAndSet(false)) return false
+        meshFrozen.set(false)
         val searchLoops = settings.get().closeLoops
         mesh?.setTracking(false)
         publish { it.copy(phase = "refining", refineDetail = "Queue", refineProgress = 0.05f) }
@@ -336,9 +373,95 @@ class RealSenseSession(
         return true
     }
 
-    fun noteSplatting() {
-        if (!ui.framesOnDisk) return
-        publish { it.copy(saveLine = "Splatting is the next step") }
+    fun setSplatting(epochs: Int, validation: Boolean, percent: Int) {
+        val next = settings.get().copy(
+            epochs = epochs.coerceIn(1, 500),
+            validation = validation,
+            validationPercent = if (percent == 5 || percent == 10) percent else 8,
+        )
+        settings.set(next)
+        mesh?.replaceSettings(next)
+    }
+
+    /** Writes the finished review mesh beside the keyframes and the opened scan. */
+    fun cacheReviewMesh(): Boolean {
+        if (meshFrozen.get()) return true
+        synchronized(meshCacheGate) {
+            if (!meshFrozen.compareAndSet(false, true)) return true
+            scanDir.mkdirs()
+            val tmp = File(scanDir, "mesh.bin.tmp")
+            val ok = preview?.saveMesh(tmp.absolutePath) == true && tmp.length() > 16
+            if (!ok) {
+                tmp.delete()
+                meshFrozen.set(false)
+                Log.e(TAG, "mesh cache was not written")
+                return false
+            }
+            val dest = File(scanDir, "mesh.bin")
+            if (dest.exists() && !dest.delete()) Log.e(TAG, "mesh cache replace failed")
+            if (!tmp.renameTo(dest)) {
+                meshFrozen.set(false)
+                Log.e(TAG, "mesh cache rename failed")
+                return false
+            }
+            preview?.dropQueue()
+            val uri = packageUri.get()
+            if (uri != null) dest.copyTo(meshSidecar(uri), overwrite = true)
+            Log.i(TAG, "mesh cache ${dest.length()} bytes")
+            main.post { Toast.makeText(context, "Mesh saved", Toast.LENGTH_SHORT).show() }
+            if (uri != null) {
+                try {
+                    ScanPackage.attachMesh(context, uri, dest)
+                } catch (error: Exception) {
+                    Log.w(TAG, "package mesh: ${error.message}")
+                }
+            }
+            return true
+        }
+    }
+
+    private fun meshSidecar(uri: Uri): File {
+        val digest = MessageDigest.getInstance("SHA-256").digest(uri.toString().toByteArray())
+        val name = digest.take(8).joinToString("") { "%02x".format(it) }
+        val dir = File(context.getExternalFilesDir(null), "mesh-cache")
+        dir.mkdirs()
+        return File(dir, "$name.bin")
+    }
+
+    fun releaseTrainingSources() {
+        mesh?.releaseTrainingSources()
+    }
+
+    /** Copies color views, reads the mesh, then stops the camera and frees the volume. */
+    fun beginSplatting(dir: File): SplatPrepared {
+        val frames = mesh?.exportTraining(dir) ?: error("No scan to train")
+        if (frames.isEmpty()) error("No full frames to train")
+        if (preview?.captureSeed() != true) error("The mesh could not be read")
+        val seeded = preview?.seedVoxel() ?: 0f
+        haltCapture()
+        preview?.dropMesh()
+        volumeConfigured.set(false)
+        publish { it.copy(phase = "idle", framesOnDisk = false, saveLine = "", refineDetail = "") }
+        val voxel = if (seeded > 1e-4f) seeded else settings.get().reviewVoxelCm / 100f
+        return SplatPrepared(voxel, frames)
+    }
+
+    fun resumeAfterSplat() {
+        publish { it.copy(phase = "idle", framesOnDisk = false, saveLine = "", refineDetail = "", refineProgress = 0f) }
+        volumeConfigured.set(false)
+        if (worker != null) return
+        alive.set(true)
+        streaming.set(false)
+        start()
+        val scan = settings.get()
+        if (preview?.meshConfigure(scan.voxelCm / 100f, scan.depthMeters) == true) volumeConfigured.set(true)
+    }
+
+    private fun haltCapture() {
+        alive.set(false)
+        streaming.set(false)
+        worker?.join(4000)
+        worker = null
     }
 
     fun backToScan() {
