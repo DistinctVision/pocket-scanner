@@ -40,8 +40,9 @@ struct Preview {
     bool captureSeedFromFile(const char* path, int cap);
     const char* splatError() const;
     float seedVoxel() const { return seedVoxelSize; }
-    bool splatInitFromSeed(int views, int width, int height);
-    bool splatInit(const float* verts, int count, float voxel, int views, int width, int height);
+    int splatGaussianCount() const;
+    bool splatInitFromSeed(int views, int width, int height, int budget);
+    bool splatInit(const float* verts, int count, float voxel, int views, int width, int height, int budget);
     bool splatStep(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy,
                    int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[3]);
     bool splatRender(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb);

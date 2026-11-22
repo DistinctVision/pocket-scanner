@@ -378,7 +378,7 @@ class RealSenseSession(
         return true
     }
 
-    fun setSplatting(epochs: Int, validation: Boolean, percent: Int, every: Int, budget: Int) {
+    fun setSplatting(epochs: Int, validation: Boolean, percent: Int, every: Int, budget: Int, videoSeconds: Int) {
         val share = if (percent == 8 || percent == 10) percent else 5
         val next = settings.get().copy(
             epochs = epochs.coerceIn(1, 500),
@@ -386,6 +386,7 @@ class RealSenseSession(
             validationPercent = share,
             validationEvery = every.coerceIn(1, 50),
             gaussBudget = budget.coerceIn(100_000, 5_000_000),
+            videoSeconds = videoSeconds.coerceIn(1, 30),
         )
         settings.set(next)
         mesh?.replaceSettings(next)
@@ -458,6 +459,7 @@ class RealSenseSession(
                     validationPercent = if (percent == 8 || percent == 10) percent else 5,
                     validationEvery = json.optInt("validationEvery", 5).coerceAtLeast(1),
                     gaussBudget = json.optInt("gaussBudget", 3_000_000).coerceIn(100_000, 5_000_000),
+                    videoSeconds = json.optInt("videoSeconds", 10).coerceIn(1, 30),
                 ),
             )
             frontierOn.set(json.optBoolean("frontier", false))
@@ -481,6 +483,7 @@ class RealSenseSession(
         json.put("validationPercent", scan.validationPercent)
         json.put("validationEvery", scan.validationEvery)
         json.put("gaussBudget", scan.gaussBudget)
+        json.put("videoSeconds", scan.videoSeconds)
         json.put("frontier", frontierOn.get())
         try {
             settingsFile().writeText(json.toString())

@@ -31,7 +31,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-data class TrainMetric(val epoch: Int, val l1: Float, val ssim: Float, val psnr: Float)
+data class TrainMetric(val epoch: Int, val l1: Float, val ssim: Float, val psnr: Float, val gaussians: Int = 0)
 
 data class TrainUi(
     val status: String = "Preparing",
@@ -106,7 +106,7 @@ internal object SplatRuntime {
         }
         writeRun(dir, settings)
         val viewIndex = usable.mapIndexed { index, frame -> frame.id to index }.toMap()
-        val seeded = preview.splatInitFromSeed(usable.size, width, height)
+        val seeded = preview.splatInitFromSeed(usable.size, width, height, settings.gaussBudget)
         if (!seeded) {
             session.resumeAfterSplat()
             fail(context, "The GPU trainer did not start")
@@ -132,8 +132,9 @@ internal object SplatRuntime {
                     failed = !stop.get()
                     break
                 }
-                trainSeries.add(trainMean)
-                append(metrics, epoch, "train", trainMean)
+                val counted = trainMean.copy(gaussians = preview.splatGaussianCount())
+                trainSeries.add(counted)
+                append(metrics, epoch, "train", counted)
                 note("Epoch $epoch train  L1 ${fmt(trainMean.l1)}  SSIM ${fmt(trainMean.ssim)}  PSNR ${fmt(trainMean.psnr)}")
                 publish { it.copy(epoch = epoch, train = trainSeries.toList(), fraction = 1f) }
             }
@@ -150,14 +151,14 @@ internal object SplatRuntime {
                 append(metrics, epoch, "val", valMean)
                 note("Epoch $epoch val  L1 ${fmt(valMean.l1)}  SSIM ${fmt(valMean.ssim)}  PSNR ${fmt(valMean.psnr)}")
                 publish { it.copy(validation = valSeries.toList(), image = latestImage(valDir), fraction = 0f, status = "Rendering video") }
-                if (!stop.get()) encodeVideo(context, preview, usable, width, height, video, epoch, settings.epochs)
+                if (!stop.get()) encodeVideo(context, preview, usable, width, height, video, epoch, settings.epochs, settings.videoSeconds)
             }
             finishedEpochs = epoch
             TrainService.update(context, epoch, settings.epochs, 1f)
         }
         if (!failed && !settings.validation && finishedEpochs > 0 && !stop.get()) {
             publish { it.copy(fraction = 0f, status = "Rendering video") }
-            encodeVideo(context, preview, usable, width, height, video, finishedEpochs, settings.epochs)
+            encodeVideo(context, preview, usable, width, height, video, finishedEpochs, settings.epochs, settings.videoSeconds)
         }
         if (failed) {
             TrainService.stop(context)
@@ -245,6 +246,7 @@ internal object SplatRuntime {
         dest: File,
         epoch: Int,
         epochs: Int,
+        seconds: Int,
     ) {
         if (frames.size < 2) return
         val poses = ArrayList<FloatArray>()
@@ -261,7 +263,7 @@ internal object SplatRuntime {
         }
         poses.add(frames.last().pose.copyOf())
         lenses.add(frames.last())
-        val keep = 48
+        val keep = seconds.coerceIn(1, 30) * 30
         val start = if (poses.size <= keep) 0 else (poses.size - keep) / 2
         val end = minOf(start + keep, poses.size)
         val tmp = File(dest.parentFile, "${dest.name}.tmp")
@@ -313,13 +315,13 @@ internal object SplatRuntime {
 
     private fun writeRun(dir: File, settings: ScanSettings) {
         File(dir, "run.json").writeText(
-            """{"epochs":${settings.epochs},"validation":${settings.validation},"percent":${settings.validationPercent},"every":${settings.validationEvery},"budget":${settings.gaussBudget},"lrMean":1.6e-4,"lrScale":5.0e-3,"lrQuat":1.0e-3,"lrOpacity":5.0e-2,"lrColor":2.5e-3,"lrGrid":2.0e-3}""",
+            """{"epochs":${settings.epochs},"validation":${settings.validation},"percent":${settings.validationPercent},"every":${settings.validationEvery},"budget":${settings.gaussBudget},"videoSeconds":${settings.videoSeconds},"lrMean":1.6e-4,"lrScale":5.0e-3,"lrQuat":1.0e-3,"lrOpacity":5.0e-2,"lrColor":2.5e-3,"lrGrid":2.0e-3}""",
         )
     }
 
     private fun append(file: File, epoch: Int, split: String, metric: TrainMetric) {
         file.appendText(
-            """{"epoch":$epoch,"split":"$split","l1":${metric.l1},"ssim":${metric.ssim},"psnr":${metric.psnr}}""" + "\n",
+            """{"epoch":$epoch,"split":"$split","l1":${metric.l1},"ssim":${metric.ssim},"psnr":${metric.psnr},"gaussians":${metric.gaussians}}""" + "\n",
         )
     }
 
@@ -339,7 +341,13 @@ internal object SplatRuntime {
             val validation = ArrayList<TrainMetric>()
             file.forEachLine { line ->
                 val epoch = number(line, "epoch")?.toInt() ?: return@forEachLine
-                val metric = TrainMetric(epoch, number(line, "l1") ?: return@forEachLine, number(line, "ssim") ?: return@forEachLine, number(line, "psnr") ?: return@forEachLine)
+                val metric = TrainMetric(
+                    epoch,
+                    number(line, "l1") ?: return@forEachLine,
+                    number(line, "ssim") ?: return@forEachLine,
+                    number(line, "psnr") ?: return@forEachLine,
+                    number(line, "gaussians")?.toInt() ?: 0,
+                )
                 if (line.contains("\"val\"")) validation.add(metric) else train.add(metric)
             }
             return train to validation

@@ -212,6 +212,7 @@ private fun series(label: String, color: Color, metrics: List<TrainMetric>): Plo
         metrics.map { it.epoch.toFloat() to it.l1 },
         metrics.map { it.epoch.toFloat() to it.ssim },
         metrics.map { it.epoch.toFloat() to it.psnr },
+        metrics.map { it.epoch.toFloat() to it.gaussians.toFloat() },
     )
 }
 

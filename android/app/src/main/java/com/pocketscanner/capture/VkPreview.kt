@@ -304,10 +304,11 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeCaptureSeedFromFile(handle: Long, path: String, cap: Int): Boolean
     private external fun nativeSplatError(handle: Long): String
     private external fun nativeSeedVoxel(handle: Long): Float
-    private external fun nativeSplatInitFromSeed(handle: Long, views: Int, width: Int, height: Int): Boolean
+    private external fun nativeSplatGaussianCount(handle: Long): Int
+    private external fun nativeSplatInitFromSeed(handle: Long, views: Int, width: Int, height: Int, budget: Int): Boolean
     private external fun nativeDropMesh(handle: Long)
     private external fun nativeSplatInit(
-        handle: Long, verts: FloatArray, voxel: Float, views: Int, width: Int, height: Int,
+        handle: Long, verts: FloatArray, voxel: Float, views: Int, width: Int, height: Int, budget: Int,
     ): Boolean
     private external fun nativeSplatStep(
         handle: Long, rgb: FloatArray, pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float,
@@ -355,8 +356,12 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         if (handle == 0L) 0f else view.nativeSeedVoxel(handle)
     }
 
-    fun splatInitFromSeed(views: Int, width: Int, height: Int): Boolean = onGpu(false) { view, handle ->
-        handle != 0L && view.nativeSplatInitFromSeed(handle, views, width, height)
+    fun splatGaussianCount(): Int = onGpu(0) { view, handle ->
+        if (handle == 0L) 0 else view.nativeSplatGaussianCount(handle)
+    }
+
+    fun splatInitFromSeed(views: Int, width: Int, height: Int, budget: Int): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeSplatInitFromSeed(handle, views, width, height, budget)
     }
 
     fun dropMesh() {
@@ -365,9 +370,9 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         }
     }
 
-    fun splatInit(verts: FloatArray, voxel: Float, views: Int, width: Int, height: Int): Boolean =
+    fun splatInit(verts: FloatArray, voxel: Float, views: Int, width: Int, height: Int, budget: Int): Boolean =
         onGpu(false) { view, handle ->
-            handle != 0L && view.nativeSplatInit(handle, verts, voxel, views, width, height)
+            handle != 0L && view.nativeSplatInit(handle, verts, voxel, views, width, height, budget)
         }
 
     fun splatStep(

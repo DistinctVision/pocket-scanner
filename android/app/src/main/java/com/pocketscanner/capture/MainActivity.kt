@@ -954,7 +954,7 @@ internal fun SettingsPanel(
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
     onRefine: (Boolean, Int) -> Unit,
-    onSplatting: (Int, Boolean, Int, Int, Int) -> Unit,
+    onSplatting: (Int, Boolean, Int, Int, Int, Int) -> Unit,
     onClose: () -> Unit,
 ) {
     var voxel by remember { mutableIntStateOf(applied.voxelCm) }
@@ -969,6 +969,7 @@ internal fun SettingsPanel(
     var validationPercent by remember { mutableIntStateOf(applied.validationPercent) }
     var validationEvery by remember { mutableIntStateOf(applied.validationEvery) }
     var gaussBudget by remember { mutableIntStateOf(applied.gaussBudget) }
+    var videoSeconds by remember { mutableIntStateOf(applied.videoSeconds) }
     val scheme = MaterialTheme.colorScheme
     Column(
         modifier = Modifier
@@ -1032,6 +1033,7 @@ internal fun SettingsPanel(
                         validationPercent = validationPercent,
                         validationEvery = validationEvery,
                         gaussBudget = gaussBudget,
+                        videoSeconds = videoSeconds,
                     ),
                 )
             },
@@ -1088,7 +1090,7 @@ internal fun SettingsPanel(
             range = 1f..500f,
         ) {
             epochs = it.toInt().coerceIn(1, 500)
-            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
+            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1100,13 +1102,13 @@ internal fun SettingsPanel(
                 checked = validation,
                 onCheckedChange = {
                     validation = it
-                    onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
+                    onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
                 },
             )
         }
         ChoiceRow("Validation share", listOf(5, 8, 10), validationPercent, { "$it%" }) {
             validationPercent = it
-            onSplatting(epochs, validation, it, validationEvery, gaussBudget)
+            onSplatting(epochs, validation, it, validationEvery, gaussBudget, videoSeconds)
         }
         LabeledSlider(
             title = "Validation interval",
@@ -1116,7 +1118,7 @@ internal fun SettingsPanel(
             range = 1f..20f,
         ) {
             validationEvery = it.toInt().coerceIn(1, 20)
-            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
+            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
         }
         LabeledSlider(
             title = "Gaussians",
@@ -1126,7 +1128,17 @@ internal fun SettingsPanel(
             range = 0.5f..5f,
         ) {
             gaussBudget = (it * 1_000_000f).toInt().coerceIn(500_000, 5_000_000)
-            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
+            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
+        }
+        LabeledSlider(
+            title = "Video",
+            value = "$videoSeconds s",
+            detail = "Length of the clip taken from the middle of the path.",
+            sliderValue = videoSeconds.toFloat(),
+            range = 1f..30f,
+        ) {
+            videoSeconds = it.toInt().coerceIn(1, 30)
+            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
         }
     }
 }

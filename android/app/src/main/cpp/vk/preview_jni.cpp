@@ -203,24 +203,29 @@ JNIEXPORT jstring JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatEr
     return env->NewStringUTF(text == nullptr ? "" : text);
 }
 
+JNIEXPORT jint JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatGaussianCount(JNIEnv*, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    return preview == nullptr ? 0 : preview->splatGaussianCount();
+}
+
 JNIEXPORT jfloat JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSeedVoxel(JNIEnv*, jobject, jlong handle) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     return preview == nullptr ? 0.f : preview->seedVoxel();
 }
 
 JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatInitFromSeed(
-    JNIEnv*, jobject, jlong handle, jint views, jint width, jint height) {
+    JNIEnv*, jobject, jlong handle, jint views, jint width, jint height, jint budget) {
     auto* preview = reinterpret_cast<Preview*>(handle);
-    return preview != nullptr && preview->splatInitFromSeed(views, width, height) ? JNI_TRUE : JNI_FALSE;
+    return preview != nullptr && preview->splatInitFromSeed(views, width, height, budget) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatInit(
-    JNIEnv* env, jobject, jlong handle, jfloatArray verts, jfloat voxel, jint views, jint width, jint height) {
+    JNIEnv* env, jobject, jlong handle, jfloatArray verts, jfloat voxel, jint views, jint width, jint height, jint budget) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     if (preview == nullptr || verts == nullptr) return JNI_FALSE;
     jfloat* values = env->GetFloatArrayElements(verts, nullptr);
     int count = env->GetArrayLength(verts) / 9;
-    bool ok = values != nullptr && preview->splatInit(values, count, voxel, views, width, height);
+    bool ok = values != nullptr && preview->splatInit(values, count, voxel, views, width, height, budget);
     if (values != nullptr) env->ReleaseFloatArrayElements(verts, values, JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }

@@ -41,6 +41,7 @@ data class ScanSettings(
     val validationPercent: Int = 5,
     val validationEvery: Int = 5,
     val gaussBudget: Int = 3_000_000,
+    val videoSeconds: Int = 10,
 ) {
     val integrateHeight: Int get() = integrateWidth * 3 / 4
 

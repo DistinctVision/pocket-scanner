@@ -9,6 +9,9 @@ StructuredBuffer<int> accum;
 [[vk::binding(2, 0)]]
 RWStructuredBuffer<Gauss> grads;
 
+[[vk::binding(3, 0)]]
+RWStructuredBuffer<float4> densify;
+
 struct ParamPush {
     float4 row0;
     float4 row1;
@@ -93,5 +96,8 @@ void paramGrad(uint3 tid : SV_DispatchThreadID) {
         float3 dc = conicOf(shifted, cam) - base;
         outg.quat[axis] = dot(dcon, dc) / eps;
     }
+    int slot = int(tid.x) * 2;
+    densify[slot] += float4(length(dxy), 1.0, 0.0, 0.0);
+    densify[slot + 1] += float4(outg.meanOp.xyz, 0.0);
     grads[tid.x] = outg;
 }

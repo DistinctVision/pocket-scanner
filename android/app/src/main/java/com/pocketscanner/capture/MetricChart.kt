@@ -44,6 +44,7 @@ data class PlotLine(
     val l1: List<Pair<Float, Float>>,
     val ssim: List<Pair<Float, Float>>,
     val psnr: List<Pair<Float, Float>>,
+    val gaussians: List<Pair<Float, Float>>,
 )
 
 private val holdChartScroll = object : NestedScrollConnection {
@@ -66,6 +67,11 @@ internal fun MetricColumn(lines: List<PlotLine>, height: androidx.compose.ui.uni
         MetricChart("L1", lines.map { it.color to it.l1 }, Modifier.fillMaxWidth().height(height))
         MetricChart("SSIM", lines.map { it.color to it.ssim }, Modifier.fillMaxWidth().height(height))
         MetricChart("PSNR", lines.map { it.color to it.psnr }, Modifier.fillMaxWidth().height(height))
+        MetricChart(
+            "Gaussians",
+            lines.map { it.color to it.gaussians.filter { point -> point.second > 0f } },
+            Modifier.fillMaxWidth().height(height),
+        )
     }
 }
 
