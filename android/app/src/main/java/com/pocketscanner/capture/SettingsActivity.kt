@@ -41,7 +41,9 @@ class SettingsActivity : ComponentActivity() {
                         finishSettings()
                     },
                     onRefine = { loops, voxel -> session.updateRefine(loops, voxel) },
-                    onSplatting = { epochs, validation, percent -> session.setSplatting(epochs, validation, percent) },
+                    onSplatting = { epochs, validation, percent, every, budget ->
+                        session.setSplatting(epochs, validation, percent, every, budget)
+                    },
                     onClose = { finishSettings() },
                 )
             }

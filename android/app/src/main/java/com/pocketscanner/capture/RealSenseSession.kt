@@ -113,6 +113,10 @@ class RealSenseSession(
     private val previewColorLock = Any()
     private var loggedPreviewMiss = false
     private val settings = AtomicReference(ScanSettings())
+
+    init {
+        loadSettings()
+    }
     private val recordFrames = AtomicBoolean(false)
     private val frontierOn = AtomicBoolean(false)
     private val volumeConfigured = AtomicBoolean(false)
@@ -177,7 +181,7 @@ class RealSenseSession(
             try {
                 val stream = app.contentResolver.openOutputStream(uri)
                     ?: error("Could not open the file")
-                val count = stream.use { mesh?.writePackage(it, settings.get(), File(scanDir, "mesh.bin")) ?: 0 }
+                val count = stream.use { mesh?.writePackage(it, settings.get(), File(scanDir, "mesh.ply")) ?: 0 }
                 if (count <= 0) {
                     try {
                         DocumentsContract.deleteDocument(app.contentResolver, uri)
@@ -188,7 +192,7 @@ class RealSenseSession(
                 }
                 ScanLibrary.persist(app, uri)
                 packageUri.set(uri)
-                val mesh = File(scanDir, "mesh.bin")
+                val mesh = File(scanDir, "mesh.ply")
                 if (mesh.isFile) mesh.copyTo(meshSidecar(uri), overwrite = true)
                 val name = ScanLibrary.displayName(app, uri)
                 ScanLibrary.remember(app, uri, name, count)
@@ -212,10 +216,7 @@ class RealSenseSession(
             try {
                 val count = mesh?.restore(rebuildMesh = false) { accept ->
                     ScanPackage.read(app, uri, { header ->
-                        val tuned = settings.get().copy(
-                            voxelCm = header.voxelCm,
-                            reviewVoxelCm = header.reviewVoxelCm,
-                        )
+                        val tuned = settings.get().copy(voxelCm = header.voxelCm)
                         settings.set(tuned)
                         mesh?.replaceSettings(tuned)
                     }, accept)
@@ -225,7 +226,7 @@ class RealSenseSession(
                     .filter { it.isFile && it.length() > 16 }
                     .maxByOrNull { it.lastModified() }
                 val shown = cached != null && preview?.loadMesh(cached.absolutePath, depth) == true
-                val beside = File(scanDir, "mesh.bin")
+                val beside = File(scanDir, "mesh.ply")
                 if (shown) {
                     volumeConfigured.set(true)
                     meshFrozen.set(true)
@@ -266,6 +267,7 @@ class RealSenseSession(
     fun setFrontier(enabled: Boolean) {
         frontierOn.set(enabled)
         preview?.setFrontier(enabled)
+        saveSettings()
     }
 
     fun setRecording(enabled: Boolean) {
@@ -288,6 +290,7 @@ class RealSenseSession(
     fun applyScan(next: ScanSettings) {
         scanning.set(false)
         settings.set(next)
+        saveSettings()
         mesh?.apply(next)
         trackerRef?.updateTuning(next.tuning())
         preview?.meshConfigure(next.voxelCm / 100f, next.depthMeters)
@@ -321,6 +324,7 @@ class RealSenseSession(
         val next = settings.get().copy(closeLoops = closeLoops, reviewVoxelCm = reviewVoxelCm)
         settings.set(next)
         mesh?.replaceSettings(next)
+        saveSettings()
         if (ui.phase == "review") {
             meshFrozen.set(false)
             mesh?.rebuild(reviewVoxelCm)
@@ -374,14 +378,18 @@ class RealSenseSession(
         return true
     }
 
-    fun setSplatting(epochs: Int, validation: Boolean, percent: Int) {
+    fun setSplatting(epochs: Int, validation: Boolean, percent: Int, every: Int, budget: Int) {
+        val share = if (percent == 8 || percent == 10) percent else 5
         val next = settings.get().copy(
             epochs = epochs.coerceIn(1, 500),
             validation = validation,
-            validationPercent = if (percent == 5 || percent == 10) percent else 8,
+            validationPercent = share,
+            validationEvery = every.coerceIn(1, 50),
+            gaussBudget = budget.coerceIn(100_000, 5_000_000),
         )
         settings.set(next)
         mesh?.replaceSettings(next)
+        saveSettings()
     }
 
     /** Writes the finished review mesh beside the keyframes and the opened scan. */
@@ -390,7 +398,7 @@ class RealSenseSession(
         synchronized(meshCacheGate) {
             if (!meshFrozen.compareAndSet(false, true)) return true
             scanDir.mkdirs()
-            val tmp = File(scanDir, "mesh.bin.tmp")
+            val tmp = File(scanDir, "mesh.ply.tmp")
             val ok = preview?.saveMesh(tmp.absolutePath) == true && tmp.length() > 16
             if (!ok) {
                 tmp.delete()
@@ -398,7 +406,7 @@ class RealSenseSession(
                 Log.e(TAG, "mesh cache was not written")
                 return false
             }
-            val dest = File(scanDir, "mesh.bin")
+            val dest = File(scanDir, "mesh.ply")
             if (dest.exists() && !dest.delete()) Log.e(TAG, "mesh cache replace failed")
             if (!tmp.renameTo(dest)) {
                 meshFrozen.set(false)
@@ -425,7 +433,60 @@ class RealSenseSession(
         val name = digest.take(8).joinToString("") { "%02x".format(it) }
         val dir = File(context.getExternalFilesDir(null), "mesh-cache")
         dir.mkdirs()
-        return File(dir, "$name.bin")
+        return File(dir, "$name.ply")
+    }
+
+    private fun settingsFile(): File = File(context.filesDir, "scan-settings.json")
+
+    private fun loadSettings() {
+        val file = settingsFile()
+        if (!file.isFile) return
+        try {
+            val json = org.json.JSONObject(file.readText())
+            val percent = json.optInt("validationPercent", 5)
+            settings.set(
+                ScanSettings(
+                    voxelCm = json.optInt("voxelCm", 8),
+                    integrateWidth = json.optInt("integrateWidth", 160),
+                    minSize = json.optInt("minSize", 500),
+                    pyramidLevels = json.optInt("pyramidLevels", 6),
+                    depthMeters = json.optDouble("depthMeters", 6.0).toFloat(),
+                    reviewVoxelCm = json.optInt("reviewVoxelCm", 8),
+                    closeLoops = json.optBoolean("closeLoops", true),
+                    epochs = json.optInt("epochs", 100).coerceIn(1, 500),
+                    validation = json.optBoolean("validation", true),
+                    validationPercent = if (percent == 8 || percent == 10) percent else 5,
+                    validationEvery = json.optInt("validationEvery", 5).coerceAtLeast(1),
+                    gaussBudget = json.optInt("gaussBudget", 3_000_000).coerceIn(100_000, 5_000_000),
+                ),
+            )
+            frontierOn.set(json.optBoolean("frontier", false))
+        } catch (error: Exception) {
+            Log.w(TAG, "settings: ${error.message}")
+        }
+    }
+
+    private fun saveSettings() {
+        val scan = settings.get()
+        val json = org.json.JSONObject()
+        json.put("voxelCm", scan.voxelCm)
+        json.put("integrateWidth", scan.integrateWidth)
+        json.put("minSize", scan.minSize)
+        json.put("pyramidLevels", scan.pyramidLevels)
+        json.put("depthMeters", scan.depthMeters.toDouble())
+        json.put("reviewVoxelCm", scan.reviewVoxelCm)
+        json.put("closeLoops", scan.closeLoops)
+        json.put("epochs", scan.epochs)
+        json.put("validation", scan.validation)
+        json.put("validationPercent", scan.validationPercent)
+        json.put("validationEvery", scan.validationEvery)
+        json.put("gaussBudget", scan.gaussBudget)
+        json.put("frontier", frontierOn.get())
+        try {
+            settingsFile().writeText(json.toString())
+        } catch (error: Exception) {
+            Log.w(TAG, "settings write: ${error.message}")
+        }
     }
 
     fun releaseTrainingSources() {
@@ -434,10 +495,11 @@ class RealSenseSession(
 
     /** Copies color views, reads the mesh, then stops the camera and frees the volume. */
     fun beginSplatting(dir: File): SplatPrepared {
-        val meshFile = File(scanDir, "mesh.bin")
+        val cap = settings.get().gaussBudget
+        val meshFile = File(scanDir, "mesh.ply")
         val haveSeed =
-            (meshFile.isFile && meshFile.length() > 16 && preview?.captureSeedFromFile(meshFile.absolutePath) == true) ||
-                preview?.captureSeed() == true
+            (meshFile.isFile && meshFile.length() > 16 && preview?.captureSeedFromFile(meshFile.absolutePath, cap) == true) ||
+                preview?.captureSeed(cap) == true
         if (!haveSeed) error("The mesh could not be read")
         val frames = mesh?.exportTraining(dir) ?: error("No scan to train")
         if (frames.isEmpty()) error("No full frames to train")

@@ -300,8 +300,9 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeSaveMesh(handle: Long, path: String): Boolean
     private external fun nativeLoadMesh(handle: Long, path: String, depthMeters: Float): Boolean
     private external fun nativeDropQueue(handle: Long)
-    private external fun nativeCaptureSeed(handle: Long): Boolean
-    private external fun nativeCaptureSeedFromFile(handle: Long, path: String): Boolean
+    private external fun nativeCaptureSeed(handle: Long, cap: Int): Boolean
+    private external fun nativeCaptureSeedFromFile(handle: Long, path: String, cap: Int): Boolean
+    private external fun nativeSplatError(handle: Long): String
     private external fun nativeSeedVoxel(handle: Long): Float
     private external fun nativeSplatInitFromSeed(handle: Long, views: Int, width: Int, height: Int): Boolean
     private external fun nativeDropMesh(handle: Long)
@@ -338,12 +339,16 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         }
     }
 
-    fun captureSeed(): Boolean = onGpu(false) { view, handle ->
-        handle != 0L && view.nativeCaptureSeed(handle)
+    fun captureSeed(cap: Int): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeCaptureSeed(handle, cap)
     }
 
-    fun captureSeedFromFile(path: String): Boolean = onGpu(false) { view, handle ->
-        handle != 0L && view.nativeCaptureSeedFromFile(handle, path)
+    fun captureSeedFromFile(path: String, cap: Int): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeCaptureSeedFromFile(handle, path, cap)
+    }
+
+    fun splatError(): String = onGpu("") { view, handle ->
+        if (handle == 0L) "" else view.nativeSplatError(handle)
     }
 
     fun seedVoxel(): Float = onGpu(0f) { view, handle ->

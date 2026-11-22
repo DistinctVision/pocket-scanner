@@ -75,14 +75,21 @@ void project(uint3 tid : SV_DispatchThreadID) {
     }
     float invDet = 1.0 / det;
     float2 xy = float2(fx * cam.x * invZ + pc.intr.z, fy * cam.y * invZ + pc.intr.w);
-    float radius = 3.0 * sqrt(max(c00, c11));
     float alpha = sigmoid(g.meanOp.w);
-    float alive = (radius >= 0.5 && xy.x + radius >= 0 && xy.y + radius >= 0 &&
-                   xy.x - radius < pc.width && xy.y - radius < pc.height)
-        ? 1.0
-        : 0.0;
-    o.xyDepthRadius = float4(xy, cam.z, radius);
-    o.conicAlpha = float4(c11 * invDet, -c01 * invDet, c00 * invDet, alpha);
+    float conicA = c11 * invDet;
+    float conicB = -c01 * invDet;
+    float conicC = c00 * invDet;
+    float xMag = 0.0;
+    float yMag = 0.0;
+    float extent = 2.0 * log(max(alpha, 1e-6) * 255.0);
+    float alive = 0.0;
+    if (ellipseBox(conicA, conicB, conicC, extent, xMag, yMag) &&
+        xy.x + xMag >= 0.0 && xy.y + yMag >= 0.0 &&
+        xy.x - xMag < float(pc.width) && xy.y - yMag < float(pc.height)) {
+        alive = 1.0;
+    }
+    o.xyDepthRadius = float4(xy, cam.z, 0.0);
+    o.conicAlpha = float4(conicA, conicB, conicC, alpha);
     o.colorAlive = float4(saturate(g.colorPad.xyz), alive);
     splats[i] = o;
 }

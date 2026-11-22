@@ -868,10 +868,10 @@ bool Preview::loadMesh(const char* path, float depthMeters) {
 
 void Preview::dropQueue() { volume.dropQueue(); }
 
-bool Preview::captureSeed() {
+bool Preview::captureSeed(int cap) {
     waitInFlight();
     seed.clear();
-    const int count = volume.copySurface(seed, seedVoxelSize);
+    const int count = volume.copySurface(seed, seedVoxelSize, cap);
     if (count < 3) {
         seed.clear();
         seed.shrink_to_fit();
@@ -880,9 +880,9 @@ bool Preview::captureSeed() {
     return true;
 }
 
-bool Preview::captureSeedFromFile(const char* path) {
+bool Preview::captureSeedFromFile(const char* path, int cap) {
     seed.clear();
-    const int count = volume.readMeshSeed(path, seed, seedVoxelSize);
+    const int count = volume.readMeshSeed(path, seed, seedVoxelSize, cap);
     if (count < 3) {
         seed.clear();
         seed.shrink_to_fit();
@@ -919,6 +919,8 @@ bool Preview::splatRender(const float pose[16], float fx, float fy, float cx, fl
 bool Preview::splatRead(uint8_t* rgb) { return splat != nullptr && splat->readCorrected(rgb); }
 
 bool Preview::splatWritePly(const char* path) { return splat != nullptr && splat->writePly(path); }
+
+const char* Preview::splatError() const { return splat == nullptr ? "" : splat->lastError(); }
 
 int Preview::splatWidth() const { return splat == nullptr ? 0 : splat->viewWidth(); }
 

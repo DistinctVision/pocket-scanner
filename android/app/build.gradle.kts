@@ -66,4 +66,5 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.foundation:foundation")
+    implementation("com.patrykandpatrick.vico:compose-m3:2.1.3")
 }

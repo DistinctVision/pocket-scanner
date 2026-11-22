@@ -954,7 +954,7 @@ internal fun SettingsPanel(
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
     onRefine: (Boolean, Int) -> Unit,
-    onSplatting: (Int, Boolean, Int) -> Unit,
+    onSplatting: (Int, Boolean, Int, Int, Int) -> Unit,
     onClose: () -> Unit,
 ) {
     var voxel by remember { mutableIntStateOf(applied.voxelCm) }
@@ -967,6 +967,8 @@ internal fun SettingsPanel(
     var epochs by remember { mutableIntStateOf(applied.epochs) }
     var validation by remember { mutableStateOf(applied.validation) }
     var validationPercent by remember { mutableIntStateOf(applied.validationPercent) }
+    var validationEvery by remember { mutableIntStateOf(applied.validationEvery) }
+    var gaussBudget by remember { mutableIntStateOf(applied.gaussBudget) }
     val scheme = MaterialTheme.colorScheme
     Column(
         modifier = Modifier
@@ -1028,6 +1030,8 @@ internal fun SettingsPanel(
                         epochs = epochs,
                         validation = validation,
                         validationPercent = validationPercent,
+                        validationEvery = validationEvery,
+                        gaussBudget = gaussBudget,
                     ),
                 )
             },
@@ -1066,7 +1070,7 @@ internal fun SettingsPanel(
             onRefine(closeLoops, it)
         }
         Text(
-            "Default is 4 cm. 2 cm can fill the chunk budget in a large room.",
+            "Default is 8 cm. 2 cm can fill the chunk budget in a large room.",
             color = scheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
@@ -1076,15 +1080,16 @@ internal fun SettingsPanel(
             color = scheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
-        Text("Epochs $epochs", style = MaterialTheme.typography.labelLarge)
-        androidx.compose.material3.Slider(
-            value = epochs.toFloat(),
-            onValueChange = {
-                epochs = it.toInt().coerceIn(1, 500)
-                onSplatting(epochs, validation, validationPercent)
-            },
-            valueRange = 1f..500f,
-        )
+        LabeledSlider(
+            title = "Epochs",
+            value = "$epochs",
+            detail = "Training stops after this many passes over the frames.",
+            sliderValue = epochs.toFloat(),
+            range = 1f..500f,
+        ) {
+            epochs = it.toInt().coerceIn(1, 500)
+            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1095,14 +1100,54 @@ internal fun SettingsPanel(
                 checked = validation,
                 onCheckedChange = {
                     validation = it
-                    onSplatting(epochs, validation, validationPercent)
+                    onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
                 },
             )
         }
         ChoiceRow("Validation share", listOf(5, 8, 10), validationPercent, { "$it%" }) {
             validationPercent = it
-            onSplatting(epochs, validation, it)
+            onSplatting(epochs, validation, it, validationEvery, gaussBudget)
         }
+        LabeledSlider(
+            title = "Validation interval",
+            value = "$validationEvery epochs",
+            detail = "Validation runs after this many training epochs.",
+            sliderValue = validationEvery.toFloat(),
+            range = 1f..20f,
+        ) {
+            validationEvery = it.toInt().coerceIn(1, 20)
+            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
+        }
+        LabeledSlider(
+            title = "Gaussians",
+            value = String.format(java.util.Locale.US, "%.1f million", gaussBudget / 1_000_000f),
+            detail = "Most measured mesh vertices kept for the run.",
+            sliderValue = gaussBudget / 1_000_000f,
+            range = 0.5f..5f,
+        ) {
+            gaussBudget = (it * 1_000_000f).toInt().coerceIn(500_000, 5_000_000)
+            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget)
+        }
+    }
+}
+
+@Composable
+private fun LabeledSlider(
+    title: String,
+    value: String,
+    detail: String,
+    sliderValue: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onValueChange: (Float) -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(title, color = scheme.onSurface, style = MaterialTheme.typography.labelLarge)
+            Text(value, color = scheme.onSurface, style = MaterialTheme.typography.labelLarge)
+        }
+        Text(detail, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        androidx.compose.material3.Slider(value = sliderValue, onValueChange = onValueChange, valueRange = range)
     }
 }
 

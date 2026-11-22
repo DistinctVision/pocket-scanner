@@ -107,10 +107,10 @@ private fun TrainScreen(ui: TrainUi, onStop: () -> Unit, onBack: () -> Unit, onM
     }
     val compared = compare?.let { SplatRuntime.readMetrics(it) }
     val lines = buildList {
-        add(plot(Color(0xFF8AB4F8), false, ui.train))
-        if (ui.validation.isNotEmpty()) add(plot(Color(0xFF8AB4F8), true, ui.validation))
-        if (compared != null && compared.first.isNotEmpty()) add(plot(Color(0xFFF6C945), false, compared.first))
-        if (compared != null && compared.second.isNotEmpty()) add(plot(Color(0xFFF6C945), true, compared.second))
+        add(plot("Train", Color(0xFF8AB4F8), ui.train))
+        if (ui.validation.isNotEmpty()) add(plot("Val", Color(0xFFF28B82), ui.validation))
+        if (compared != null && compared.first.isNotEmpty()) add(plot("Compare train", Color(0xFFF6C945), compared.first))
+        if (compared != null && compared.second.isNotEmpty()) add(plot("Compare val", Color(0xFF81C995), compared.second))
     }
     Column(
         modifier = Modifier
@@ -149,7 +149,7 @@ private fun TrainScreen(ui: TrainUi, onStop: () -> Unit, onBack: () -> Unit, onM
                 }
             }
         }
-        MetricColumn(lines = lines, height = 140.dp, fullscreen = null, onFullscreen = { onMetrics() })
+        MetricColumn(lines = lines, height = 160.dp)
         ui.image?.let { image ->
             Image(bitmap = image.asImageBitmap(), contentDescription = "Validation", modifier = Modifier.fillMaxWidth())
         }
@@ -167,10 +167,10 @@ private fun TrainScreen(ui: TrainUi, onStop: () -> Unit, onBack: () -> Unit, onM
     }
 }
 
-private fun plot(color: Color, dashed: Boolean, metrics: List<TrainMetric>): PlotLine {
+private fun plot(label: String, color: Color, metrics: List<TrainMetric>): PlotLine {
     return PlotLine(
+        label,
         color,
-        dashed,
         metrics.map { it.epoch.toFloat() to it.l1 },
         metrics.map { it.epoch.toFloat() to it.ssim },
         metrics.map { it.epoch.toFloat() to it.psnr },

@@ -34,11 +34,13 @@ data class ScanSettings(
     val minSize: Int = 500,
     val pyramidLevels: Int = 6,
     val depthMeters: Float = 6f,
-    val reviewVoxelCm: Int = 4,
+    val reviewVoxelCm: Int = 8,
     val closeLoops: Boolean = true,
     val epochs: Int = 100,
-    val validation: Boolean = false,
-    val validationPercent: Int = 8,
+    val validation: Boolean = true,
+    val validationPercent: Int = 5,
+    val validationEvery: Int = 5,
+    val gaussBudget: Int = 3_000_000,
 ) {
     val integrateHeight: Int get() = integrateWidth * 3 / 4
 

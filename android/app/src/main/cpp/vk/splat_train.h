@@ -32,6 +32,13 @@ private:
     bool uploadIdentity();
     bool projectAndBlend(const float pose[16], float fx, float fy, float cx, float cy);
     bool metricsOf(float out[3]);
+    bool grow(void* buffer, uint64_t bytes);
+    void bindScans();
+    bool scratchFor(int n);
+    bool recordScan(void* cmd, int level, int n, int inBase, int outBase);
+    bool ensurePairs(int total);
+    bool radixSort(int total);
+    void fail(const char* text);
 
     VkCore* core = nullptr;
     Kernels* gpu = nullptr;
@@ -43,4 +50,8 @@ private:
     int tilesY = 0;
     int gaussStep = 0;
     int gridStep = 0;
+    char error[160] = {};
+
+public:
+    const char* lastError() const { return error; }
 };

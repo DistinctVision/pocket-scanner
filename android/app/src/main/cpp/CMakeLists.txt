@@ -95,9 +95,13 @@ slang_shader("${SHADER_DIR}/marching.slang" marching compute marching_spv)
 slang_shader("${SHADER_DIR}/mesh.slang" meshVert vertex mesh_vert_spv)
 slang_shader("${SHADER_DIR}/mesh.slang" meshFrag fragment mesh_frag_spv)
 slang_shader("${SHADER_DIR}/splat_project.slang" project compute splat_project_spv)
-slang_shader("${SHADER_DIR}/splat_tile.slang" clearTiles compute splat_clear_spv)
-slang_shader("${SHADER_DIR}/splat_tile.slang" binSplats compute splat_bin_spv)
-slang_shader("${SHADER_DIR}/splat_tile.slang" sortTiles compute splat_sort_spv)
+slang_shader("${SHADER_DIR}/splat_tile.slang" countTiles compute splat_count_spv)
+slang_shader("${SHADER_DIR}/splat_keys.slang" writeKeys compute splat_keys_spv)
+slang_shader("${SHADER_DIR}/splat_scan.slang" scanBlock compute splat_scan_spv)
+slang_shader("${SHADER_DIR}/splat_scan_add.slang" scanAdd compute splat_scan_add_spv)
+slang_shader("${SHADER_DIR}/splat_sort.slang" radixHist compute splat_hist_spv)
+slang_shader("${SHADER_DIR}/splat_scatter.slang" radixScatter compute splat_scatter_spv)
+slang_shader("${SHADER_DIR}/splat_ranges.slang" markRanges compute splat_ranges_spv)
 slang_shader("${SHADER_DIR}/splat_blend.slang" blendForward compute splat_blend_spv)
 slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackward compute splat_back_spv)
 slang_shader("${SHADER_DIR}/splat_params.slang" paramGrad compute splat_params_spv)
@@ -116,9 +120,13 @@ list(APPEND SHADER_HEADERS
     "${SHADER_OUT}/mesh_vert_spv.h"
     "${SHADER_OUT}/mesh_frag_spv.h"
     "${SHADER_OUT}/splat_project_spv.h"
-    "${SHADER_OUT}/splat_clear_spv.h"
-    "${SHADER_OUT}/splat_bin_spv.h"
-    "${SHADER_OUT}/splat_sort_spv.h"
+    "${SHADER_OUT}/splat_count_spv.h"
+    "${SHADER_OUT}/splat_keys_spv.h"
+    "${SHADER_OUT}/splat_scan_spv.h"
+    "${SHADER_OUT}/splat_scan_add_spv.h"
+    "${SHADER_OUT}/splat_hist_spv.h"
+    "${SHADER_OUT}/splat_scatter_spv.h"
+    "${SHADER_OUT}/splat_ranges_spv.h"
     "${SHADER_OUT}/splat_blend_spv.h"
     "${SHADER_OUT}/splat_back_spv.h"
     "${SHADER_OUT}/splat_params_spv.h"

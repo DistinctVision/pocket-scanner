@@ -36,8 +36,9 @@ struct Preview {
     void dropQueue();
     void dropMesh();
     // Keeps the measured surface in this process. The Java heap never sees the vertices.
-    bool captureSeed();
-    bool captureSeedFromFile(const char* path);
+    bool captureSeed(int cap);
+    bool captureSeedFromFile(const char* path, int cap);
+    const char* splatError() const;
     float seedVoxel() const { return seedVoxelSize; }
     bool splatInitFromSeed(int views, int width, int height);
     bool splatInit(const float* verts, int count, float voxel, int views, int width, int height);

@@ -181,19 +181,26 @@ JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeDropQueue(
     if (preview != nullptr) preview->dropQueue();
 }
 
-JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptureSeed(JNIEnv*, jobject, jlong handle) {
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptureSeed(
+    JNIEnv*, jobject, jlong handle, jint cap) {
     auto* preview = reinterpret_cast<Preview*>(handle);
-    return preview != nullptr && preview->captureSeed() ? JNI_TRUE : JNI_FALSE;
+    return preview != nullptr && preview->captureSeed(cap) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptureSeedFromFile(
-    JNIEnv* env, jobject, jlong handle, jstring path) {
+    JNIEnv* env, jobject, jlong handle, jstring path, jint cap) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     if (preview == nullptr || path == nullptr) return JNI_FALSE;
     const char* chars = env->GetStringUTFChars(path, nullptr);
-    const bool ok = chars != nullptr && preview->captureSeedFromFile(chars);
+    const bool ok = chars != nullptr && preview->captureSeedFromFile(chars, cap);
     if (chars != nullptr) env->ReleaseStringUTFChars(path, chars);
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatError(JNIEnv* env, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    const char* text = preview == nullptr ? "" : preview->splatError();
+    return env->NewStringUTF(text == nullptr ? "" : text);
 }
 
 JNIEXPORT jfloat JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSeedVoxel(JNIEnv*, jobject, jlong handle) {

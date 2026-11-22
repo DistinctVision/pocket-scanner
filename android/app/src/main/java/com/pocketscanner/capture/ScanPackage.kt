@@ -77,7 +77,7 @@ internal class ScanHeader(
 )
 
 internal object ScanPackage {
-    fun cachedMesh(context: Context): File = File(context.getExternalFilesDir(null), "packages/loaded-mesh.bin")
+    fun cachedMesh(context: Context): File = File(context.getExternalFilesDir(null), "packages/loaded-mesh.ply")
 
     /** Copies mesh.bin into an already saved package. The original stays unchanged if the write fails. */
     fun attachMesh(context: Context, uri: Uri, mesh: File) {
@@ -93,12 +93,12 @@ internal object ScanPackage {
                 val entries = zip.entries()
                 while (entries.hasMoreElements()) {
                     val entry = entries.nextElement()
-                    if (entry.name == "mesh.bin") continue
+                    if (entry.name == "mesh.bin" || entry.name == "mesh.ply") continue
                     out.putNextEntry(ZipEntry(entry.name))
                     zip.getInputStream(entry).use { it.copyTo(out) }
                     out.closeEntry()
                 }
-                out.putNextEntry(ZipEntry("mesh.bin"))
+                out.putNextEntry(ZipEntry("mesh.ply"))
                 mesh.inputStream().use { it.copyTo(out) }
                 out.closeEntry()
             }
@@ -146,7 +146,7 @@ internal object ScanPackage {
                 putBytes(zip, "frames/${shot.id}.z16", packDepth(shot))
             }
             if (mesh != null && mesh.isFile && mesh.length() > 16) {
-                val entry = ZipEntry("mesh.bin")
+                val entry = ZipEntry("mesh.ply")
                 entry.method = ZipEntry.DEFLATED
                 zip.putNextEntry(entry)
                 mesh.inputStream().use { it.copyTo(zip) }
@@ -165,7 +165,8 @@ internal object ScanPackage {
         }
         ZipFile(kept).use { zip ->
             val meshOut = cachedMesh(context)
-            val meshEntry = zip.getEntry("mesh.bin")
+            File(meshOut.parentFile, "loaded-mesh.bin").delete()
+            val meshEntry = zip.getEntry("mesh.ply")
             if (meshEntry != null) {
                 meshOut.parentFile?.mkdirs()
                 zip.getInputStream(meshEntry).use { input ->

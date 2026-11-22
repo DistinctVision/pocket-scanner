@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -1198,10 +1199,9 @@ void invalidateHost(VkCore* core, const Buffer& buf) {
 }
 
 // Measured triangles only. Frontier vertices have alpha 0 and are not a surface to train.
-void appendMeasured(const uint8_t* bytes, uint32_t n, std::vector<float>& interleaved) {
-    constexpr uint32_t kMaxCopy = 1000000;
+void appendMeasured(const uint8_t* bytes, uint32_t n, std::vector<float>& interleaved, int cap) {
     for (uint32_t v = 0; v + 2 < n; v += 3) {
-        if (interleaved.size() / 9 + 3 > kMaxCopy) return;
+        if (static_cast<int>(interleaved.size() / 9) + 3 > cap) return;
         float p[3][3];
         uint8_t rgba[3][4];
         bool keep = true;
@@ -1306,7 +1306,7 @@ void Volume::dropHeavy() {
     ready = false;
 }
 
-int Volume::copySurface(std::vector<float>& interleaved, float& voxel) const {
+int Volume::copySurface(std::vector<float>& interleaved, float& voxel, int cap) const {
     interleaved.clear();
     voxel = voxelSize;
     if (core == nullptr || vertices.buffer == VK_NULL_HANDLE) return 0;
@@ -1339,8 +1339,8 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel) const {
     auto* draw = static_cast<const uint32_t*>(counts.mapped);
     int live = 0;
     uint32_t raw = 0;
-    constexpr uint32_t kMaxCopy = 1000000;
-    for (int slot = 0; slot < static_cast<int>(chunks.size()) && interleaved.size() / 9 < kMaxCopy; ++slot) {
+    if (cap < 3) cap = 3;
+    for (int slot = 0; slot < static_cast<int>(chunks.size()) && static_cast<int>(interleaved.size() / 9) < cap; ++slot) {
         if (!chunks[slot].live) continue;
         live++;
         uint32_t n = draw[static_cast<size_t>(slot) * 4];
@@ -1357,7 +1357,7 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel) const {
         });
         if (!copied) continue;
         invalidateHost(core, one);
-        appendMeasured(static_cast<const uint8_t*>(one.mapped), n, interleaved);
+        appendMeasured(static_cast<const uint8_t*>(one.mapped), n, interleaved, cap);
     }
     core->destroy(one);
     core->destroy(counts);
@@ -1367,32 +1367,69 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel) const {
     return kept;
 }
 
-int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, float& voxel) const {
+struct PlyHeader {
+    float voxel = 0.f;
+    int verts = 0;
+    int faces = 0;
+};
+
+bool readPlyHeader(FILE* in, PlyHeader& header) {
+    char line[256];
+    bool format = false;
+    if (std::fgets(line, sizeof(line), in) == nullptr || std::strncmp(line, "ply", 3) != 0) return false;
+    while (std::fgets(line, sizeof(line), in) != nullptr) {
+        if (std::strncmp(line, "format binary_little_endian", 27) == 0) format = true;
+        else if (std::strncmp(line, "comment voxel ", 14) == 0) header.voxel = std::strtof(line + 14, nullptr);
+        else if (std::strncmp(line, "element vertex ", 15) == 0) header.verts = std::atoi(line + 15);
+        else if (std::strncmp(line, "element face ", 13) == 0) header.faces = std::atoi(line + 13);
+        else if (std::strncmp(line, "end_header", 10) == 0) {
+            return format && header.verts >= 3 && header.faces >= 1 && header.voxel >= 0.01f;
+        }
+    }
+    return false;
+}
+
+bool readPlyVert(FILE* in, float xyz[3], uint8_t rgb[3]) {
+    return std::fread(xyz, 4, 3, in) == 3 && std::fread(rgb, 1, 3, in) == 3;
+}
+
+int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, float& voxel, int cap) const {
     interleaved.clear();
     voxel = 0.f;
     if (path == nullptr) return 0;
     FILE* in = std::fopen(path, "rb");
     if (in == nullptr) return 0;
-    char magic[4]{};
-    uint32_t version = 0;
-    uint32_t chunkCount = 0;
-    const bool header = std::fread(magic, 1, 4, in) == 4 && magic[0] == 'P' && magic[1] == 'S' && magic[2] == 'M' &&
-        magic[3] == '1' && std::fread(&version, 4, 1, in) == 1 && std::fread(&voxel, 4, 1, in) == 1 &&
-        std::fread(&chunkCount, 4, 1, in) == 1;
-    if (!header || version != 1 || chunkCount == 0 || voxel < 0.01f) {
+    PlyHeader header;
+    if (!readPlyHeader(in, header)) {
         std::fclose(in);
-        interleaved.clear();
         return 0;
     }
-    std::vector<uint8_t> bytes(static_cast<size_t>(kMaxVerts) * 16);
-    constexpr uint32_t kMaxCopy = 1000000;
-    for (uint32_t slot = 0; slot < chunkCount && interleaved.size() / 9 < kMaxCopy; ++slot) {
-        uint32_t n = 0;
-        if (std::fread(&n, 4, 1, in) != 1 || n == 0 || n > static_cast<uint32_t>(kMaxVerts) || n % 3 != 0 ||
-            std::fread(bytes.data(), 1, static_cast<size_t>(n) * 16, in) != static_cast<size_t>(n) * 16) {
-            break;
+    if (cap < 3) cap = 3;
+    voxel = header.voxel;
+    std::vector<float> xyz(static_cast<size_t>(header.verts) * 3);
+    std::vector<uint8_t> rgb(static_cast<size_t>(header.verts) * 3);
+    for (int i = 0; i < header.verts; ++i) {
+        if (!readPlyVert(in, xyz.data() + static_cast<size_t>(i) * 3, rgb.data() + static_cast<size_t>(i) * 3)) {
+            std::fclose(in);
+            interleaved.clear();
+            return 0;
         }
-        appendMeasured(bytes.data(), n, interleaved);
+    }
+    for (int face = 0; face < header.faces && static_cast<int>(interleaved.size() / 9) + 3 <= cap; ++face) {
+        uint8_t n = 0;
+        int idx[3]{};
+        if (std::fread(&n, 1, 1, in) != 1 || n != 3 || std::fread(idx, 4, 3, in) != 3) break;
+        if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 || idx[0] >= header.verts || idx[1] >= header.verts ||
+            idx[2] >= header.verts) {
+            continue;
+        }
+        uint8_t tri[48]{};
+        for (int k = 0; k < 3; ++k) {
+            std::memcpy(tri + k * 16, xyz.data() + static_cast<size_t>(idx[k]) * 3, 12);
+            std::memcpy(tri + k * 16 + 12, rgb.data() + static_cast<size_t>(idx[k]) * 3, 3);
+            tri[k * 16 + 15] = 255;
+        }
+        appendMeasured(tri, 3, interleaved, cap);
     }
     std::fclose(in);
     const int kept = static_cast<int>(interleaved.size() / 9);
@@ -1428,41 +1465,72 @@ bool Volume::saveMesh(const char* path) const {
     }
     core->destroy(counts);
     if (items.empty()) return false;
-    FILE* out = std::fopen(path, "wb");
-    if (out == nullptr) return false;
-    const char magic[4] = {'P', 'S', 'M', '1'};
-    const uint32_t version = 1;
-    const uint32_t chunkCount = static_cast<uint32_t>(items.size());
-    const float voxel = voxelSize;
-    std::fwrite(magic, 1, 4, out);
-    std::fwrite(&version, 4, 1, out);
-    std::fwrite(&voxel, 4, 1, out);
-    std::fwrite(&chunkCount, 4, 1, out);
     Buffer one{};
     if (!core->buffer(static_cast<VkDeviceSize>(kMaxVerts) * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, one) ||
         one.mapped == nullptr) {
-        std::fclose(out);
-        std::remove(path);
         core->destroy(one);
         return false;
     }
-    bool ok = true;
+    std::vector<float> xyz;
+    std::vector<uint8_t> rgb;
     for (const auto& item : items) {
         const uint32_t n = item.second;
-        submitCopy(core, [&](VkCommandBuffer cmd) {
+        const bool copied = submitCopy(core, [&](VkCommandBuffer cmd) {
+            barrierToTransfer(cmd, vertices.buffer, vertices.size);
             VkBufferCopy region{};
             region.srcOffset = static_cast<VkDeviceSize>(item.first) * kMaxVerts * 16;
             region.size = static_cast<VkDeviceSize>(n) * 16;
             vkCmdCopyBuffer(cmd, vertices.buffer, one.buffer, 1, &region);
         });
-        if (std::fwrite(&n, 4, 1, out) != 1 || std::fwrite(one.mapped, 1, static_cast<size_t>(n) * 16, out) != static_cast<size_t>(n) * 16) {
+        if (!copied) continue;
+        invalidateHost(core, one);
+        auto* bytes = static_cast<const uint8_t*>(one.mapped);
+        for (uint32_t v = 0; v + 2 < n; v += 3) {
+            bool keep = true;
+            float p[3][3];
+            uint8_t color[3][3];
+            for (int k = 0; k < 3; ++k) {
+                const uint8_t* src = bytes + static_cast<size_t>(v + k) * 16;
+                std::memcpy(p[k], src, 12);
+                if (src[15] < 128) keep = false;
+                color[k][0] = src[12];
+                color[k][1] = src[13];
+                color[k][2] = src[14];
+            }
+            if (!keep) continue;
+            for (int k = 0; k < 3; ++k) {
+                xyz.insert(xyz.end(), p[k], p[k] + 3);
+                rgb.insert(rgb.end(), color[k], color[k] + 3);
+            }
+        }
+    }
+    core->destroy(one);
+    const int verts = static_cast<int>(xyz.size() / 3);
+    if (verts < 3 || verts % 3 != 0) return false;
+    FILE* out = std::fopen(path, "wb");
+    if (out == nullptr) return false;
+    std::fprintf(out, "ply\nformat binary_little_endian 1.0\ncomment voxel %.6f\n", voxelSize);
+    std::fprintf(out, "element vertex %d\n", verts);
+    std::fprintf(out, "property float x\nproperty float y\nproperty float z\n");
+    std::fprintf(out, "property uchar red\nproperty uchar green\nproperty uchar blue\n");
+    std::fprintf(out, "element face %d\n", verts / 3);
+    std::fprintf(out, "property list uchar int vertex_indices\nend_header\n");
+    bool ok = true;
+    for (int i = 0; i < verts; ++i) {
+        if (std::fwrite(xyz.data() + static_cast<size_t>(i) * 3, 4, 3, out) != 3 ||
+            std::fwrite(rgb.data() + static_cast<size_t>(i) * 3, 1, 3, out) != 3) {
             ok = false;
             break;
         }
     }
+    for (int face = 0; ok && face < verts / 3; ++face) {
+        const uint8_t n = 3;
+        const int idx[3] = {face * 3, face * 3 + 1, face * 3 + 2};
+        if (std::fwrite(&n, 1, 1, out) != 1 || std::fwrite(idx, 4, 3, out) != 3) ok = false;
+    }
     std::fclose(out);
-    core->destroy(one);
     if (!ok) std::remove(path);
+    else LOGI("mesh ply %d verts", verts);
     return ok;
 }
 
@@ -1470,27 +1538,39 @@ bool Volume::loadMesh(const char* path, float depthMeters) {
     if (core == nullptr || path == nullptr) return false;
     FILE* in = std::fopen(path, "rb");
     if (in == nullptr) return false;
-    char magic[4]{};
-    uint32_t version = 0;
-    float voxel = 0.f;
-    uint32_t chunkCount = 0;
-    const bool header = std::fread(magic, 1, 4, in) == 4 && magic[0] == 'P' && magic[1] == 'S' && magic[2] == 'M' &&
-        magic[3] == '1' && std::fread(&version, 4, 1, in) == 1 && std::fread(&voxel, 4, 1, in) == 1 &&
-        std::fread(&chunkCount, 4, 1, in) == 1;
-    if (!header || version != 1 || chunkCount == 0 || chunkCount > static_cast<uint32_t>(kMaxChunks) || voxel < 0.01f) {
+    PlyHeader header;
+    if (!readPlyHeader(in, header)) {
         std::fclose(in);
         return false;
     }
-    configure(voxel, depthMeters);
-    if (vertices.buffer == VK_NULL_HANDLE && !ensureBuffers()) {
-        std::fclose(in);
-        return false;
+    std::vector<float> xyz(static_cast<size_t>(header.verts) * 3);
+    std::vector<uint8_t> rgb(static_cast<size_t>(header.verts) * 3);
+    for (int i = 0; i < header.verts; ++i) {
+        if (!readPlyVert(in, xyz.data() + static_cast<size_t>(i) * 3, rgb.data() + static_cast<size_t>(i) * 3)) {
+            std::fclose(in);
+            return false;
+        }
     }
+    std::vector<int> idx(static_cast<size_t>(header.faces) * 3);
+    for (int face = 0; face < header.faces; ++face) {
+        uint8_t n = 0;
+        if (std::fread(&n, 1, 1, in) != 1 || n != 3 ||
+            std::fread(idx.data() + static_cast<size_t>(face) * 3, 4, 3, in) != 3) {
+            std::fclose(in);
+            return false;
+        }
+    }
+    std::fclose(in);
+    const int chunkVerts = (kMaxVerts / 3) * 3;
+    const int triCount = header.faces;
+    const int chunkCount = (triCount * 3 + chunkVerts - 1) / chunkVerts;
+    if (chunkCount <= 0 || chunkCount > kMaxChunks) return false;
+    configure(header.voxel, depthMeters);
+    if (vertices.buffer == VK_NULL_HANDLE && !ensureBuffers()) return false;
     const auto host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     Buffer one{};
     if (!core->buffer(static_cast<VkDeviceSize>(kMaxVerts) * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, host, one) ||
         one.mapped == nullptr) {
-        std::fclose(in);
         core->destroy(one);
         return false;
     }
@@ -1498,13 +1578,23 @@ bool Volume::loadMesh(const char* path, float depthMeters) {
     chunks.assign(chunkCount, Chunk{});
     liveChunks.store(0, std::memory_order_relaxed);
     bool ok = true;
-    for (uint32_t slot = 0; slot < chunkCount; ++slot) {
-        uint32_t n = 0;
-        if (std::fread(&n, 4, 1, in) != 1 || n == 0 || n > static_cast<uint32_t>(kMaxVerts) || n % 3 != 0 ||
-            std::fread(one.mapped, 1, static_cast<size_t>(n) * 16, in) != static_cast<size_t>(n) * 16) {
-            ok = false;
-            break;
+    int cursor = 0;
+    for (int slot = 0; slot < chunkCount; ++slot) {
+        const int n = std::min(chunkVerts, (triCount - cursor / 3) * 3);
+        auto* dst = static_cast<uint8_t*>(one.mapped);
+        std::memset(dst, 0, static_cast<size_t>(n) * 16);
+        for (int v = 0; v < n; ++v) {
+            const int id = idx[cursor + v];
+            if (id < 0 || id >= header.verts) {
+                ok = false;
+                break;
+            }
+            std::memcpy(dst + static_cast<size_t>(v) * 16, xyz.data() + static_cast<size_t>(id) * 3, 12);
+            std::memcpy(dst + static_cast<size_t>(v) * 16 + 12, rgb.data() + static_cast<size_t>(id) * 3, 3);
+            dst[static_cast<size_t>(v) * 16 + 15] = 255;
         }
+        cursor += n;
+        if (!ok) break;
         const bool copied = submitCopy(core, [&](VkCommandBuffer cmd) {
             VkBufferCopy region{};
             region.dstOffset = static_cast<VkDeviceSize>(slot) * kMaxVerts * 16;
@@ -1515,15 +1605,14 @@ bool Volume::loadMesh(const char* path, float depthMeters) {
             ok = false;
             break;
         }
-        indirect[slot * 4] = n;
+        indirect[slot * 4] = static_cast<uint32_t>(n);
         indirect[slot * 4 + 1] = 1;
-        indirect[slot * 4 + 2] = slot * static_cast<uint32_t>(kMaxVerts);
+        indirect[slot * 4 + 2] = static_cast<uint32_t>(slot) * static_cast<uint32_t>(kMaxVerts);
         chunks[slot].live = true;
         chunks[slot].drawn = true;
         chunks[slot].meshed = true;
         liveChunks.fetch_add(1, std::memory_order_relaxed);
     }
-    std::fclose(in);
     if (ok) {
         Buffer cmds{};
         const VkDeviceSize bytes = static_cast<VkDeviceSize>(indirect.size()) * 4;
@@ -1543,10 +1632,10 @@ bool Volume::loadMesh(const char* path, float depthMeters) {
     if (!ok) {
         chunks.clear();
         liveChunks.store(0, std::memory_order_relaxed);
-        LOGE("mesh cache load failed");
+        LOGE("mesh ply load failed");
         return false;
     }
     ready = true;
-    LOGI("mesh cache %u chunks voxel %.1f cm", chunkCount, voxel * 100.f);
+    LOGI("mesh ply %d chunks voxel %.1f cm", chunkCount, header.voxel * 100.f);
     return true;
 }

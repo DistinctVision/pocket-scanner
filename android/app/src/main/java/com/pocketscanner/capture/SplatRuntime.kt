@@ -119,35 +119,56 @@ internal object SplatRuntime {
         valDir.mkdirs()
         val trainSeries = ArrayList<TrainMetric>()
         val valSeries = ArrayList<TrainMetric>()
+        val every = settings.validationEvery.coerceAtLeast(1)
+        val video = File(dir, "video.mp4")
         var finishedEpochs = 0
+        var failed = false
         for (epoch in 1..settings.epochs) {
             if (stop.get()) break
             if (train.isNotEmpty()) {
-                val trainMean = pass(context, preview, train, viewIndex, width, height, epoch, settings.epochs, updateGauss = true, metricsAfter = false, pngDir = null)
-                    ?: break
+                publish { it.copy(fraction = 0f, status = "Epoch $epoch / ${settings.epochs}, train") }
+                val trainMean = pass(context, preview, train, viewIndex, width, height, epoch, settings.epochs, "train", updateGauss = true, metricsAfter = false, pngDir = null)
+                if (trainMean == null) {
+                    failed = !stop.get()
+                    break
+                }
                 trainSeries.add(trainMean)
                 append(metrics, epoch, "train", trainMean)
                 note("Epoch $epoch train  L1 ${fmt(trainMean.l1)}  SSIM ${fmt(trainMean.ssim)}  PSNR ${fmt(trainMean.psnr)}")
                 publish { it.copy(epoch = epoch, train = trainSeries.toList(), fraction = 1f) }
             }
-            if (stop.get()) break
-            if (validation.isNotEmpty()) {
-                val valMean = pass(context, preview, validation, viewIndex, width, height, epoch, settings.epochs, updateGauss = false, metricsAfter = true, pngDir = valDir)
-                    ?: break
+            val validateNow = validation.isNotEmpty() && epoch % every == 0
+            if (validateNow) {
+                if (stop.get()) break
+                publish { it.copy(fraction = 0f, status = "Epoch $epoch / ${settings.epochs}, validation") }
+                val valMean = pass(context, preview, validation, viewIndex, width, height, epoch, settings.epochs, "validation", updateGauss = false, metricsAfter = true, pngDir = valDir)
+                if (valMean == null) {
+                    failed = !stop.get()
+                    break
+                }
                 valSeries.add(valMean)
                 append(metrics, epoch, "val", valMean)
                 note("Epoch $epoch val  L1 ${fmt(valMean.l1)}  SSIM ${fmt(valMean.ssim)}  PSNR ${fmt(valMean.psnr)}")
-                publish { it.copy(validation = valSeries.toList(), image = latestImage(valDir)) }
+                publish { it.copy(validation = valSeries.toList(), image = latestImage(valDir), fraction = 0f, status = "Rendering video") }
+                if (!stop.get()) encodeVideo(context, preview, usable, width, height, video, epoch, settings.epochs)
             }
             finishedEpochs = epoch
             TrainService.update(context, epoch, settings.epochs, 1f)
         }
-        val early = stop.get() || finishedEpochs < settings.epochs
-        publish { it.copy(status = if (early) "Writing the scene" else "Rendering video") }
-        preview.splatWritePly(File(dir, "scene.ply").absolutePath)
-        if (!early) {
-            encodePath(preview, usable, width, height, File(dir, "video.mp4"))
+        if (!failed && !settings.validation && finishedEpochs > 0 && !stop.get()) {
+            publish { it.copy(fraction = 0f, status = "Rendering video") }
+            encodeVideo(context, preview, usable, width, height, video, finishedEpochs, settings.epochs)
         }
+        if (failed) {
+            TrainService.stop(context)
+            session.resumeAfterSplat()
+            publish { it.copy(running = false, finished = false) }
+            worker = null
+            return
+        }
+        val early = stop.get() || finishedEpochs < settings.epochs
+        publish { it.copy(status = "Writing the scene") }
+        preview.splatWritePly(File(dir, "scene.ply").absolutePath)
         TrainService.stop(context)
         session.resumeAfterSplat()
         publish {
@@ -170,6 +191,7 @@ internal object SplatRuntime {
         height: Int,
         epoch: Int,
         epochs: Int,
+        passName: String,
         updateGauss: Boolean,
         metricsAfter: Boolean,
         pngDir: File?,
@@ -187,7 +209,15 @@ internal object SplatRuntime {
             val metrics = preview.splatStep(
                 rgb, frame.pose, frame.fx, frame.fy, frame.cx, frame.cy,
                 viewIndex[frame.id] ?: 0, updateGauss, true, metricsAfter,
-            ) ?: return null
+            )
+            if (metrics == null) {
+                if (!stop.get()) {
+                    val reason = preview.splatError().ifBlank { "The rasterizer stopped" }
+                    publish { it.copy(status = reason) }
+                    note(reason)
+                }
+                return null
+            }
             l1 += metrics[0]
             ssim += metrics[1]
             psnr += metrics[2]
@@ -199,14 +229,23 @@ internal object SplatRuntime {
                 }
             }
             val fraction = (index + 1f) / frames.size
-            publish { it.copy(epoch = epoch, fraction = fraction, status = "Epoch $epoch / $epochs") }
+            publish { it.copy(epoch = epoch, fraction = fraction, status = "Epoch $epoch / $epochs, $passName") }
             TrainService.update(context, epoch, epochs, fraction)
         }
         val count = frames.size.toDouble()
         return TrainMetric(epoch, (l1 / count).toFloat(), (ssim / count).toFloat(), (psnr / count).toFloat())
     }
 
-    private fun encodePath(preview: VkPreview, frames: List<TrainFrame>, width: Int, height: Int, dest: File) {
+    private fun encodeVideo(
+        context: Context,
+        preview: VkPreview,
+        frames: List<TrainFrame>,
+        width: Int,
+        height: Int,
+        dest: File,
+        epoch: Int,
+        epochs: Int,
+    ) {
         if (frames.size < 2) return
         val poses = ArrayList<FloatArray>()
         val lenses = ArrayList<TrainFrame>()
@@ -222,17 +261,39 @@ internal object SplatRuntime {
         }
         poses.add(frames.last().pose.copyOf())
         lenses.add(frames.last())
+        val keep = 48
+        val start = if (poses.size <= keep) 0 else (poses.size - keep) / 2
+        val end = minOf(start + keep, poses.size)
+        val tmp = File(dest.parentFile, "${dest.name}.tmp")
+        tmp.delete()
+        var finished = false
         try {
-            VideoEncoder(width, height, dest).use { encoder ->
-                poses.forEachIndexed { index, pose ->
+            VideoEncoder(width, height, tmp).use { encoder ->
+                for (index in start until end) {
+                    if (stop.get()) return@use
                     val lens = lenses[index]
-                    val rgb = preview.splatRender(pose, lens.fx, lens.fy, lens.cx, lens.cy, corrected = false) ?: return@forEachIndexed
+                    val rgb = preview.splatRender(poses[index], lens.fx, lens.fy, lens.cx, lens.cy, corrected = false) ?: continue
                     encoder.write(rgb)
+                    val done = index - start + 1
+                    val fraction = done.toFloat() / (end - start)
+                    publish { it.copy(status = "Rendering video", fraction = fraction) }
+                    TrainService.update(context, epoch, epochs, fraction)
                 }
+                finished = !stop.get()
             }
         } catch (error: Exception) {
             note("Video: ${error.message ?: "encoder failed"}")
-            dest.delete()
+            tmp.delete()
+            return
+        }
+        if (!finished) {
+            tmp.delete()
+            return
+        }
+        dest.delete()
+        if (!tmp.renameTo(dest)) {
+            tmp.copyTo(dest, overwrite = true)
+            tmp.delete()
         }
     }
 
@@ -252,7 +313,7 @@ internal object SplatRuntime {
 
     private fun writeRun(dir: File, settings: ScanSettings) {
         File(dir, "run.json").writeText(
-            """{"epochs":${settings.epochs},"validation":${settings.validation},"percent":${settings.validationPercent},"lrMean":1.6e-4,"lrScale":5.0e-3,"lrQuat":1.0e-3,"lrOpacity":5.0e-2,"lrColor":2.5e-3,"lrGrid":2.0e-3}""",
+            """{"epochs":${settings.epochs},"validation":${settings.validation},"percent":${settings.validationPercent},"every":${settings.validationEvery},"budget":${settings.gaussBudget},"lrMean":1.6e-4,"lrScale":5.0e-3,"lrQuat":1.0e-3,"lrOpacity":5.0e-2,"lrColor":2.5e-3,"lrGrid":2.0e-3}""",
         )
     }
 

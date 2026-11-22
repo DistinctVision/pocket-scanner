@@ -1,9 +1,13 @@
 #include "splat_train.h"
 
 #include "splat_project_spv.h"
-#include "splat_clear_spv.h"
-#include "splat_bin_spv.h"
-#include "splat_sort_spv.h"
+#include "splat_count_spv.h"
+#include "splat_keys_spv.h"
+#include "splat_scan_spv.h"
+#include "splat_scan_add_spv.h"
+#include "splat_hist_spv.h"
+#include "splat_scatter_spv.h"
+#include "splat_ranges_spv.h"
 #include "splat_blend_spv.h"
 #include "splat_back_spv.h"
 #include "splat_params_spv.h"
@@ -17,7 +21,10 @@
 
 #include <android/log.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <utility>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -28,7 +35,7 @@
 namespace {
 
 constexpr int kGridCell = 12 * 8 * 16 * 16;
-constexpr int kMaxGauss = 1000000;
+constexpr int kScan = 128;
 
 struct Gauss {
     float meanOp[4];
@@ -45,11 +52,23 @@ struct ProjectPush {
 struct TilePush {
     int count, tilesX, tilesY, width, height, pad0, pad1, pad2;
 };
+struct ScanPush {
+    int n, inBase, outBase, sumBase;
+};
+struct AddPush {
+    int n, dataBase, prefixBase, pad;
+};
+struct HistPush {
+    int n, blocks, shift, pad;
+};
+struct RangePush {
+    int n, tiles, pad0, pad1;
+};
 struct BlendPush {
     int tilesX, tilesY, width, height;
 };
 struct BackPush {
-    int width, height, tilesX, pad1;
+    int tilesX, tilesY, width, height;
 };
 struct ParamPush {
     float row0[4], row1[4], row2[4], intr[4];
@@ -86,30 +105,46 @@ bool submit(VkCore* core, F record) {
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+        vkFreeCommandBuffers(core->device, core->commandPool, 1, &cmd);
+        return false;
+    }
     record(cmd);
-    vkEndCommandBuffer(cmd);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        vkFreeCommandBuffers(core->device, core->commandPool, 1, &cmd);
+        return false;
+    }
     VkSubmitInfo info{};
     info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     info.commandBufferCount = 1;
     info.pCommandBuffers = &cmd;
-    vkQueueSubmit(core->queue, 1, &info, VK_NULL_HANDLE);
-    vkQueueWaitIdle(core->queue);
+    const VkResult submitted = vkQueueSubmit(core->queue, 1, &info, VK_NULL_HANDLE);
+    if (submitted == VK_SUCCESS) vkQueueWaitIdle(core->queue);
     vkFreeCommandBuffers(core->device, core->commandPool, 1, &cmd);
-    return true;
+    return submitted == VK_SUCCESS;
+}
+
+void hostRead(VkCore* core, const Buffer& buffer) {
+    if (buffer.memory == VK_NULL_HANDLE) return;
+    VkMappedMemoryRange range{};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = buffer.memory;
+    range.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(core->device, 1, &range);
 }
 
 void barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize size) {
     VkBufferMemoryBarrier info{};
     info.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     info.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    info.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    info.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     info.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     info.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     info.buffer = buffer;
     info.size = size;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &info, 0, nullptr);
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &info,
+                         0, nullptr);
 }
 
 void dispatch(VkCommandBuffer cmd, const ComputeKernel& kernel, const void* push, uint32_t bytes,
@@ -137,12 +172,18 @@ void bindAt(const VkCore* core, ComputeKernel& kernel, int binding, const Buffer
 } // namespace
 
 struct SplatTrainer::Kernels {
-    ComputeKernel project, clear, bin, sort, blend, back, params, slice, tv, adam, adamGrid;
+    ComputeKernel project, countTiles, writeKeys, blend, back, params, slice, tv, adam, adamGrid;
+    ComputeKernel scanG, scanG2, scanG3, scanG4, addG, addG2, addG3;
+    ComputeKernel scanH, scanH2, scanH3, scanH4, addH, addH2, addH3;
+    ComputeKernel hist, scatter, ranges;
     ComputeKernel ssimFwd, ssimBack, reduce;
     Buffer gauss, grad, moment, vel;
-    Buffer splat2d, counts, bins, image, corrected, target;
-    Buffer dstGrad, srcGrad, kept, accum;
-    Buffer grid, gridM, gridV, gridGrad, stats, partial, stageTarget, stageImage;
+    Buffer splat2d, tileCount, tileOffset, image, corrected, target, trans;
+    Buffer dstGrad, srcGrad, accum;
+    Buffer sumA, sumAex, sumB, sumBex, sumC, sumCex;
+    Buffer keyA, keyB, idA, idB, histCounts, histEx, digitTotals, digitBase, tileRange;
+    Buffer grid, gridM, gridV, gridGrad, stats, partial, stageTarget, stageImage, stageSmall;
+    int pairCap = 0;
 };
 
 SplatTrainer::SplatTrainer(VkCore* device) : core(device), gpu(new Kernels) {}
@@ -151,15 +192,21 @@ SplatTrainer::~SplatTrainer() { destroy(); delete gpu; }
 
 void SplatTrainer::destroy() {
     if (core == nullptr || gpu == nullptr) return;
-    ComputeKernel* kernels[] = {&gpu->project, &gpu->clear, &gpu->bin, &gpu->sort, &gpu->blend, &gpu->back,
-                                &gpu->params, &gpu->slice, &gpu->tv, &gpu->adam, &gpu->adamGrid, &gpu->ssimFwd,
-                                &gpu->ssimBack, &gpu->reduce};
+    ComputeKernel* kernels[] = {
+        &gpu->project, &gpu->countTiles, &gpu->writeKeys, &gpu->blend, &gpu->back, &gpu->params, &gpu->slice,
+        &gpu->tv, &gpu->adam, &gpu->adamGrid, &gpu->scanG, &gpu->scanG2, &gpu->scanG3, &gpu->scanG4, &gpu->addG,
+        &gpu->addG2, &gpu->addG3, &gpu->scanH, &gpu->scanH2, &gpu->scanH3, &gpu->scanH4, &gpu->addH, &gpu->addH2,
+        &gpu->addH3, &gpu->hist, &gpu->scatter, &gpu->ranges, &gpu->ssimFwd, &gpu->ssimBack, &gpu->reduce};
     for (ComputeKernel* kernel : kernels) core->destroy(*kernel);
-    Buffer* buffers[] = {&gpu->gauss, &gpu->grad, &gpu->moment, &gpu->vel, &gpu->splat2d, &gpu->counts, &gpu->bins,
-                         &gpu->image, &gpu->corrected, &gpu->target, &gpu->dstGrad, &gpu->srcGrad, &gpu->kept,
-                         &gpu->accum, &gpu->grid, &gpu->gridM, &gpu->gridV, &gpu->gridGrad, &gpu->stats,
-                         &gpu->partial, &gpu->stageTarget, &gpu->stageImage};
+    Buffer* buffers[] = {
+        &gpu->gauss, &gpu->grad, &gpu->moment, &gpu->vel, &gpu->splat2d, &gpu->tileCount, &gpu->tileOffset,
+        &gpu->image, &gpu->corrected, &gpu->target, &gpu->trans, &gpu->dstGrad, &gpu->srcGrad, &gpu->accum,
+        &gpu->sumA, &gpu->sumAex, &gpu->sumB, &gpu->sumBex, &gpu->sumC, &gpu->sumCex, &gpu->keyA, &gpu->keyB,
+        &gpu->idA, &gpu->idB, &gpu->histCounts, &gpu->histEx, &gpu->digitTotals, &gpu->digitBase, &gpu->tileRange,
+        &gpu->grid, &gpu->gridM, &gpu->gridV, &gpu->gridGrad, &gpu->stats, &gpu->partial, &gpu->stageTarget,
+        &gpu->stageImage, &gpu->stageSmall};
     for (Buffer* buffer : buffers) core->destroy(*buffer);
+    gpu->pairCap = 0;
     count = 0;
 }
 
@@ -171,17 +218,27 @@ bool SplatTrainer::kernels() {
     };
     const int b01[] = {0, 1};
     const int b012[] = {0, 1, 2};
-    const int b01234[] = {0, 1, 2, 3, 4};
     const int b0123[] = {0, 1, 2, 3};
+    const int b01234[] = {0, 1, 2, 3, 4};
     const int b012345[] = {0, 1, 2, 3, 4, 5};
+    const int scatterB[] = {0, 1, 2, 3, 4, 5};
+    const int keysB[] = {0, 1, 2, 3};
     const int b05[] = {0, 5};
     const int ssimF[] = {0, 1, 2};
     const int ssimB[] = {0, 1, 2, 4};
     const int red[] = {1, 2, 5, 6};
+    auto block = [&](ComputeKernel& out) {
+        return make(splat_scan_spv, sizeof(splat_scan_spv), b012, 3, sizeof(ScanPush), out);
+    };
+    auto add = [&](ComputeKernel& out) {
+        return make(splat_scan_add_spv, sizeof(splat_scan_add_spv), b01, 2, sizeof(AddPush), out);
+    };
     return make(splat_project_spv, sizeof(splat_project_spv), b01, 2, sizeof(ProjectPush), gpu->project) &&
-           make(splat_clear_spv, sizeof(splat_clear_spv), b012, 3, sizeof(TilePush), gpu->clear) &&
-           make(splat_bin_spv, sizeof(splat_bin_spv), b012, 3, sizeof(TilePush), gpu->bin) &&
-           make(splat_sort_spv, sizeof(splat_sort_spv), b012, 3, sizeof(TilePush), gpu->sort) &&
+           make(splat_count_spv, sizeof(splat_count_spv), b01, 2, sizeof(TilePush), gpu->countTiles) &&
+           make(splat_keys_spv, sizeof(splat_keys_spv), keysB, 4, sizeof(TilePush), gpu->writeKeys) &&
+           make(splat_hist_spv, sizeof(splat_hist_spv), b012, 3, sizeof(HistPush), gpu->hist) &&
+           make(splat_scatter_spv, sizeof(splat_scatter_spv), scatterB, 6, sizeof(HistPush), gpu->scatter) &&
+           make(splat_ranges_spv, sizeof(splat_ranges_spv), b01, 2, sizeof(RangePush), gpu->ranges) &&
            make(splat_blend_spv, sizeof(splat_blend_spv), b01234, 5, sizeof(BlendPush), gpu->blend) &&
            make(splat_back_spv, sizeof(splat_back_spv), b012345, 6, sizeof(BackPush), gpu->back) &&
            make(splat_params_spv, sizeof(splat_params_spv), b012, 3, sizeof(ParamPush), gpu->params) &&
@@ -191,7 +248,10 @@ bool SplatTrainer::kernels() {
            make(splat_adam_grid_spv, sizeof(splat_adam_grid_spv), b0123, 4, sizeof(GridAdamPush), gpu->adamGrid) &&
            make(ssim_fwd_spv, sizeof(ssim_fwd_spv), ssimF, 3, sizeof(SsimPush), gpu->ssimFwd) &&
            make(ssim_back_spv, sizeof(ssim_back_spv), ssimB, 4, sizeof(SsimPush), gpu->ssimBack) &&
-           make(ssim_reduce_spv, sizeof(ssim_reduce_spv), red, 4, sizeof(SsimPush), gpu->reduce);
+           make(ssim_reduce_spv, sizeof(ssim_reduce_spv), red, 4, sizeof(SsimPush), gpu->reduce) &&
+           block(gpu->scanG) && block(gpu->scanG2) && block(gpu->scanG3) && block(gpu->scanG4) &&
+           block(gpu->scanH) && block(gpu->scanH2) && block(gpu->scanH3) && block(gpu->scanH4) &&
+           add(gpu->addG) && add(gpu->addG2) && add(gpu->addG3) && add(gpu->addH) && add(gpu->addH2) && add(gpu->addH3);
 }
 
 bool SplatTrainer::buffers() {
@@ -202,20 +262,31 @@ bool SplatTrainer::buffers() {
     auto dev = [&](VkDeviceSize size, VkBufferUsageFlags extra, Buffer& out) {
         return core->buffer(size, kStorage | extra, kDevice, out);
     };
-    if (        !dev(gaussBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gpu->gauss) ||
+    const VkDeviceSize counts = static_cast<VkDeviceSize>(count) * sizeof(int);
+    const auto copy = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (!dev(gaussBytes, copy, gpu->gauss) ||
         !dev(gaussBytes, 0, gpu->grad) ||
         !dev(gaussBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->moment) ||
         !dev(gaussBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->vel) ||
         !dev(static_cast<VkDeviceSize>(count) * sizeof(float) * 12, 0, gpu->splat2d) ||
-        !dev(tiles * sizeof(int), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->counts) ||
-        !dev(tiles * 48 * sizeof(int), 0, gpu->bins) ||
-        !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gpu->image) ||
+        !dev(counts, copy, gpu->tileCount) ||
+        !dev(counts, copy, gpu->tileOffset) ||
+        !dev(pixels * 3 * sizeof(float), copy, gpu->image) ||
         !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gpu->corrected) ||
         !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->target) ||
+        !dev(pixels * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->trans) ||
         !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->dstGrad) ||
         !dev(pixels * 3 * sizeof(float), 0, gpu->srcGrad) ||
-        !dev(pixels * 128, 0, gpu->kept) ||
         !dev(static_cast<VkDeviceSize>(count) * 12 * sizeof(int), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->accum) ||
+        !dev(256 * 1024, copy, gpu->sumA) ||
+        !dev(256 * 1024, copy, gpu->sumAex) ||
+        !dev(8 * 1024, copy, gpu->sumB) ||
+        !dev(8 * 1024, copy, gpu->sumBex) ||
+        !dev(1024, copy, gpu->sumC) ||
+        !dev(1024, copy, gpu->sumCex) ||
+        !dev(64, copy, gpu->digitTotals) ||
+        !dev(64, copy, gpu->digitBase) ||
+        !dev(tiles * 2 * sizeof(int), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->tileRange) ||
         !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->grid) ||
         !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridM) ||
         !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridV) ||
@@ -223,29 +294,21 @@ bool SplatTrainer::buffers() {
         !dev(pixels * 12 * sizeof(float), 0, gpu->stats) ||
         !core->buffer(256 * 3 * sizeof(float), kStorage, kHost, gpu->partial) ||
         !core->buffer(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, kHost, gpu->stageTarget) ||
-        !core->buffer(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, gpu->stageImage)) {
+        !core->buffer(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, gpu->stageImage) ||
+        !core->buffer(256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, gpu->stageSmall)) {
         return false;
     }
     bindAt(core, gpu->project, 0, gpu->gauss);
     bindAt(core, gpu->project, 1, gpu->splat2d);
-    bindAt(core, gpu->clear, 1, gpu->counts);
-    bindAt(core, gpu->bin, 0, gpu->splat2d);
-    bindAt(core, gpu->bin, 1, gpu->counts);
-    bindAt(core, gpu->bin, 2, gpu->bins);
-    bindAt(core, gpu->sort, 0, gpu->splat2d);
-    bindAt(core, gpu->sort, 1, gpu->counts);
-    bindAt(core, gpu->sort, 2, gpu->bins);
+    bindAt(core, gpu->countTiles, 0, gpu->splat2d);
+    bindAt(core, gpu->countTiles, 1, gpu->tileCount);
     bindAt(core, gpu->blend, 0, gpu->splat2d);
-    bindAt(core, gpu->blend, 1, gpu->counts);
-    bindAt(core, gpu->blend, 2, gpu->bins);
     bindAt(core, gpu->blend, 3, gpu->image);
-    bindAt(core, gpu->blend, 4, gpu->kept);
+    bindAt(core, gpu->blend, 4, gpu->trans);
     bindAt(core, gpu->back, 0, gpu->splat2d);
-    bindAt(core, gpu->back, 1, gpu->kept);
-    bindAt(core, gpu->back, 2, gpu->srcGrad);
-    bindAt(core, gpu->back, 3, gpu->accum);
-    bindAt(core, gpu->back, 4, gpu->counts);
-    bindAt(core, gpu->back, 5, gpu->bins);
+    bindAt(core, gpu->back, 3, gpu->srcGrad);
+    bindAt(core, gpu->back, 4, gpu->accum);
+    bindAt(core, gpu->back, 5, gpu->trans);
     bindAt(core, gpu->params, 0, gpu->gauss);
     bindAt(core, gpu->params, 1, gpu->accum);
     bindAt(core, gpu->params, 2, gpu->grad);
@@ -281,8 +344,12 @@ bool SplatTrainer::buffers() {
 
 bool SplatTrainer::uploadGaussians(const float* verts, float voxel) {
     std::vector<Gauss> host(count);
-    const float tangent = std::log(std::max(voxel, 1e-3f));
-    const float thin = std::log(std::max(voxel * 0.1f, 1e-4f));
+    // Opacity starts at 0.5, so the 1/255 contour sits at this many standard deviations.
+    // That contour reaches halfway to the next voxel, so neighbours meet and barely overlap.
+    const float contour = std::sqrt(2.f * std::log(127.5f));
+    const float sigma = std::max(voxel * 0.5f / contour, 1e-4f);
+    const float tangent = std::log(sigma);
+    const float thin = std::log(std::max(sigma * 0.1f, 1e-4f));
     for (int i = 0; i < count; ++i) {
         const float* v = verts + i * 9;
         Gauss g{};
@@ -356,7 +423,7 @@ bool SplatTrainer::uploadIdentity() {
 bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, int w, int h) {
     destroy();
     if (n < 3 || viewCount < 1 || w < 16 || h < 16) return false;
-    count = std::min(n, kMaxGauss);
+    count = n;
     views = viewCount;
     width = w;
     height = h;
@@ -370,6 +437,224 @@ bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, i
         return false;
     }
     LOGI("splat %d gaussians, %d views, %dx%d", count, views, width, height);
+    return true;
+}
+
+void SplatTrainer::fail(const char* text) {
+    std::snprintf(error, sizeof(error), "%s", text);
+    LOGE("%s", error);
+}
+
+bool SplatTrainer::grow(void* buffer, uint64_t bytes) {
+    auto* out = static_cast<Buffer*>(buffer);
+    if (bytes < 64) bytes = 64;
+    if (out->buffer != VK_NULL_HANDLE && out->size >= bytes) return true;
+    core->destroy(*out);
+    const auto usage = kStorage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (!core->buffer(bytes, usage, kDevice, *out)) {
+        LOGE("splat alloc failed, %llu bytes", static_cast<unsigned long long>(bytes));
+        fail("The GPU ran out of memory for this view");
+        return false;
+    }
+    return true;
+}
+
+void SplatTrainer::bindScans() {
+    auto bindScan = [&](ComputeKernel& block, const Buffer& in, const Buffer& out, const Buffer& sums) {
+        if (in.buffer == VK_NULL_HANDLE || out.buffer == VK_NULL_HANDLE || sums.buffer == VK_NULL_HANDLE) return;
+        bindAt(core, block, 0, in);
+        bindAt(core, block, 1, out);
+        bindAt(core, block, 2, sums);
+    };
+    auto bindAdd = [&](ComputeKernel& add, const Buffer& data, const Buffer& prefix) {
+        if (data.buffer == VK_NULL_HANDLE || prefix.buffer == VK_NULL_HANDLE) return;
+        bindAt(core, add, 0, data);
+        bindAt(core, add, 1, prefix);
+    };
+    bindScan(gpu->scanG, gpu->tileCount, gpu->tileOffset, gpu->sumA);
+    bindScan(gpu->scanG2, gpu->sumA, gpu->sumAex, gpu->sumB);
+    bindScan(gpu->scanG3, gpu->sumB, gpu->sumBex, gpu->sumC);
+    bindScan(gpu->scanG4, gpu->sumC, gpu->sumCex, gpu->sumA);
+    bindAdd(gpu->addG, gpu->tileOffset, gpu->sumAex);
+    bindAdd(gpu->addG2, gpu->sumAex, gpu->sumBex);
+    bindAdd(gpu->addG3, gpu->sumBex, gpu->sumCex);
+    bindScan(gpu->scanH, gpu->histCounts, gpu->histEx, gpu->sumA);
+    bindScan(gpu->scanH2, gpu->sumA, gpu->sumAex, gpu->sumB);
+    bindScan(gpu->scanH3, gpu->sumB, gpu->sumBex, gpu->sumC);
+    bindScan(gpu->scanH4, gpu->sumC, gpu->sumCex, gpu->sumA);
+    bindAdd(gpu->addH, gpu->histEx, gpu->sumAex);
+    bindAdd(gpu->addH2, gpu->sumAex, gpu->sumBex);
+    bindAdd(gpu->addH3, gpu->sumBex, gpu->sumCex);
+}
+
+bool SplatTrainer::scratchFor(int n) {
+    if (n < 1) n = 1;
+    const int g0 = (n + kScan - 1) / kScan;
+    const int g1 = (g0 + kScan - 1) / kScan;
+    const int g2 = (g1 + kScan - 1) / kScan;
+    if (g2 > kScan) {
+        fail("The GPU ran out of memory for this view");
+        return false;
+    }
+    const VkDeviceSize a = static_cast<VkDeviceSize>(g0) * sizeof(int);
+    const VkDeviceSize b = static_cast<VkDeviceSize>(std::max(g1, 1)) * sizeof(int);
+    const VkDeviceSize c = static_cast<VkDeviceSize>(std::max(g2, 1)) * sizeof(int);
+    if (!grow(&gpu->sumA, a) || !grow(&gpu->sumAex, a) || !grow(&gpu->sumB, b) || !grow(&gpu->sumBex, b) ||
+        !grow(&gpu->sumC, c) || !grow(&gpu->sumCex, c)) {
+        return false;
+    }
+    bindScans();
+    return true;
+}
+
+bool SplatTrainer::recordScan(void* command, int level, int n, int inBase, int outBase) {
+    if (n <= 0) return true;
+    auto cmd = static_cast<VkCommandBuffer>(command);
+    ComputeKernel* block = level == 0 ? &gpu->scanG : &gpu->scanH;
+    ComputeKernel* block2 = level == 0 ? &gpu->scanG2 : &gpu->scanH2;
+    ComputeKernel* block3 = level == 0 ? &gpu->scanG3 : &gpu->scanH3;
+    ComputeKernel* block4 = level == 0 ? &gpu->scanG4 : &gpu->scanH4;
+    ComputeKernel* add = level == 0 ? &gpu->addG : &gpu->addH;
+    ComputeKernel* add2 = level == 0 ? &gpu->addG2 : &gpu->addH2;
+    ComputeKernel* add3 = level == 0 ? &gpu->addG3 : &gpu->addH3;
+    Buffer* out = level == 0 ? &gpu->tileOffset : &gpu->histEx;
+    const int g0 = (n + kScan - 1) / kScan;
+    ScanPush first{n, inBase, outBase, 0};
+    dispatch(cmd, *block, &first, sizeof(first), static_cast<uint32_t>(g0), 1);
+    if (g0 <= 1) return true;
+    barrier(cmd, out->buffer, out->size);
+    barrier(cmd, gpu->sumA.buffer, gpu->sumA.size);
+    const int g1 = (g0 + kScan - 1) / kScan;
+    ScanPush second{g0, 0, 0, 0};
+    dispatch(cmd, *block2, &second, sizeof(second), static_cast<uint32_t>(g1), 1);
+    barrier(cmd, gpu->sumAex.buffer, gpu->sumAex.size);
+    barrier(cmd, gpu->sumB.buffer, gpu->sumB.size);
+    if (g1 > 1) {
+        const int g2 = (g1 + kScan - 1) / kScan;
+        ScanPush third{g1, 0, 0, 0};
+        dispatch(cmd, *block3, &third, sizeof(third), static_cast<uint32_t>(g2), 1);
+        barrier(cmd, gpu->sumBex.buffer, gpu->sumBex.size);
+        barrier(cmd, gpu->sumC.buffer, gpu->sumC.size);
+        if (g2 > 1) {
+            ScanPush fourth{g2, 0, 0, 0};
+            dispatch(cmd, *block4, &fourth, sizeof(fourth), 1, 1);
+            barrier(cmd, gpu->sumCex.buffer, gpu->sumCex.size);
+            AddPush lift{g1, 0, 0, 0};
+            dispatch(cmd, *add3, &lift, sizeof(lift), static_cast<uint32_t>((g1 + kScan - 1) / kScan), 1);
+            barrier(cmd, gpu->sumBex.buffer, gpu->sumBex.size);
+        }
+        AddPush mid{g0, 0, 0, 0};
+        dispatch(cmd, *add2, &mid, sizeof(mid), static_cast<uint32_t>((g0 + kScan - 1) / kScan), 1);
+        barrier(cmd, gpu->sumAex.buffer, gpu->sumAex.size);
+    }
+    AddPush last{n, outBase, 0, 0};
+    dispatch(cmd, *add, &last, sizeof(last), static_cast<uint32_t>((n + kScan - 1) / kScan), 1);
+    barrier(cmd, out->buffer, out->size);
+    return true;
+}
+
+bool SplatTrainer::ensurePairs(int total) {
+    const int blocks = (total + kScan - 1) / kScan;
+    const VkDeviceSize keys = static_cast<VkDeviceSize>(total) * 8;
+    const VkDeviceSize ids = static_cast<VkDeviceSize>(total) * sizeof(uint32_t);
+    const VkDeviceSize histBytes = static_cast<VkDeviceSize>(blocks) * 16 * sizeof(int);
+    const int tiles = tilesX * tilesY;
+    if (!grow(&gpu->keyA, keys) || !grow(&gpu->keyB, keys) || !grow(&gpu->idA, ids) || !grow(&gpu->idB, ids) ||
+        !grow(&gpu->histCounts, histBytes) || !grow(&gpu->histEx, histBytes) ||
+        !grow(&gpu->tileRange, static_cast<uint64_t>(tiles) * 2 * sizeof(int))) {
+        return false;
+    }
+    if (gpu->pairCap != total) {
+        gpu->pairCap = total;
+        LOGI("splat tiles %d", total);
+    }
+    bindAt(core, gpu->writeKeys, 0, gpu->splat2d);
+    bindAt(core, gpu->writeKeys, 1, gpu->tileOffset);
+    bindAt(core, gpu->writeKeys, 2, gpu->keyA);
+    bindAt(core, gpu->writeKeys, 3, gpu->idA);
+    bindAt(core, gpu->ranges, 0, gpu->keyA);
+    bindAt(core, gpu->ranges, 1, gpu->tileRange);
+    bindAt(core, gpu->blend, 1, gpu->tileRange);
+    bindAt(core, gpu->blend, 2, gpu->idA);
+    bindAt(core, gpu->back, 1, gpu->tileRange);
+    bindAt(core, gpu->back, 2, gpu->idA);
+    bindScans();
+    return scratchFor((total + kScan - 1) / kScan);
+}
+
+bool SplatTrainer::radixSort(int total) {
+    const int blocks = (total + kScan - 1) / kScan;
+    Buffer* srcKey = &gpu->keyA;
+    Buffer* dstKey = &gpu->keyB;
+    Buffer* srcId = &gpu->idA;
+    Buffer* dstId = &gpu->idB;
+    for (int shift = 0; shift < 64; shift += 4) {
+        if (!submit(core, [&](VkCommandBuffer cmd) {
+                vkCmdFillBuffer(cmd, gpu->digitTotals.buffer, 0, 64, 0);
+                barrier(cmd, gpu->digitTotals.buffer, gpu->digitTotals.size);
+                bindAt(core, gpu->hist, 0, *srcKey);
+                bindAt(core, gpu->hist, 1, gpu->histCounts);
+                bindAt(core, gpu->hist, 2, gpu->digitTotals);
+                HistPush hist{};
+                hist.n = total;
+                hist.blocks = blocks;
+                hist.shift = shift;
+                dispatch(cmd, gpu->hist, &hist, sizeof(hist), static_cast<uint32_t>(blocks), 1);
+                barrier(cmd, gpu->histCounts.buffer, gpu->histCounts.size);
+                barrier(cmd, gpu->digitTotals.buffer, gpu->digitTotals.size);
+                VkBufferCopy copy{};
+                copy.size = 64;
+                vkCmdCopyBuffer(cmd, gpu->digitTotals.buffer, gpu->stageSmall.buffer, 1, &copy);
+                barrier(cmd, gpu->histCounts.buffer, gpu->histCounts.size);
+                for (int digit = 0; digit < 16; ++digit) {
+                    recordScan(cmd, 1, blocks, digit * blocks, digit * blocks);
+                    barrier(cmd, gpu->sumA.buffer, gpu->sumA.size);
+                    barrier(cmd, gpu->sumAex.buffer, gpu->sumAex.size);
+                    barrier(cmd, gpu->sumB.buffer, gpu->sumB.size);
+                    barrier(cmd, gpu->sumBex.buffer, gpu->sumBex.size);
+                }
+            })) {
+            fail("The rasterizer stopped");
+            return false;
+        }
+        hostRead(core, gpu->stageSmall);
+        auto* totals = static_cast<int*>(gpu->stageSmall.mapped);
+        int base = 0;
+        int bases[16];
+        for (int digit = 0; digit < 16; ++digit) {
+            bases[digit] = base;
+            base += totals[digit];
+        }
+        if (base != total) {
+            fail("The rasterizer stopped");
+            return false;
+        }
+        std::memcpy(gpu->stageSmall.mapped, bases, sizeof(bases));
+        if (!submit(core, [&](VkCommandBuffer cmd) {
+                VkBufferCopy copy{};
+                copy.size = 64;
+                vkCmdCopyBuffer(cmd, gpu->stageSmall.buffer, gpu->digitBase.buffer, 1, &copy);
+                barrier(cmd, gpu->digitBase.buffer, gpu->digitBase.size);
+                bindAt(core, gpu->scatter, 0, *srcKey);
+                bindAt(core, gpu->scatter, 1, *srcId);
+                bindAt(core, gpu->scatter, 2, *dstKey);
+                bindAt(core, gpu->scatter, 3, *dstId);
+                bindAt(core, gpu->scatter, 4, gpu->histEx);
+                bindAt(core, gpu->scatter, 5, gpu->digitBase);
+                HistPush scatter{};
+                scatter.n = total;
+                scatter.blocks = blocks;
+                scatter.shift = shift;
+                dispatch(cmd, gpu->scatter, &scatter, sizeof(scatter), static_cast<uint32_t>(blocks), 1);
+                barrier(cmd, dstKey->buffer, dstKey->size);
+                barrier(cmd, dstId->buffer, dstId->size);
+            })) {
+            fail("The rasterizer stopped");
+            return false;
+        }
+        std::swap(srcKey, dstKey);
+        std::swap(srcId, dstId);
+    }
     return true;
 }
 
@@ -398,18 +683,66 @@ bool SplatTrainer::projectAndBlend(const float pose[16], float fx, float fy, flo
     blend.tilesY = tilesY;
     blend.width = width;
     blend.height = height;
+    error[0] = 0;
+    if (!scratchFor(count)) return false;
+    if (!submit(core, [&](VkCommandBuffer cmd) {
+            dispatch(cmd, gpu->project, &project, sizeof(project), (count + 63) / 64, 1);
+            barrier(cmd, gpu->splat2d.buffer, gpu->splat2d.size);
+            dispatch(cmd, gpu->countTiles, &tile, sizeof(tile), (count + kScan - 1) / kScan, 1);
+            barrier(cmd, gpu->tileCount.buffer, gpu->tileCount.size);
+            recordScan(cmd, 0, count, 0, 0);
+            barrier(cmd, gpu->tileOffset.buffer, gpu->tileOffset.size);
+            barrier(cmd, gpu->tileCount.buffer, gpu->tileCount.size);
+            VkBufferCopy copy{};
+            copy.srcOffset = static_cast<VkDeviceSize>(count - 1) * sizeof(int);
+            copy.size = sizeof(int);
+            vkCmdCopyBuffer(cmd, gpu->tileOffset.buffer, gpu->stageSmall.buffer, 1, &copy);
+            copy.dstOffset = sizeof(int);
+            vkCmdCopyBuffer(cmd, gpu->tileCount.buffer, gpu->stageSmall.buffer, 1, &copy);
+        })) {
+        fail("The rasterizer stopped");
+        return false;
+    }
+    hostRead(core, gpu->stageSmall);
+    auto* tail = static_cast<int*>(gpu->stageSmall.mapped);
+    const int64_t total64 = static_cast<int64_t>(tail[0]) + tail[1];
+    static int loggedPairs = 0;
+    if (loggedPairs < 1 || tail[0] < 0 || tail[1] < 0 || total64 > 2000000000) {
+        LOGI("splat pairs offset %d count %d", tail[0], tail[1]);
+        loggedPairs++;
+    }
+    if (tail[0] < 0 || tail[1] < 0 || total64 > 2000000000) {
+        fail("The GPU ran out of memory for this view");
+        return false;
+    }
+    const int total = static_cast<int>(total64);
+    if (total == 0) {
+        return submit(core, [&](VkCommandBuffer cmd) {
+            vkCmdFillBuffer(cmd, gpu->image.buffer, 0, gpu->image.size, 0);
+            vkCmdFillBuffer(cmd, gpu->trans.buffer, 0, gpu->trans.size, 0x3f800000u);
+        });
+    }
+    if (!ensurePairs(total)) return false;
+    if (!submit(core, [&](VkCommandBuffer cmd) {
+            dispatch(cmd, gpu->writeKeys, &tile, sizeof(tile), (count + kScan - 1) / kScan, 1);
+            barrier(cmd, gpu->keyA.buffer, gpu->keyA.size);
+            barrier(cmd, gpu->idA.buffer, gpu->idA.size);
+        })) {
+        fail("The rasterizer stopped");
+        return false;
+    }
+    if (!radixSort(total)) return false;
+    RangePush range{};
+    range.n = total;
+    range.tiles = tilesX * tilesY;
     return submit(core, [&](VkCommandBuffer cmd) {
-        dispatch(cmd, gpu->project, &project, sizeof(project), (count + 63) / 64, 1);
-        barrier(cmd, gpu->splat2d.buffer, gpu->splat2d.size);
-        vkCmdFillBuffer(cmd, gpu->counts.buffer, 0, VK_WHOLE_SIZE, 0);
-        barrier(cmd, gpu->counts.buffer, gpu->counts.size);
-        dispatch(cmd, gpu->bin, &tile, sizeof(tile), (count + 63) / 64, 1);
-        barrier(cmd, gpu->bins.buffer, gpu->bins.size);
-        barrier(cmd, gpu->counts.buffer, gpu->counts.size);
-        dispatch(cmd, gpu->sort, &tile, sizeof(tile), tilesX * tilesY, 1);
-        barrier(cmd, gpu->bins.buffer, gpu->bins.size);
+        vkCmdFillBuffer(cmd, gpu->tileRange.buffer, 0, gpu->tileRange.size, 0);
+        barrier(cmd, gpu->tileRange.buffer, gpu->tileRange.size);
+        dispatch(cmd, gpu->ranges, &range, sizeof(range), (total + kScan - 1) / kScan, 1);
+        barrier(cmd, gpu->tileRange.buffer, gpu->tileRange.size);
         dispatch(cmd, gpu->blend, &blend, sizeof(blend), tilesX, tilesY);
         barrier(cmd, gpu->image.buffer, gpu->image.size);
+        barrier(cmd, gpu->trans.buffer, gpu->trans.size);
     });
 }
 
@@ -472,9 +805,10 @@ bool SplatTrainer::step(const float* rgb, const float pose[16], float fx, float 
     ssim.height = height;
     ssim.scale = -0.2f / (static_cast<float>(pixels) * 3.f);
     BackPush back{};
+    back.tilesX = tilesX;
+    back.tilesY = tilesY;
     back.width = width;
     back.height = height;
-    back.tilesX = tilesX;
     ParamPush param{};
     for (int i = 0; i < 4; ++i) {
         param.row0[i] = pose[i];
