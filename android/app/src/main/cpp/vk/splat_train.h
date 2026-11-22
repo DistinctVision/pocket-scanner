@@ -26,11 +26,13 @@ struct SplatHyper {
 
     float ssimWeight = 0.2f;
     float tvLambda = 0.01f;
+    float depthLambda = 1e-2f;
+    float depthMin = 0.05f;
 
     int densifyFrom = 500;
     int densifyUntil = 15000;
     int densifyInterval = 100;
-    float gradThreshold = 1e-2f;
+    float gradThreshold = 1.f;
     float percentDense = 0.01f;
     float pruneScale = 0.1f;
     float minOpacity = 0.005f;
@@ -61,8 +63,8 @@ struct SplatTrainer {
 
     bool init(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps);
     // metricsAfter is the validation pass: the grid steps, then the numbers are read.
-    bool step(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy,
-              int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[3]);
+    bool step(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy,
+              int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[4]);
     bool render(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb);
     bool readCorrected(uint8_t* rgb);
     bool writePly(const char* path);
@@ -79,8 +81,9 @@ private:
     bool kernels();
     bool uploadGaussians(const float* verts, float voxel);
     bool uploadIdentity();
-    bool projectAndBlend(const float pose[16], float fx, float fy, float cx, float cy);
-    bool metricsOf(float out[3]);
+    bool projectAndBlend(const float pose[16], float fx, float fy, float cx, float cy, int mode);
+    bool depthLoss(const float* depth, float& loss, float& weight);
+    bool metricsOf(float out[4]);
     bool grow(void* buffer, uint64_t bytes);
     void bindScans();
     bool scratchFor(int n);

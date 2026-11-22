@@ -77,7 +77,8 @@ void paramGrad(uint3 tid : SV_DispatchThreadID) {
     float3 dcam = 0;
     dcam.x = dxy.x * pc.intr.x * invZ;
     dcam.y = dxy.y * pc.intr.y * invZ;
-    dcam.z = dxy.x * (-pc.intr.x * cam.x * invZ2) + dxy.y * (-pc.intr.y * cam.y * invZ2);
+    float dDepth = accum[tid.x * 12 + 9] * inv;
+    dcam.z = dxy.x * (-pc.intr.x * cam.x * invZ2) + dxy.y * (-pc.intr.y * cam.y * invZ2) + dDepth;
     float3x3 Rwc = float3x3(pc.row0.xyz, pc.row1.xyz, pc.row2.xyz);
     outg.meanOp.xyz = mul(transpose(Rwc), dcam);
     float3 base = conicOf(g, cam);

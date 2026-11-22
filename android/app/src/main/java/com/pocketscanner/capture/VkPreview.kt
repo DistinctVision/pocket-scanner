@@ -312,7 +312,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         handle: Long, verts: FloatArray, voxel: Float, views: Int, width: Int, height: Int, budget: Int, meanSteps: Int, gridSteps: Int,
     ): Boolean
     private external fun nativeSplatStep(
-        handle: Long, rgb: FloatArray, pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float,
+        handle: Long, rgb: FloatArray, depth: FloatArray, pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float,
         view: Int, updateGauss: Boolean, updateGrid: Boolean, metricsAfter: Boolean, metrics: FloatArray,
     ): Boolean
     private external fun nativeSplatRender(
@@ -382,6 +382,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
 
     fun splatStep(
         rgb: FloatArray,
+        depth: FloatArray,
         pose: FloatArray,
         fx: Float,
         fy: Float,
@@ -393,9 +394,9 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         metricsAfter: Boolean,
     ): FloatArray? = onGpu(null) { gpu, handle ->
         if (handle == 0L) return@onGpu null
-        val metrics = FloatArray(3)
+        val metrics = FloatArray(4)
         val ok = gpu.nativeSplatStep(
-            handle, rgb, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics,
+            handle, rgb, depth, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics,
         )
         if (ok) metrics else null
     }

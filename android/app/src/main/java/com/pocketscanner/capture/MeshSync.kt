@@ -26,6 +26,7 @@ data class TrainFrame(
     val cx: Float,
     val cy: Float,
     val rgb: File,
+    val depth: File,
 )
 
 data class ScanSettings(
@@ -203,6 +204,21 @@ class MeshSync(
                 }
                 val file = File(dest, "$id.rgb")
                 file.writeBytes(rgb)
+                val depthFile = File(dest, "$id.f32")
+                val meters = ByteBuffer.allocate(full.width * full.height * 4).order(ByteOrder.LITTLE_ENDIAN)
+                val scale = raw.depthScale
+                for (y in 0 until full.height) {
+                    for (x in 0 until full.width) {
+                        val depthIndex = y * raw.depthStride + x * 2
+                        val sample = if (depthIndex + 1 < raw.depth.size) {
+                            (raw.depth[depthIndex].toInt() and 0xff) or ((raw.depth[depthIndex + 1].toInt() and 0xff) shl 8)
+                        } else {
+                            0
+                        }
+                        meters.putFloat(if (sample == 0 || scale <= 0f) 0f else sample / scale)
+                    }
+                }
+                depthFile.writeBytes(meters.array())
                 written.add(
                     TrainFrame(
                         id,
@@ -214,6 +230,7 @@ class MeshSync(
                         full.cx,
                         full.cy,
                         file,
+                        depthFile,
                     ),
                 )
             } catch (error: Exception) {
@@ -875,6 +892,7 @@ class MeshSync(
             val colorStride: Int,
             val depth: ByteArray,
             val depthStride: Int,
+            val depthScale: Float,
         )
 
         private fun writeStored(
@@ -921,12 +939,12 @@ class MeshSync(
                 input.readFloat()
                 input.readFloat()
                 input.readFloat()
-                input.readFloat()
+                val depthScale = input.readFloat()
                 val color = ByteArray(input.readInt())
                 input.readFully(color)
                 val depth = ByteArray(input.readInt())
                 input.readFully(depth)
-                return RawFrame(color, colorStride, depth, depthStride)
+                return RawFrame(color, colorStride, depth, depthStride, depthScale)
             }
         }
 

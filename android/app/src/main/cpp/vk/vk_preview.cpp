@@ -907,9 +907,9 @@ bool Preview::splatInit(const float* verts, int count, float voxel, int views, i
     return splat->init(verts, count, voxel, views, width, height, budget, meanSteps, gridSteps);
 }
 
-bool Preview::splatStep(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy, int view,
-                        bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[3]) {
-    return splat != nullptr && splat->step(rgb, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics);
+bool Preview::splatStep(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy, int view,
+                        bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[4]) {
+    return splat != nullptr && splat->step(rgb, depth, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics);
 }
 
 bool Preview::splatRender(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb) {

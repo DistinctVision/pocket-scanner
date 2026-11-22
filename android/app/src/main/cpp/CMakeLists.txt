@@ -102,8 +102,13 @@ slang_shader("${SHADER_DIR}/splat_scan_add.slang" scanAdd compute splat_scan_add
 slang_shader("${SHADER_DIR}/splat_sort.slang" radixHist compute splat_hist_spv)
 slang_shader("${SHADER_DIR}/splat_scatter.slang" radixScatter compute splat_scatter_spv)
 slang_shader("${SHADER_DIR}/splat_ranges.slang" markRanges compute splat_ranges_spv)
-slang_shader("${SHADER_DIR}/splat_blend.slang" blendForward compute splat_blend_spv)
-slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackward compute splat_back_spv)
+slang_shader("${SHADER_DIR}/splat_blend.slang" blendRgb compute splat_blend_rgb_spv)
+slang_shader("${SHADER_DIR}/splat_blend.slang" blendEd compute splat_blend_ed_spv)
+slang_shader("${SHADER_DIR}/splat_blend.slang" blendRgbEd compute splat_blend_rgbed_spv)
+slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackwardRgb compute splat_back_rgb_spv)
+slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackwardEd compute splat_back_ed_spv)
+slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackwardRgbEd compute splat_back_rgbed_spv)
+slang_shader("${SHADER_DIR}/splat_depth.slang" depthLoss compute splat_depth_spv)
 slang_shader("${SHADER_DIR}/splat_params.slang" paramGrad compute splat_params_spv)
 slang_shader("${SHADER_DIR}/bilagrid.slang" sliceGrid compute bilagrid_slice_spv)
 slang_shader("${SHADER_DIR}/bilagrid.slang" gridTv compute bilagrid_tv_spv)
@@ -127,8 +132,13 @@ list(APPEND SHADER_HEADERS
     "${SHADER_OUT}/splat_hist_spv.h"
     "${SHADER_OUT}/splat_scatter_spv.h"
     "${SHADER_OUT}/splat_ranges_spv.h"
-    "${SHADER_OUT}/splat_blend_spv.h"
-    "${SHADER_OUT}/splat_back_spv.h"
+    "${SHADER_OUT}/splat_blend_rgb_spv.h"
+    "${SHADER_OUT}/splat_blend_ed_spv.h"
+    "${SHADER_OUT}/splat_blend_rgbed_spv.h"
+    "${SHADER_OUT}/splat_back_rgb_spv.h"
+    "${SHADER_OUT}/splat_back_ed_spv.h"
+    "${SHADER_OUT}/splat_back_rgbed_spv.h"
+    "${SHADER_OUT}/splat_depth_spv.h"
     "${SHADER_OUT}/splat_params_spv.h"
     "${SHADER_OUT}/bilagrid_slice_spv.h"
     "${SHADER_OUT}/bilagrid_tv_spv.h"

@@ -32,7 +32,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-data class TrainMetric(val epoch: Int, val l1: Float, val ssim: Float, val psnr: Float, val gaussians: Int = 0)
+data class TrainMetric(val epoch: Int, val l1: Float, val ssim: Float, val psnr: Float, val gaussians: Int = 0, val depth: Float = 0f)
 
 data class TrainUi(
     val status: String = "Preparing",
@@ -140,7 +140,7 @@ internal object SplatRuntime {
                 val counted = trainMean.copy(gaussians = preview.splatGaussianCount())
                 trainSeries.add(counted)
                 append(metrics, epoch, "train", counted)
-                note("Epoch $epoch train  L1 ${fmt(trainMean.l1)}  SSIM ${fmt(trainMean.ssim)}  PSNR ${fmt(trainMean.psnr)}")
+                note("Epoch $epoch train  L1 ${fmt(trainMean.l1)}  SSIM ${fmt(trainMean.ssim)}  PSNR ${fmt(trainMean.psnr)}  depth ${fmt(trainMean.depth)}")
                 publish { it.copy(epoch = epoch, train = trainSeries.toList(), fraction = 1f) }
             }
             val validateNow = validation.isNotEmpty() && epoch % every == 0
@@ -154,7 +154,7 @@ internal object SplatRuntime {
                 }
                 valSeries.add(valMean)
                 append(metrics, epoch, "val", valMean)
-                note("Epoch $epoch val  L1 ${fmt(valMean.l1)}  SSIM ${fmt(valMean.ssim)}  PSNR ${fmt(valMean.psnr)}")
+                note("Epoch $epoch val  L1 ${fmt(valMean.l1)}  SSIM ${fmt(valMean.ssim)}  PSNR ${fmt(valMean.psnr)}  depth ${fmt(valMean.depth)}")
                 publish { it.copy(validation = valSeries.toList(), image = latestImage(valDir), fraction = 0f, status = "Rendering video") }
                 if (!stop.get()) encodeVideo(context, preview, usable, width, height, video, epoch, settings.epochs, settings.videoSeconds)
             }
@@ -206,14 +206,23 @@ internal object SplatRuntime {
         var l1 = 0.0
         var ssim = 0.0
         var psnr = 0.0
+        var depthLoss = 0.0
         val rgb = FloatArray(width * height * 3)
+        val depth = FloatArray(width * height)
         frames.forEachIndexed { index, frame ->
             if (stop.get()) return null
             val bytes = frame.rgb.readBytes()
             val n = minOf(rgb.size, bytes.size)
             for (i in 0 until n) rgb[i] = (bytes[i].toInt() and 255) / 255f
+            depth.fill(0f)
+            if (frame.depth.isFile) {
+                val raw = frame.depth.readBytes()
+                val view = java.nio.ByteBuffer.wrap(raw).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                val samples = minOf(depth.size, raw.size / 4)
+                for (i in 0 until samples) depth[i] = view.float
+            }
             val metrics = preview.splatStep(
-                rgb, frame.pose, frame.fx, frame.fy, frame.cx, frame.cy,
+                rgb, depth, frame.pose, frame.fx, frame.fy, frame.cx, frame.cy,
                 viewIndex[frame.id] ?: 0, updateGauss, true, metricsAfter,
             )
             if (metrics == null) {
@@ -227,6 +236,7 @@ internal object SplatRuntime {
             l1 += metrics[0]
             ssim += metrics[1]
             psnr += metrics[2]
+            depthLoss += metrics[3]
             if (pngDir != null) {
                 val rendered = preview.splatRender(frame.pose, frame.fx, frame.fy, frame.cx, frame.cy, corrected = true)
                 val image = rendered?.let { bitmapOf(it, width, height) }
@@ -239,7 +249,7 @@ internal object SplatRuntime {
             TrainService.update(context, epoch, epochs, fraction)
         }
         val count = frames.size.toDouble()
-        return TrainMetric(epoch, (l1 / count).toFloat(), (ssim / count).toFloat(), (psnr / count).toFloat())
+        return TrainMetric(epoch, (l1 / count).toFloat(), (ssim / count).toFloat(), (psnr / count).toFloat(), depth = (depthLoss / count).toFloat())
     }
 
     private fun encodeVideo(
@@ -336,7 +346,7 @@ internal object SplatRuntime {
 
     private fun append(file: File, epoch: Int, split: String, metric: TrainMetric) {
         file.appendText(
-            """{"epoch":$epoch,"split":"$split","l1":${metric.l1},"ssim":${metric.ssim},"psnr":${metric.psnr},"gaussians":${metric.gaussians}}""" + "\n",
+            """{"epoch":$epoch,"split":"$split","l1":${metric.l1},"ssim":${metric.ssim},"psnr":${metric.psnr},"depth":${metric.depth},"gaussians":${metric.gaussians}}""" + "\n",
         )
     }
 
@@ -362,6 +372,7 @@ internal object SplatRuntime {
                     number(line, "ssim") ?: return@forEachLine,
                     number(line, "psnr") ?: return@forEachLine,
                     number(line, "gaussians")?.toInt() ?: 0,
+                    number(line, "depth") ?: 0f,
                 )
                 if (line.contains("\"val\"")) validation.add(metric) else train.add(metric)
             }

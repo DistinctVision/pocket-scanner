@@ -237,18 +237,20 @@ JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatI
 }
 
 JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatStep(
-    JNIEnv* env, jobject, jlong handle, jfloatArray rgb, jfloatArray pose, jfloat fx, jfloat fy, jfloat cx, jfloat cy,
+    JNIEnv* env, jobject, jlong handle, jfloatArray rgb, jfloatArray depth, jfloatArray pose, jfloat fx, jfloat fy, jfloat cx, jfloat cy,
     jint view, jboolean updateGauss, jboolean updateGrid, jboolean metricsAfter, jfloatArray metrics) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     if (preview == nullptr || rgb == nullptr || pose == nullptr || metrics == nullptr) return JNI_FALSE;
     jfloat poseValues[16];
     env->GetFloatArrayRegion(pose, 0, 16, poseValues);
     jfloat* image = env->GetFloatArrayElements(rgb, nullptr);
-    float out[3]{};
-    bool ok = image != nullptr && preview->splatStep(image, poseValues, fx, fy, cx, cy, view, updateGauss == JNI_TRUE,
+    jfloat* depthValues = depth == nullptr ? nullptr : env->GetFloatArrayElements(depth, nullptr);
+    float out[4]{};
+    bool ok = image != nullptr && preview->splatStep(image, depthValues, poseValues, fx, fy, cx, cy, view, updateGauss == JNI_TRUE,
                                                       updateGrid == JNI_TRUE, metricsAfter == JNI_TRUE, out);
     if (image != nullptr) env->ReleaseFloatArrayElements(rgb, image, JNI_ABORT);
-    env->SetFloatArrayRegion(metrics, 0, 3, out);
+    if (depthValues != nullptr) env->ReleaseFloatArrayElements(depth, depthValues, JNI_ABORT);
+    env->SetFloatArrayRegion(metrics, 0, 4, out);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

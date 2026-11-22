@@ -44,8 +44,8 @@ struct Preview {
     int splatGaussianCount() const;
     bool splatInitFromSeed(int views, int width, int height, int budget, int meanSteps, int gridSteps);
     bool splatInit(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps);
-    bool splatStep(const float* rgb, const float pose[16], float fx, float fy, float cx, float cy,
-                   int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[3]);
+    bool splatStep(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy,
+                   int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[4]);
     bool splatRender(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb);
     bool splatRead(uint8_t* rgb);
     bool splatWritePly(const char* path);
