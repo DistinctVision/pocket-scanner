@@ -880,6 +880,17 @@ bool Preview::captureSeed() {
     return true;
 }
 
+bool Preview::captureSeedFromFile(const char* path) {
+    seed.clear();
+    const int count = volume.readMeshSeed(path, seed, seedVoxelSize);
+    if (count < 3) {
+        seed.clear();
+        seed.shrink_to_fit();
+        return false;
+    }
+    return true;
+}
+
 bool Preview::splatInitFromSeed(int views, int width, int height) {
     if (seed.size() < 27) return false;
     if (splat == nullptr) splat = new SplatTrainer(&core);

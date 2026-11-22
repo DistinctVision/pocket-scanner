@@ -186,6 +186,16 @@ JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptur
     return preview != nullptr && preview->captureSeed() ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptureSeedFromFile(
+    JNIEnv* env, jobject, jlong handle, jstring path) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr || path == nullptr) return JNI_FALSE;
+    const char* chars = env->GetStringUTFChars(path, nullptr);
+    const bool ok = chars != nullptr && preview->captureSeedFromFile(chars);
+    if (chars != nullptr) env->ReleaseStringUTFChars(path, chars);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jfloat JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSeedVoxel(JNIEnv*, jobject, jlong handle) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     return preview == nullptr ? 0.f : preview->seedVoxel();

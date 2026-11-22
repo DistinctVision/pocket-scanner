@@ -227,6 +227,7 @@ class RealSenseSession(
                 val shown = cached != null && preview?.loadMesh(cached.absolutePath, depth) == true
                 val beside = File(scanDir, "mesh.bin")
                 if (shown) {
+                    volumeConfigured.set(true)
                     meshFrozen.set(true)
                     scanDir.mkdirs()
                     cached.copyTo(beside, overwrite = true)
@@ -433,9 +434,13 @@ class RealSenseSession(
 
     /** Copies color views, reads the mesh, then stops the camera and frees the volume. */
     fun beginSplatting(dir: File): SplatPrepared {
+        val meshFile = File(scanDir, "mesh.bin")
+        val haveSeed =
+            (meshFile.isFile && meshFile.length() > 16 && preview?.captureSeedFromFile(meshFile.absolutePath) == true) ||
+                preview?.captureSeed() == true
+        if (!haveSeed) error("The mesh could not be read")
         val frames = mesh?.exportTraining(dir) ?: error("No scan to train")
         if (frames.isEmpty()) error("No full frames to train")
-        if (preview?.captureSeed() != true) error("The mesh could not be read")
         val seeded = preview?.seedVoxel() ?: 0f
         haltCapture()
         preview?.dropMesh()

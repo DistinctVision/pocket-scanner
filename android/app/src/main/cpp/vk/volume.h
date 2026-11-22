@@ -38,6 +38,8 @@ struct Volume {
     int chunkCap() const;
     // Host xyz, normal, rgb for each measured vertex. Call on the Vulkan thread.
     int copySurface(std::vector<float>& interleaved, float& voxel) const;
+    // Same vertex list, read from a saved mesh.bin. Does not use the GPU.
+    int readMeshSeed(const char* path, std::vector<float>& interleaved, float& voxel) const;
     // Finished review mesh, next to the scan. A later open draws this instead of integrating again.
     bool saveMesh(const char* path) const;
     bool loadMesh(const char* path, float depthMeters);

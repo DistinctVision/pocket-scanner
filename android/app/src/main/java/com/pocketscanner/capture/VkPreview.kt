@@ -301,6 +301,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeLoadMesh(handle: Long, path: String, depthMeters: Float): Boolean
     private external fun nativeDropQueue(handle: Long)
     private external fun nativeCaptureSeed(handle: Long): Boolean
+    private external fun nativeCaptureSeedFromFile(handle: Long, path: String): Boolean
     private external fun nativeSeedVoxel(handle: Long): Float
     private external fun nativeSplatInitFromSeed(handle: Long, views: Int, width: Int, height: Int): Boolean
     private external fun nativeDropMesh(handle: Long)
@@ -339,6 +340,10 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
 
     fun captureSeed(): Boolean = onGpu(false) { view, handle ->
         handle != 0L && view.nativeCaptureSeed(handle)
+    }
+
+    fun captureSeedFromFile(path: String): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeCaptureSeedFromFile(handle, path)
     }
 
     fun seedVoxel(): Float = onGpu(0f) { view, handle ->

@@ -1126,6 +1126,10 @@ void Volume::draw(VkCommandBuffer cmd, float fitX, float fitY) {
 
 namespace {
 
+void releaseCopy(VkCore* core, VkCommandBuffer cmd) {
+    if (cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(core->device, core->commandPool, 1, &cmd);
+}
+
 bool submitCopy(VkCore* core, const std::function<void(VkCommandBuffer)>& record) {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo alloc{};
@@ -1133,21 +1137,103 @@ bool submitCopy(VkCore* core, const std::function<void(VkCommandBuffer)>& record
     alloc.commandPool = core->commandPool;
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(core->device, &alloc, &cmd) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(core->device, &alloc, &cmd) != VK_SUCCESS) {
+        LOGE("mesh copy allocate failed");
+        return false;
+    }
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+        releaseCopy(core, cmd);
+        LOGE("mesh copy begin failed");
+        return false;
+    }
     record(cmd);
-    vkEndCommandBuffer(cmd);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        releaseCopy(core, cmd);
+        LOGE("mesh copy end failed");
+        return false;
+    }
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    vkQueueSubmit(core->queue, 1, &submit, VK_NULL_HANDLE);
+    if (vkQueueSubmit(core->queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+        releaseCopy(core, cmd);
+        LOGE("mesh copy submit failed");
+        return false;
+    }
     vkQueueWaitIdle(core->queue);
-    vkFreeCommandBuffers(core->device, core->commandPool, 1, &cmd);
+    releaseCopy(core, cmd);
     return true;
+}
+
+void barrierToTransfer(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize size) {
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+        VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = buffer;
+    barrier.offset = 0;
+    barrier.size = size;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+}
+
+void invalidateHost(VkCore* core, const Buffer& buf) {
+    if (buf.memory == VK_NULL_HANDLE) return;
+    VkMappedMemoryRange range{};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = buf.memory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(core->device, 1, &range);
+}
+
+// Measured triangles only. Frontier vertices have alpha 0 and are not a surface to train.
+void appendMeasured(const uint8_t* bytes, uint32_t n, std::vector<float>& interleaved) {
+    constexpr uint32_t kMaxCopy = 1000000;
+    for (uint32_t v = 0; v + 2 < n; v += 3) {
+        if (interleaved.size() / 9 + 3 > kMaxCopy) return;
+        float p[3][3];
+        uint8_t rgba[3][4];
+        bool keep = true;
+        for (int k = 0; k < 3; ++k) {
+            const uint8_t* src = bytes + static_cast<size_t>(v + k) * 16;
+            std::memcpy(p[k], src, 12);
+            std::memcpy(rgba[k], src + 12, 4);
+            if (rgba[k][3] < 128) keep = false;
+        }
+        if (!keep) continue;
+        float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
+        float e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
+        float nx = e1[1] * e2[2] - e1[2] * e2[1];
+        float ny = e1[2] * e2[0] - e1[0] * e2[2];
+        float nz = e1[0] * e2[1] - e1[1] * e2[0];
+        float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (len <= 1e-8f) continue;
+        nx /= len;
+        ny /= len;
+        nz /= len;
+        for (int k = 0; k < 3; ++k) {
+            interleaved.push_back(p[k][0]);
+            interleaved.push_back(p[k][1]);
+            interleaved.push_back(p[k][2]);
+            interleaved.push_back(nx);
+            interleaved.push_back(ny);
+            interleaved.push_back(nz);
+            interleaved.push_back(rgba[k][0] / 255.f);
+            interleaved.push_back(rgba[k][1] / 255.f);
+            interleaved.push_back(rgba[k][2] / 255.f);
+        }
+    }
 }
 
 } // namespace
@@ -1227,97 +1313,92 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel) const {
     vkDeviceWaitIdle(core->device);
     const auto host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     Buffer counts{};
-    if (!core->buffer(triDraw.size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, counts)) return 0;
-    submitCopy(core, [&](VkCommandBuffer cmd) {
+    if (!core->buffer(triDraw.size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, counts) || counts.mapped == nullptr) {
+        core->destroy(counts);
+        return 0;
+    }
+    const bool countsCopied = submitCopy(core, [&](VkCommandBuffer cmd) {
+        barrierToTransfer(cmd, triDraw.buffer, triDraw.size);
         VkBufferCopy region{};
         region.size = triDraw.size;
         vkCmdCopyBuffer(cmd, triDraw.buffer, counts.buffer, 1, &region);
     });
+    invalidateHost(core, counts);
+    if (!countsCopied) {
+        core->destroy(counts);
+        LOGE("surface counts were not copied");
+        return 0;
+    }
+    Buffer one{};
+    if (!core->buffer(static_cast<VkDeviceSize>(kMaxVerts) * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, one) ||
+        one.mapped == nullptr) {
+        core->destroy(counts);
+        core->destroy(one);
+        return 0;
+    }
     auto* draw = static_cast<const uint32_t*>(counts.mapped);
-    std::vector<std::pair<int, uint32_t>> slots;
-    uint32_t total = 0;
+    int live = 0;
+    uint32_t raw = 0;
     constexpr uint32_t kMaxCopy = 1000000;
-    for (int slot = 0; slot < static_cast<int>(chunks.size()) && total < kMaxCopy; ++slot) {
+    for (int slot = 0; slot < static_cast<int>(chunks.size()) && interleaved.size() / 9 < kMaxCopy; ++slot) {
         if (!chunks[slot].live) continue;
-        uint32_t n = draw[slot * 4];
+        live++;
+        uint32_t n = draw[static_cast<size_t>(slot) * 4];
         if (n > static_cast<uint32_t>(kMaxVerts)) n = kMaxVerts;
         n -= n % 3;
         if (n == 0) continue;
-        if (total + n > kMaxCopy) n = (kMaxCopy - total) - (kMaxCopy - total) % 3;
-        if (n == 0) continue;
-        slots.emplace_back(slot, n);
-        total += n;
-    }
-    if (total == 0) {
-        core->destroy(counts);
-        return 0;
-    }
-    Buffer verts{};
-    if (!core->buffer(static_cast<VkDeviceSize>(total) * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, verts)) {
-        core->destroy(counts);
-        return 0;
-    }
-    submitCopy(core, [&](VkCommandBuffer cmd) {
-        std::vector<VkBufferCopy> regions;
-        VkDeviceSize dst = 0;
-        for (const auto& item : slots) {
+        raw += n;
+        const bool copied = submitCopy(core, [&](VkCommandBuffer cmd) {
+            barrierToTransfer(cmd, vertices.buffer, vertices.size);
             VkBufferCopy region{};
-            region.srcOffset = static_cast<VkDeviceSize>(item.first) * kMaxVerts * 16;
-            region.dstOffset = dst;
-            region.size = static_cast<VkDeviceSize>(item.second) * 16;
-            regions.push_back(region);
-            dst += region.size;
-        }
-        for (size_t start = 0; start < regions.size(); start += 256) {
-            uint32_t batch = static_cast<uint32_t>(std::min<size_t>(256, regions.size() - start));
-            vkCmdCopyBuffer(cmd, vertices.buffer, verts.buffer, batch, regions.data() + start);
-        }
-    });
-    auto* bytes = static_cast<const uint8_t*>(verts.mapped);
-    interleaved.reserve(static_cast<size_t>(total) * 9);
-    size_t offset = 0;
-    for (const auto& item : slots) {
-        uint32_t n = item.second;
-        for (uint32_t v = 0; v + 2 < n; v += 3) {
-            float p[3][3];
-            uint8_t rgba[3][4];
-            bool keep = true;
-            for (int k = 0; k < 3; ++k) {
-                const uint8_t* src = bytes + offset + static_cast<size_t>(v + k) * 16;
-                std::memcpy(p[k], src, 12);
-                std::memcpy(rgba[k], src + 12, 4);
-                if (rgba[k][3] < 128) keep = false;
-            }
-            if (keep) {
-                float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
-                float e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
-                float nx = e1[1] * e2[2] - e1[2] * e2[1];
-                float ny = e1[2] * e2[0] - e1[0] * e2[2];
-                float nz = e1[0] * e2[1] - e1[1] * e2[0];
-                float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-                if (len > 1e-8f) {
-                    nx /= len;
-                    ny /= len;
-                    nz /= len;
-                    for (int k = 0; k < 3; ++k) {
-                        interleaved.push_back(p[k][0]);
-                        interleaved.push_back(p[k][1]);
-                        interleaved.push_back(p[k][2]);
-                        interleaved.push_back(nx);
-                        interleaved.push_back(ny);
-                        interleaved.push_back(nz);
-                        interleaved.push_back(rgba[k][0] / 255.f);
-                        interleaved.push_back(rgba[k][1] / 255.f);
-                        interleaved.push_back(rgba[k][2] / 255.f);
-                    }
-                }
-            }
-        }
-        offset += static_cast<size_t>(n) * 16;
+            region.srcOffset = static_cast<VkDeviceSize>(slot) * static_cast<VkDeviceSize>(kMaxVerts) * 16;
+            region.size = static_cast<VkDeviceSize>(n) * 16;
+            vkCmdCopyBuffer(cmd, vertices.buffer, one.buffer, 1, &region);
+        });
+        if (!copied) continue;
+        invalidateHost(core, one);
+        appendMeasured(static_cast<const uint8_t*>(one.mapped), n, interleaved);
     }
-    core->destroy(verts);
+    core->destroy(one);
     core->destroy(counts);
-    return static_cast<int>(interleaved.size() / 9);
+    const int kept = static_cast<int>(interleaved.size() / 9);
+    if (kept < 3) LOGE("surface copy kept %d of %u verts from %d chunks", kept, raw, live);
+    else LOGI("surface copy %d verts", kept);
+    return kept;
+}
+
+int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, float& voxel) const {
+    interleaved.clear();
+    voxel = 0.f;
+    if (path == nullptr) return 0;
+    FILE* in = std::fopen(path, "rb");
+    if (in == nullptr) return 0;
+    char magic[4]{};
+    uint32_t version = 0;
+    uint32_t chunkCount = 0;
+    const bool header = std::fread(magic, 1, 4, in) == 4 && magic[0] == 'P' && magic[1] == 'S' && magic[2] == 'M' &&
+        magic[3] == '1' && std::fread(&version, 4, 1, in) == 1 && std::fread(&voxel, 4, 1, in) == 1 &&
+        std::fread(&chunkCount, 4, 1, in) == 1;
+    if (!header || version != 1 || chunkCount == 0 || voxel < 0.01f) {
+        std::fclose(in);
+        interleaved.clear();
+        return 0;
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(kMaxVerts) * 16);
+    constexpr uint32_t kMaxCopy = 1000000;
+    for (uint32_t slot = 0; slot < chunkCount && interleaved.size() / 9 < kMaxCopy; ++slot) {
+        uint32_t n = 0;
+        if (std::fread(&n, 4, 1, in) != 1 || n == 0 || n > static_cast<uint32_t>(kMaxVerts) || n % 3 != 0 ||
+            std::fread(bytes.data(), 1, static_cast<size_t>(n) * 16, in) != static_cast<size_t>(n) * 16) {
+            break;
+        }
+        appendMeasured(bytes.data(), n, interleaved);
+    }
+    std::fclose(in);
+    const int kept = static_cast<int>(interleaved.size() / 9);
+    if (kept < 3) LOGE("mesh file seed kept %d", kept);
+    else LOGI("mesh file seed %d verts", kept);
+    return kept;
 }
 
 bool Volume::saveMesh(const char* path) const {
