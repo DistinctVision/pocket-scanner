@@ -36,6 +36,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.draw.alpha
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.safeDrawing
@@ -551,7 +552,6 @@ internal fun RefineScreen(
     lens: () -> ViewLens?,
     chunkCount: () -> Int,
     chunkPending: () -> Int,
-    chunkUndrawn: () -> Int,
     onMeshIdle: () -> Boolean,
 ) {
     val scheme = MaterialTheme.colorScheme
@@ -562,11 +562,10 @@ internal fun RefineScreen(
     val gestures = remember { LookGestures(lookHolder, lookTick) }
     var meshChunks by remember { mutableIntStateOf(0) }
     var meshPending by remember { mutableIntStateOf(0) }
-    var meshUndrawn by remember { mutableIntStateOf(1) }
-    LaunchedEffect(ui.phase, meshUndrawn, meshChunks) {
-        if (ui.phase != "review" || meshUndrawn > 0 || meshChunks <= 0) return@LaunchedEffect
+    LaunchedEffect(ui.phase, meshPending, meshChunks) {
+        if (ui.phase != "review" || meshPending > 0 || meshChunks <= 0) return@LaunchedEffect
         delay(1500)
-        if (meshUndrawn > 0 || meshChunks <= 0) return@LaunchedEffect
+        if (meshPending > 0 || meshChunks <= 0) return@LaunchedEffect
         while (true) {
             val saved = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { onMeshIdle() }
             if (saved) break
@@ -577,7 +576,6 @@ internal fun RefineScreen(
         while (true) {
             meshChunks = chunkCount()
             meshPending = chunkPending()
-            meshUndrawn = chunkUndrawn()
             delay(250)
         }
     }
@@ -820,6 +818,7 @@ internal fun Trackball(enabled: Boolean, onDrag: (Float, Float) -> Unit) {
     Canvas(
         Modifier
             .size(124.dp)
+            .alpha(0.5f)
             .pointerInput(enabled) {
                 if (!enabled) return@pointerInput
                 val limit = minOf(size.width, size.height) / 2f - 22.dp.toPx()

@@ -404,7 +404,6 @@ class RealSenseSession(
                 Log.e(TAG, "mesh cache rename failed")
                 return false
             }
-            preview?.dropQueue()
             val uri = packageUri.get()
             if (uri != null) dest.copyTo(meshSidecar(uri), overwrite = true)
             Log.i(TAG, "mesh cache ${dest.length()} bytes")

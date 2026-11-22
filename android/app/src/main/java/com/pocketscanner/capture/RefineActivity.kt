@@ -62,7 +62,6 @@ class RefineActivity : ComponentActivity() {
                     lens = { created.viewLens() },
                     chunkCount = { preview?.chunkCount() ?: 0 },
                     chunkPending = { preview?.chunkPending() ?: 0 },
-                    chunkUndrawn = { preview?.chunkUndrawn() ?: 1 },
                     onMeshIdle = { created.cacheReviewMesh() },
                 )
             }
