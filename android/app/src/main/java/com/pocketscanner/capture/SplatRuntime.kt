@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -590,6 +591,8 @@ private class VideoEncoder(private val width: Int, private val height: Int, dest
 }
 
 class TrainService : Service() {
+    private var wake: PowerManager.WakeLock? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -599,7 +602,20 @@ class TrainService : Service() {
         } else {
             startForeground(TrainNotes.ID, notification)
         }
+        if (wake == null) {
+            val power = getSystemService(PowerManager::class.java)
+            wake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pocketscanner:train").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
         return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        wake?.let { if (it.isHeld) it.release() }
+        wake = null
+        super.onDestroy()
     }
 
     companion object {
