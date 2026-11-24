@@ -604,7 +604,11 @@ class TrainService : Service() {
         }
         if (wake == null) {
             val power = getSystemService(PowerManager::class.java)
-            wake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pocketscanner:train").apply {
+            @Suppress("DEPRECATION")
+            val level = PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                PowerManager.ON_AFTER_RELEASE
+            wake = power.newWakeLock(level, "pocketscanner:train").apply {
                 setReferenceCounted(false)
                 acquire()
             }
