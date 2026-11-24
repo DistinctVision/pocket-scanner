@@ -155,6 +155,7 @@ private fun RunDetail(dir: File, live: TrainUi, onBack: () -> Unit) {
         File(dir, "val").listFiles { file -> file.isFile && file.name.endsWith(".png") }?.sortedBy { it.name } ?: emptyList()
     }
     val video = File(dir, "video.mp4")
+    val hyper = remember(dir) { hyperLines(dir) }
     Box(modifier = Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
@@ -221,6 +222,14 @@ private fun RunDetail(dir: File, live: TrainUi, onBack: () -> Unit) {
                 onRelease = { it.stopPlayback() },
             )
         }
+        Text("Hyperparameters", color = scheme.onSurface, style = MaterialTheme.typography.titleSmall)
+        if (hyper.isEmpty()) {
+            Text("No hyperparameters recorded", color = scheme.onSurfaceVariant)
+        } else {
+            hyper.forEach { line ->
+                Text(line, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+            }
+        }
     }
         fullImage?.let { bitmap -> FullscreenImage(bitmap) { fullImage = null } }
         if (fullVideo) FullscreenVideo(video) { fullVideo = false }
@@ -280,5 +289,20 @@ private fun runLine(dir: File): String {
     val trainPsnr = train.lastOrNull()?.let { "train %.2f".format(Locale.US, it.psnr) } ?: "train —"
     val valPsnr = if (!validation) "validation off" else held.lastOrNull()?.let { "val %.2f".format(Locale.US, it.psnr) } ?: "val —"
     val epochs = if (planned > 0) "$done / $planned epochs" else "$done epochs"
-    return "$epochs · $trainPsnr · $valPsnr"
+    val knobs = hyperKnobs(dir)
+    return if (knobs.isEmpty()) "$epochs · $trainPsnr · $valPsnr" else "$epochs · $trainPsnr · $valPsnr · $knobs"
+}
+
+private fun hyperLines(dir: File): List<String> {
+    val json = runCatching { JSONObject(File(dir, "hyperparameters.json").readText()) }.getOrNull() ?: return emptyList()
+    return json.keys().asSequence().map { key -> "$key  ${json.opt(key)}" }.toList()
+}
+
+private fun hyperKnobs(dir: File): String {
+    val json = runCatching { JSONObject(File(dir, "hyperparameters.json").readText()) }.getOrNull() ?: return ""
+    if (!json.has("densifyInterval") && !json.has("gradThreshold")) return ""
+    val interval = json.optInt("densifyInterval", 0)
+    val threshold = json.optDouble("gradThreshold", Double.NaN)
+    val thresholdText = if (threshold.isFinite()) String.format(Locale.US, "%g", threshold) else "—"
+    return "every $interval · grad $thresholdText"
 }

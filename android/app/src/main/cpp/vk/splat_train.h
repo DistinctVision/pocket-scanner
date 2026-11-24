@@ -60,6 +60,7 @@ struct SplatTrainer {
     explicit SplatTrainer(VkCore* core);
     ~SplatTrainer();
 
+    void setDensity(int interval, float threshold);
     bool init(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps);
     // metricsAfter is the validation pass: the grid steps, then the numbers are read.
     bool step(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy,

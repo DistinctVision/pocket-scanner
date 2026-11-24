@@ -112,6 +112,7 @@ internal object SplatRuntime {
         val gridSteps = (meanSteps + valPasses * validation.size).coerceAtLeast(1)
         writeRun(dir, settings, meanSteps, gridSteps)
         val viewIndex = usable.mapIndexed { index, frame -> frame.id to index }.toMap()
+        preview.splatDensity(settings.densifyInterval, settings.gradThreshold)
         val seeded = preview.splatInitFromSeed(usable.size, width, height, settings.gaussBudget, meanSteps, gridSteps)
         if (seeded) writeHyper(dir, settings, preview.splatHyperJson())
         if (!seeded) {

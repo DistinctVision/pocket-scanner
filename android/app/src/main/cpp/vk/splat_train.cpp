@@ -546,6 +546,11 @@ std::string SplatHyper::json() const {
     return out.str();
 }
 
+void SplatTrainer::setDensity(int interval, float threshold) {
+    if (interval >= 1) hyper.densifyInterval = interval;
+    if (std::isfinite(threshold) && threshold >= 0.f) hyper.gradThreshold = threshold;
+}
+
 bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, int w, int h, int cap, int meanHorizon, int gridHorizon) {
     destroy();
     if (n < 3 || viewCount < 1 || w < 16 || h < 16) return false;

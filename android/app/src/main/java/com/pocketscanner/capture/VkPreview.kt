@@ -306,6 +306,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeSplatHyper(handle: Long): String
     private external fun nativeSeedVoxel(handle: Long): Float
     private external fun nativeSplatGaussianCount(handle: Long): Int
+    private external fun nativeSplatDensity(handle: Long, interval: Int, threshold: Float)
     private external fun nativeSplatInitFromSeed(handle: Long, views: Int, width: Int, height: Int, budget: Int, meanSteps: Int, gridSteps: Int): Boolean
     private external fun nativeDropMesh(handle: Long)
     private external fun nativeSplatInit(
@@ -363,6 +364,12 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
 
     fun splatGaussianCount(): Int = onGpu(0) { view, handle ->
         if (handle == 0L) 0 else view.nativeSplatGaussianCount(handle)
+    }
+
+    fun splatDensity(interval: Int, threshold: Float) {
+        onGpu(Unit) { view, handle ->
+            if (handle != 0L) view.nativeSplatDensity(handle, interval, threshold)
+        }
     }
 
     fun splatInitFromSeed(views: Int, width: Int, height: Int, budget: Int, meanSteps: Int, gridSteps: Int): Boolean = onGpu(false) { view, handle ->

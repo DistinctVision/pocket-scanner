@@ -219,6 +219,12 @@ JNIEXPORT jfloat JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSeedVoxe
     return preview == nullptr ? 0.f : preview->seedVoxel();
 }
 
+JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatDensity(
+    JNIEnv*, jobject, jlong handle, jint interval, jfloat threshold) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview != nullptr) preview->splatDensity(interval, threshold);
+}
+
 JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatInitFromSeed(
     JNIEnv*, jobject, jlong handle, jint views, jint width, jint height, jint budget, jint meanSteps, jint gridSteps) {
     auto* preview = reinterpret_cast<Preview*>(handle);

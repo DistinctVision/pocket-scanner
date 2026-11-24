@@ -43,6 +43,8 @@ data class ScanSettings(
     val validationEvery: Int = 5,
     val gaussBudget: Int = 3_000_000,
     val videoSeconds: Int = 10,
+    val densifyInterval: Int = 100,
+    val gradThreshold: Float = 2e-4f,
 ) {
     val integrateHeight: Int get() = integrateWidth * 3 / 4
 
