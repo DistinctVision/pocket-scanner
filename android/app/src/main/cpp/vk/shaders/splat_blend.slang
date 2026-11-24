@@ -14,10 +14,7 @@ StructuredBuffer<uint> ids;
 RWStructuredBuffer<float> image;
 
 [[vk::binding(4, 0)]]
-RWStructuredBuffer<float> trans;
-
-[[vk::binding(5, 0)]]
-RWStructuredBuffer<float> expected;
+RWStructuredBuffer<PixelBlend> pixels;
 
 struct BlendPush {
     int tilesX;
@@ -29,25 +26,36 @@ struct BlendPush {
 [[vk::push_constant]]
 BlendPush pc;
 
-groupshared uint batchId[128];
 groupshared Splat2D batch[128];
 groupshared int alive;
 
-void shade<let kMode : int>(int x, int y, inout float3 color, inout float depth, inout float T, int n) {
-    if (x >= pc.width || y >= pc.height || T <= 1.0 / 255.0) return;
+void shade<let kMode : int>(int x, int y, inout float3 color, inout PixelBlend pixel, int base, int n) {
+    if (x >= pc.width || y >= pc.height || pixel.transmittance <= kMinTransmittance) return;
     float2 pix = float2(float(x), float(y)) + 0.5;
     for (int i = 0; i < n; ++i) {
-        if (T <= 1.0 / 255.0) break;
+        if (pixel.transmittance <= kMinTransmittance) break;
         Splat2D s = batch[i];
-        float2 d = pix - s.xyDepthRadius.xy;
-        float q = s.conicAlpha.x * d.x * d.x + 2.0 * s.conicAlpha.y * d.x * d.y + s.conicAlpha.z * d.y * d.y;
-        if (q > 12.0) continue;
-        float a = s.conicAlpha.w * exp(-0.5 * q);
-        if (a < 1.0 / 255.0) continue;
-        if (kMode != 1) color += a * T * s.colorAlive.xyz;
-        if (kMode != 0) depth += a * T * s.xyDepthRadius.z;
-        T *= (1.0 - a);
+        float gaussian;
+        float a = splatAlpha(s, pix - s.xyDepthRadius.xy, gaussian);
+        if (a < kMinAlpha) continue;
+        float w = a * pixel.transmittance;
+        if (kMode != 1) color += w * s.colorAlive.xyz;
+        if (kMode != 0) pixel.depth += w * s.xyDepthRadius.z;
+        pixel.transmittance *= 1.0 - a;
+        pixel.end = base + i + 1;
     }
+}
+
+void writePixel<let kMode : int>(int x, int y, float3 color, PixelBlend pixel) {
+    if (x >= pc.width || y >= pc.height) return;
+    int index = y * pc.width + x;
+    if (kMode != 1) {
+        image[index * 3 + 0] = color.x;
+        image[index * 3 + 1] = color.y;
+        image[index * 3 + 2] = color.z;
+    }
+    if (kMode != 0 && pixel.end > 0) pixel.depth /= 1.0 - pixel.transmittance;
+    pixels[index] = pixel;
 }
 
 void blendOne<let kMode : int>(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
@@ -63,52 +71,32 @@ void blendOne<let kMode : int>(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThre
     int y1 = int(gid.y) * kTile + (local1 >> 4);
     float3 color0 = 0;
     float3 color1 = 0;
-    float depth0 = 0;
-    float depth1 = 0;
-    float T0 = 1.0;
-    float T1 = 1.0;
+    PixelBlend pixel0 = {1.0, 0, 0.0};
+    PixelBlend pixel1 = pixel0;
     for (int base = begin; base < end; base += 128) {
         int n = min(128, end - base);
         if (int(lane) < n) {
-            uint id = ids[base + int(lane)];
-            batchId[lane] = id;
-            batch[lane] = splats[id];
+            batch[lane] = splats[ids[base + int(lane)]];
         }
         if (lane == 0) alive = 0;
         GroupMemoryBarrierWithGroupSync();
-        shade<kMode>(x0, y0, color0, depth0, T0, n);
-        shade<kMode>(x1, y1, color1, depth1, T1, n);
+        shade<kMode>(x0, y0, color0, pixel0, base, n);
+        shade<kMode>(x1, y1, color1, pixel1, base, n);
         int live = 0;
-        if (x0 < pc.width && y0 < pc.height && T0 > 1.0 / 255.0) live = 1;
-        if (x1 < pc.width && y1 < pc.height && T1 > 1.0 / 255.0) live = 1;
+        if (x0 < pc.width && y0 < pc.height && pixel0.transmittance > kMinTransmittance) live = 1;
+        if (x1 < pc.width && y1 < pc.height && pixel1.transmittance > kMinTransmittance) live = 1;
         if (live != 0) InterlockedOr(alive, 1);
         GroupMemoryBarrierWithGroupSync();
-        if (alive == 0) {
+        bool done = alive == 0;
+        GroupMemoryBarrierWithGroupSync();
+        if (done) {
             end = base + n;
             break;
         }
     }
     if (lane == 0) ranges[tile * 2 + 1] = end;
-    if (x0 < pc.width && y0 < pc.height) {
-        int pix = y0 * pc.width + x0;
-        if (kMode != 1) {
-            image[pix * 3 + 0] = color0.x;
-            image[pix * 3 + 1] = color0.y;
-            image[pix * 3 + 2] = color0.z;
-        }
-        if (kMode != 0) expected[pix] = depth0;
-        trans[pix] = T0;
-    }
-    if (x1 < pc.width && y1 < pc.height) {
-        int pix = y1 * pc.width + x1;
-        if (kMode != 1) {
-            image[pix * 3 + 0] = color1.x;
-            image[pix * 3 + 1] = color1.y;
-            image[pix * 3 + 2] = color1.z;
-        }
-        if (kMode != 0) expected[pix] = depth1;
-        trans[pix] = T1;
-    }
+    writePixel<kMode>(x0, y0, color0, pixel0);
+    writePixel<kMode>(x1, y1, color1, pixel1);
 }
 
 [shader("compute")]

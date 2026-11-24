@@ -6,7 +6,9 @@ static const int kGridL = 8;
 static const int kGridH = 16;
 static const int kGridW = 16;
 static const int kGridCell = 12 * kGridL * kGridH * kGridW;
-static const float kGradScale = 100000.0;
+static const float kMinAlpha = 1.0 / 255.0;
+static const float kMaxAlpha = 0.999;
+static const float kMinTransmittance = 1.0 / 255.0;
 
 struct Gauss {
     float4 meanOp;
@@ -20,6 +22,33 @@ struct Splat2D {
     float4 conicAlpha;
     float4 colorAlive;
 };
+
+struct PixelBlend {
+    float transmittance;
+    int end; // Exclusive end in the sorted intersections; zero for an empty pixel.
+    float depth;
+};
+
+float splatAlpha(Splat2D s, float2 delta, out float gaussian) {
+    float q = s.conicAlpha.x * delta.x * delta.x +
+              2.0 * s.conicAlpha.y * delta.x * delta.y +
+              s.conicAlpha.z * delta.y * delta.y;
+    gaussian = q >= 0.0 && q <= 12.0 ? exp(-0.5 * q) : 0.0;
+    return min(kMaxAlpha, s.conicAlpha.w * gaussian);
+}
+
+// Add a float through its uint bits using the integer atomics of Vulkan 1.1.
+void addFloat(RWStructuredBuffer<uint> dest, int index, float value) {
+    if (value == 0.0) return;
+    uint previous;
+    InterlockedOr(dest[index], 0u, previous);
+    uint expected;
+    do {
+        expected = previous;
+        InterlockedCompareExchange(dest[index], expected,
+                                   asuint(asfloat(expected) + value), previous);
+    } while (previous != expected);
+}
 
 struct Key64 {
     uint depth;
@@ -41,6 +70,28 @@ float3x3 quatMat(float4 q) {
         1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
         2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
         2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y));
+}
+
+float3x3 cameraCovariance(Gauss g, float3x3 worldToCamera) {
+    float3 s = exp(clamp(g.scalePad.xyz, -12.0, 4.0));
+    float3x3 scale = float3x3(s.x, 0, 0, 0, s.y, 0, 0, 0, s.z);
+    float3x3 transform = mul(mul(worldToCamera, quatMat(g.quat)), scale);
+    return mul(transform, transpose(transform));
+}
+
+bool projectConic(float3x3 covariance, float3 cam, float2 focal, out float3 conic) {
+    float invZ = 1.0 / cam.z;
+    float2 f = focal * invZ;
+    float3 jx = float3(f.x, 0.0, -f.x * cam.x * invZ);
+    float3 jy = float3(0.0, f.y, -f.y * cam.y * invZ);
+    float3 covX = mul(covariance, jx);
+    float3 covY = mul(covariance, jy);
+    float xx = max(dot(jx, covX), 0.0) + 0.3;
+    float xy = dot(jx, covY);
+    float yy = max(dot(jy, covY), 0.0) + 0.3;
+    float det = xx * yy - xy * xy;
+    conic = float3(yy, -xy, xx) / max(det, 1e-6);
+    return det >= 1e-6;
 }
 
 float sigmoid(float x) {

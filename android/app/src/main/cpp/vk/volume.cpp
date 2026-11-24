@@ -10,6 +10,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -1198,43 +1200,90 @@ void invalidateHost(VkCore* core, const Buffer& buf) {
     vkInvalidateMappedMemoryRanges(core->device, 1, &range);
 }
 
-// Measured triangles only. Frontier vertices have alpha 0 and are not a surface to train.
-void appendMeasured(const uint8_t* bytes, uint32_t n, std::vector<float>& interleaved, int cap) {
-    for (uint32_t v = 0; v + 2 < n; v += 3) {
-        if (static_cast<int>(interleaved.size() / 9) + 3 > cap) return;
-        float p[3][3];
-        uint8_t rgba[3][4];
-        bool keep = true;
-        for (int k = 0; k < 3; ++k) {
-            const uint8_t* src = bytes + static_cast<size_t>(v + k) * 16;
-            std::memcpy(p[k], src, 12);
-            std::memcpy(rgba[k], src + 12, 4);
-            if (rgba[k][3] < 128) keep = false;
+// Weld shared marching-cubes vertices before spending the Gaussian budget.
+class MeshSeed {
+    using Position = std::array<double, 3>;
+    struct PositionHash {
+        size_t operator()(const Position& position) const {
+            size_t hash = 0;
+            for (double axis : position) {
+                hash ^= std::hash<double>{}(axis) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+            }
+            return hash;
         }
-        if (!keep) continue;
-        float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
-        float e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
-        float nx = e1[1] * e2[2] - e1[2] * e2[1];
-        float ny = e1[2] * e2[0] - e1[0] * e2[2];
-        float nz = e1[0] * e2[1] - e1[1] * e2[0];
-        float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-        if (len <= 1e-8f) continue;
-        nx /= len;
-        ny /= len;
-        nz /= len;
-        for (int k = 0; k < 3; ++k) {
-            interleaved.push_back(p[k][0]);
-            interleaved.push_back(p[k][1]);
-            interleaved.push_back(p[k][2]);
-            interleaved.push_back(nx);
-            interleaved.push_back(ny);
-            interleaved.push_back(nz);
-            interleaved.push_back(rgba[k][0] / 255.f);
-            interleaved.push_back(rgba[k][1] / 255.f);
-            interleaved.push_back(rgba[k][2] / 255.f);
+    };
+
+    std::vector<float>& vertices;
+    std::unordered_map<Position, size_t, PositionHash> indices;
+    std::vector<uint32_t> samples;
+    const size_t cap;
+    const double precision;
+
+public:
+    MeshSeed(std::vector<float>& vertices, float voxel, int cap)
+        : vertices(vertices), cap(std::max(3, cap)), precision(1.0 / std::max(1e-6, voxel * 1e-3)) {}
+
+    bool full() const { return samples.size() >= cap; }
+
+    void append(const uint8_t* bytes, uint32_t count) {
+        for (uint32_t v = 0; v + 2 < count; v += 3) {
+            float p[3][3];
+            const uint8_t* colors[3];
+            bool measured = true;
+            for (int k = 0; k < 3; ++k) {
+                const uint8_t* src = bytes + static_cast<size_t>(v + k) * 16;
+                std::memcpy(p[k], src, sizeof(p[k]));
+                colors[k] = src + 12;
+                measured &= src[15] >= 128;
+            }
+            if (!measured) continue;
+            float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
+            float e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
+            float normal[3] = {
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            };
+            const float length = std::hypot(normal[0], normal[1], normal[2]);
+            if (!std::isfinite(length) || length <= 1e-8f) continue;
+            for (float& axis : normal) axis /= length;
+            for (int k = 0; k < 3; ++k) {
+                const Position key = {std::round(p[k][0] * precision),
+                                      std::round(p[k][1] * precision),
+                                      std::round(p[k][2] * precision)};
+                auto found = indices.find(key);
+                if (found == indices.end()) {
+                    if (full()) continue;
+                    found = indices.emplace(key, samples.size()).first;
+                    samples.push_back(0);
+                    vertices.insert(vertices.end(), {p[k][0], p[k][1], p[k][2], 0, 0, 0, 0, 0, 0});
+                }
+                const size_t index = found->second;
+                float* vertex = vertices.data() + index * 9;
+                for (int axis = 0; axis < 3; ++axis) {
+                    vertex[3 + axis] += normal[axis];
+                    vertex[6 + axis] += colors[k][axis] / 255.f;
+                }
+                ++samples[index];
+            }
         }
     }
-}
+
+    int finish() {
+        for (size_t i = 0; i < samples.size(); ++i) {
+            float* vertex = vertices.data() + i * 9;
+            const float length = std::hypot(vertex[3], vertex[4], vertex[5]);
+            if (length > 1e-8f) {
+                for (int axis = 0; axis < 3; ++axis) vertex[3 + axis] /= length;
+            } else {
+                vertex[3] = vertex[4] = 0.f;
+                vertex[5] = 1.f;
+            }
+            for (int channel = 0; channel < 3; ++channel) vertex[6 + channel] /= samples[i];
+        }
+        return static_cast<int>(samples.size());
+    }
+};
 
 } // namespace
 
@@ -1339,8 +1388,8 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel, int cap) 
     auto* draw = static_cast<const uint32_t*>(counts.mapped);
     int live = 0;
     uint32_t raw = 0;
-    if (cap < 3) cap = 3;
-    for (int slot = 0; slot < static_cast<int>(chunks.size()) && static_cast<int>(interleaved.size() / 9) < cap; ++slot) {
+    MeshSeed seed(interleaved, voxel, cap);
+    for (int slot = 0; slot < static_cast<int>(chunks.size()) && !seed.full(); ++slot) {
         if (!chunks[slot].live) continue;
         live++;
         uint32_t n = draw[static_cast<size_t>(slot) * 4];
@@ -1357,11 +1406,11 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel, int cap) 
         });
         if (!copied) continue;
         invalidateHost(core, one);
-        appendMeasured(static_cast<const uint8_t*>(one.mapped), n, interleaved, cap);
+        seed.append(static_cast<const uint8_t*>(one.mapped), n);
     }
     core->destroy(one);
     core->destroy(counts);
-    const int kept = static_cast<int>(interleaved.size() / 9);
+    const int kept = seed.finish();
     if (kept < 3) LOGE("surface copy kept %d of %u verts from %d chunks", kept, raw, live);
     else LOGI("surface copy %d verts", kept);
     return kept;
@@ -1404,7 +1453,6 @@ int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, floa
         std::fclose(in);
         return 0;
     }
-    if (cap < 3) cap = 3;
     voxel = header.voxel;
     std::vector<float> xyz(static_cast<size_t>(header.verts) * 3);
     std::vector<uint8_t> rgb(static_cast<size_t>(header.verts) * 3);
@@ -1415,7 +1463,8 @@ int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, floa
             return 0;
         }
     }
-    for (int face = 0; face < header.faces && static_cast<int>(interleaved.size() / 9) + 3 <= cap; ++face) {
+    MeshSeed seed(interleaved, voxel, cap);
+    for (int face = 0; face < header.faces; ++face) {
         uint8_t n = 0;
         int idx[3]{};
         if (std::fread(&n, 1, 1, in) != 1 || n != 3 || std::fread(idx, 4, 3, in) != 3) break;
@@ -1429,10 +1478,10 @@ int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, floa
             std::memcpy(tri + k * 16 + 12, rgb.data() + static_cast<size_t>(idx[k]) * 3, 3);
             tri[k * 16 + 15] = 255;
         }
-        appendMeasured(tri, 3, interleaved, cap);
+        seed.append(tri, 3);
     }
     std::fclose(in);
-    const int kept = static_cast<int>(interleaved.size() / 9);
+    const int kept = seed.finish();
     if (kept < 3) LOGE("mesh file seed kept %d", kept);
     else LOGI("mesh file seed %d verts", kept);
     return kept;

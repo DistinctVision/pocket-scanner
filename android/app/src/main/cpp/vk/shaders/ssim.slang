@@ -72,7 +72,8 @@ void ssimForward(uint3 tid : SV_DispatchThreadID) {
                 xy += w * a * b;
             }
         }
-        float s1 = max(x2 - mu1 * mu1, 0.0);
+        float variance1 = x2 - mu1 * mu1;
+        float s1 = max(variance1, 0.0);
         float s2 = max(y2 - mu2 * mu2, 0.0);
         float s12 = xy - mu1 * mu2;
         float A = 2.0 * mu1 * mu2 + kC1;
@@ -82,7 +83,7 @@ void ssimForward(uint3 tid : SV_DispatchThreadID) {
         float den = B * D;
         float ssim = A * C / den;
         float dMu = ((2.0 * mu2 * C) * den - A * C * (2.0 * mu1 * D)) / (den * den);
-        float dS1 = -(A * C * B) / (den * den);
+        float dS1 = variance1 > 0.0 ? -(A * C * B) / (den * den) : 0.0;
         float dS12 = (2.0 * A * den) / (den * den);
         dMu += dS1 * (-2.0 * mu1) + dS12 * (-mu2);
         int base = (pixId * 3 + c) * 4;

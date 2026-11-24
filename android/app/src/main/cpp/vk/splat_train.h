@@ -32,12 +32,11 @@ struct SplatHyper {
     int densifyFrom = 500;
     int densifyUntil = 15000;
     int densifyInterval = 100;
-    float gradThreshold = 1000.f;
+    float gradThreshold = 2e-4f;
     float percentDense = 0.01f;
     float pruneScale = 0.1f;
     float minOpacity = 0.005f;
     float splitFactor = 1.6f;
-    float cloneShift = 0.5f;
     int opacityResetEvery = 3000;
     float opacityReset = 0.01f;
     int minKeep = 64;
@@ -108,6 +107,7 @@ private:
     int tilesY = 0;
     int gaussStep = 0;
     int gridStep = 0;
+    std::vector<int> gridViewSteps;
     int budget = 0;
     int capacity = 0;
     int meanSteps = 1;
