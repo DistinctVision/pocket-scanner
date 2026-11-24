@@ -32,7 +32,7 @@ struct SplatHyper {
     int densifyFrom = 500;
     int densifyUntil = 15000;
     int densifyInterval = 100;
-    float gradThreshold = 1.f;
+    float gradThreshold = 1000.f;
     float percentDense = 0.01f;
     float pruneScale = 0.1f;
     float minOpacity = 0.005f;
