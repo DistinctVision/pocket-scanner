@@ -182,19 +182,31 @@ JNIEXPORT void JNICALL Java_com_pocketscanner_capture_VkPreview_nativeDropQueue(
 }
 
 JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptureSeed(
-    JNIEnv*, jobject, jlong handle, jint cap) {
+    JNIEnv*, jobject, jlong handle, jint cap, jboolean collectCoverage) {
     auto* preview = reinterpret_cast<Preview*>(handle);
-    return preview != nullptr && preview->captureSeed(cap) ? JNI_TRUE : JNI_FALSE;
+    return preview != nullptr && preview->captureSeed(cap, collectCoverage == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_pocketscanner_capture_VkPreview_nativeCaptureSeedFromFile(
-    JNIEnv* env, jobject, jlong handle, jstring path, jint cap) {
+    JNIEnv* env, jobject, jlong handle, jstring path, jint cap, jboolean collectCoverage) {
     auto* preview = reinterpret_cast<Preview*>(handle);
     if (preview == nullptr || path == nullptr) return JNI_FALSE;
     const char* chars = env->GetStringUTFChars(path, nullptr);
-    const bool ok = chars != nullptr && preview->captureSeedFromFile(chars, cap);
+    const bool ok = chars != nullptr && preview->captureSeedFromFile(chars, cap, collectCoverage == JNI_TRUE);
     if (chars != nullptr) env->ReleaseStringUTFChars(path, chars);
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jfloatArray JNICALL Java_com_pocketscanner_capture_VkPreview_nativeTakeSeedCoverage(
+    JNIEnv* env, jobject, jlong handle) {
+    auto* preview = reinterpret_cast<Preview*>(handle);
+    if (preview == nullptr) return nullptr;
+    const auto samples = preview->takeSeedCoverage();
+    if (samples.empty()) return nullptr;
+    const auto size = static_cast<jsize>(samples.size());
+    jfloatArray result = env->NewFloatArray(size);
+    if (result != nullptr) env->SetFloatArrayRegion(result, 0, size, samples.data());
+    return result;
 }
 
 JNIEXPORT jstring JNICALL Java_com_pocketscanner_capture_VkPreview_nativeSplatError(JNIEnv* env, jobject, jlong handle) {

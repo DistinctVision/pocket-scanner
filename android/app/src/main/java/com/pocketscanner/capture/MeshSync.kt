@@ -45,6 +45,7 @@ data class ScanSettings(
     val videoSeconds: Int = 10,
     val densifyInterval: Int = 100,
     val gradThreshold: Float = 2e-4f,
+    val filterRedundantFrames: Boolean = true,
 ) {
     val integrateHeight: Int get() = integrateWidth * 3 / 4
 

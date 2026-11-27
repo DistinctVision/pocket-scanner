@@ -300,8 +300,9 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeSaveMesh(handle: Long, path: String): Boolean
     private external fun nativeLoadMesh(handle: Long, path: String, depthMeters: Float): Boolean
     private external fun nativeDropQueue(handle: Long)
-    private external fun nativeCaptureSeed(handle: Long, cap: Int): Boolean
-    private external fun nativeCaptureSeedFromFile(handle: Long, path: String, cap: Int): Boolean
+    private external fun nativeCaptureSeed(handle: Long, cap: Int, collectCoverage: Boolean): Boolean
+    private external fun nativeCaptureSeedFromFile(handle: Long, path: String, cap: Int, collectCoverage: Boolean): Boolean
+    private external fun nativeTakeSeedCoverage(handle: Long): FloatArray?
     private external fun nativeSplatError(handle: Long): String
     private external fun nativeSplatHyper(handle: Long): String
     private external fun nativeSeedVoxel(handle: Long): Float
@@ -342,12 +343,16 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         }
     }
 
-    fun captureSeed(cap: Int): Boolean = onGpu(false) { view, handle ->
-        handle != 0L && view.nativeCaptureSeed(handle, cap)
+    fun captureSeed(cap: Int, collectCoverage: Boolean): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeCaptureSeed(handle, cap, collectCoverage)
     }
 
-    fun captureSeedFromFile(path: String, cap: Int): Boolean = onGpu(false) { view, handle ->
-        handle != 0L && view.nativeCaptureSeedFromFile(handle, path, cap)
+    fun captureSeedFromFile(path: String, cap: Int, collectCoverage: Boolean): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeCaptureSeedFromFile(handle, path, cap, collectCoverage)
+    }
+
+    fun takeSeedCoverage(): FloatArray? = onGpu(null) { view, handle ->
+        if (handle == 0L) null else view.nativeTakeSeedCoverage(handle)
     }
 
     fun splatError(): String = onGpu("") { view, handle ->

@@ -956,7 +956,7 @@ internal fun SettingsPanel(
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
     onRefine: (Boolean, Int) -> Unit,
-    onSplatting: (Int, Boolean, Int, Int, Int, Int, Int, Float) -> Unit,
+    onSplatting: (Int, Boolean, Int, Int, Int, Int, Int, Float, Boolean) -> Unit,
     onClose: () -> Unit,
 ) {
     var voxel by remember { mutableIntStateOf(applied.voxelCm) }
@@ -974,6 +974,7 @@ internal fun SettingsPanel(
     var videoSeconds by remember { mutableIntStateOf(applied.videoSeconds) }
     var densifyInterval by remember { mutableIntStateOf(applied.densifyInterval) }
     var gradThreshold by remember { mutableStateOf(applied.gradThreshold) }
+    var filterRedundantFrames by remember { mutableStateOf(applied.filterRedundantFrames) }
     var epochsText by remember { mutableStateOf(applied.epochs.toString()) }
     var densifyText by remember { mutableStateOf(applied.densifyInterval.toString()) }
     var thresholdText by remember { mutableStateOf(formatKnob(applied.gradThreshold)) }
@@ -988,6 +989,7 @@ internal fun SettingsPanel(
             videoSeconds,
             densifyInterval,
             gradThreshold,
+            filterRedundantFrames,
         )
     }
     Column(
@@ -1055,6 +1057,7 @@ internal fun SettingsPanel(
                         videoSeconds = videoSeconds,
                         densifyInterval = densifyInterval,
                         gradThreshold = gradThreshold,
+                        filterRedundantFrames = filterRedundantFrames,
                     ),
                 )
             },
@@ -1143,6 +1146,20 @@ internal fun SettingsPanel(
         ) {
             validationEvery = it.toInt().coerceIn(1, 20)
             pushSplatting()
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Filter redundant frames", style = MaterialTheme.typography.labelLarge)
+            Switch(
+                checked = filterRedundantFrames,
+                onCheckedChange = {
+                    filterRedundantFrames = it
+                    pushSplatting()
+                },
+            )
         }
         LabeledSlider(
             title = "Gaussians",

@@ -1216,16 +1216,19 @@ class MeshSeed {
     std::vector<float>& vertices;
     std::unordered_map<Position, size_t, PositionHash> indices;
     std::vector<uint32_t> samples;
+    std::vector<float>* coverage;
+    std::vector<float> centers;
     const size_t cap;
     const double precision;
 
 public:
-    MeshSeed(std::vector<float>& vertices, float voxel, int cap)
-        : vertices(vertices), cap(std::max(3, cap)), precision(1.0 / std::max(1e-6, voxel * 1e-3)) {}
+    MeshSeed(std::vector<float>& vertices, float voxel, int cap, std::vector<float>* coverage)
+        : vertices(vertices), coverage(coverage), cap(std::max(3, cap)),
+          precision(1.0 / std::max(1e-6, voxel * 1e-3)) {}
 
     bool full() const { return samples.size() >= cap; }
 
-    void append(const uint8_t* bytes, uint32_t count) {
+    void append(const uint8_t* bytes, uint32_t count, bool accumulateSeed = true) {
         for (uint32_t v = 0; v + 2 < count; v += 3) {
             float p[3][3];
             const uint8_t* colors[3];
@@ -1247,18 +1250,28 @@ public:
             const float length = std::hypot(normal[0], normal[1], normal[2]);
             if (!std::isfinite(length) || length <= 1e-8f) continue;
             for (float& axis : normal) axis /= length;
+            if (coverage != nullptr) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    centers.push_back((p[0][axis] + p[1][axis] + p[2][axis]) / 3.f);
+                }
+            }
             for (int k = 0; k < 3; ++k) {
                 const Position key = {std::round(p[k][0] * precision),
                                       std::round(p[k][1] * precision),
                                       std::round(p[k][2] * precision)};
                 auto found = indices.find(key);
                 if (found == indices.end()) {
-                    if (full()) continue;
+                    if (full() && coverage == nullptr) continue;
+                    if (coverage != nullptr) coverage->insert(coverage->end(), p[k], p[k] + 3);
+                    // One sentinel for all unique positions beyond the seed budget.
                     found = indices.emplace(key, samples.size()).first;
-                    samples.push_back(0);
-                    vertices.insert(vertices.end(), {p[k][0], p[k][1], p[k][2], 0, 0, 0, 0, 0, 0});
+                    if (!full()) {
+                        samples.push_back(0);
+                        vertices.insert(vertices.end(), {p[k][0], p[k][1], p[k][2], 0, 0, 0, 0, 0, 0});
+                    }
                 }
                 const size_t index = found->second;
+                if (!accumulateSeed || index == cap) continue;
                 float* vertex = vertices.data() + index * 9;
                 for (int axis = 0; axis < 3; ++axis) {
                     vertex[3 + axis] += normal[axis];
@@ -1270,6 +1283,7 @@ public:
     }
 
     int finish() {
+        if (coverage != nullptr) coverage->insert(coverage->end(), centers.begin(), centers.end());
         for (size_t i = 0; i < samples.size(); ++i) {
             float* vertex = vertices.data() + i * 9;
             const float length = std::hypot(vertex[3], vertex[4], vertex[5]);
@@ -1355,7 +1369,7 @@ void Volume::dropHeavy() {
     ready = false;
 }
 
-int Volume::copySurface(std::vector<float>& interleaved, float& voxel, int cap) const {
+int Volume::copySurface(std::vector<float>& interleaved, float& voxel, int cap, std::vector<float>* coverage) const {
     interleaved.clear();
     voxel = voxelSize;
     if (core == nullptr || vertices.buffer == VK_NULL_HANDLE) return 0;
@@ -1388,8 +1402,9 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel, int cap) 
     auto* draw = static_cast<const uint32_t*>(counts.mapped);
     int live = 0;
     uint32_t raw = 0;
-    MeshSeed seed(interleaved, voxel, cap);
-    for (int slot = 0; slot < static_cast<int>(chunks.size()) && !seed.full(); ++slot) {
+    bool complete = true;
+    MeshSeed seed(interleaved, voxel, cap, coverage);
+    for (int slot = 0; slot < static_cast<int>(chunks.size()) && (coverage != nullptr || !seed.full()); ++slot) {
         if (!chunks[slot].live) continue;
         live++;
         uint32_t n = draw[static_cast<size_t>(slot) * 4];
@@ -1404,13 +1419,18 @@ int Volume::copySurface(std::vector<float>& interleaved, float& voxel, int cap) 
             region.size = static_cast<VkDeviceSize>(n) * 16;
             vkCmdCopyBuffer(cmd, vertices.buffer, one.buffer, 1, &region);
         });
-        if (!copied) continue;
+        if (!copied) {
+            complete = false;
+            continue;
+        }
         invalidateHost(core, one);
-        seed.append(static_cast<const uint8_t*>(one.mapped), n);
+        // Later chunks can supply coverage after the live seed's budget is filled.
+        seed.append(static_cast<const uint8_t*>(one.mapped), n, !seed.full());
     }
     core->destroy(one);
     core->destroy(counts);
     const int kept = seed.finish();
+    if (!complete && coverage != nullptr) coverage->clear();
     if (kept < 3) LOGE("surface copy kept %d of %u verts from %d chunks", kept, raw, live);
     else LOGI("surface copy %d verts", kept);
     return kept;
@@ -1442,7 +1462,8 @@ bool readPlyVert(FILE* in, float xyz[3], uint8_t rgb[3]) {
     return std::fread(xyz, 4, 3, in) == 3 && std::fread(rgb, 1, 3, in) == 3;
 }
 
-int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, float& voxel, int cap) const {
+int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, float& voxel, int cap,
+                         std::vector<float>* coverage) const {
     interleaved.clear();
     voxel = 0.f;
     if (path == nullptr) return 0;
@@ -1463,13 +1484,18 @@ int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, floa
             return 0;
         }
     }
-    MeshSeed seed(interleaved, voxel, cap);
+    MeshSeed seed(interleaved, voxel, cap, coverage);
+    bool complete = true;
     for (int face = 0; face < header.faces; ++face) {
         uint8_t n = 0;
         int idx[3]{};
-        if (std::fread(&n, 1, 1, in) != 1 || n != 3 || std::fread(idx, 4, 3, in) != 3) break;
+        if (std::fread(&n, 1, 1, in) != 1 || n != 3 || std::fread(idx, 4, 3, in) != 3) {
+            complete = false;
+            break;
+        }
         if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 || idx[0] >= header.verts || idx[1] >= header.verts ||
             idx[2] >= header.verts) {
+            complete = false;
             continue;
         }
         uint8_t tri[48]{};
@@ -1482,6 +1508,7 @@ int Volume::readMeshSeed(const char* path, std::vector<float>& interleaved, floa
     }
     std::fclose(in);
     const int kept = seed.finish();
+    if (!complete && coverage != nullptr) coverage->clear();
     if (kept < 3) LOGE("mesh file seed kept %d", kept);
     else LOGI("mesh file seed %d verts", kept);
     return kept;

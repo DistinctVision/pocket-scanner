@@ -868,27 +868,37 @@ bool Preview::loadMesh(const char* path, float depthMeters) {
 
 void Preview::dropQueue() { volume.dropQueue(); }
 
-bool Preview::captureSeed(int cap) {
+bool Preview::captureSeed(int cap, bool collectCoverage) {
     waitInFlight();
     seed.clear();
-    const int count = volume.copySurface(seed, seedVoxelSize, cap);
+    seedCoverage.clear();
+    const int count = volume.copySurface(seed, seedVoxelSize, cap, collectCoverage ? &seedCoverage : nullptr);
     if (count < 3) {
         seed.clear();
         seed.shrink_to_fit();
+        seedCoverage.clear();
         return false;
     }
     return true;
 }
 
-bool Preview::captureSeedFromFile(const char* path, int cap) {
+bool Preview::captureSeedFromFile(const char* path, int cap, bool collectCoverage) {
     seed.clear();
-    const int count = volume.readMeshSeed(path, seed, seedVoxelSize, cap);
+    seedCoverage.clear();
+    const int count = volume.readMeshSeed(path, seed, seedVoxelSize, cap, collectCoverage ? &seedCoverage : nullptr);
     if (count < 3) {
         seed.clear();
         seed.shrink_to_fit();
+        seedCoverage.clear();
         return false;
     }
     return true;
+}
+
+std::vector<float> Preview::takeSeedCoverage() {
+    std::vector<float> samples;
+    samples.swap(seedCoverage);
+    return samples;
 }
 
 void Preview::splatDensity(int interval, float threshold) {

@@ -17,13 +17,16 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.app.NotificationCompat
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.acos
@@ -83,7 +86,7 @@ internal object SplatRuntime {
         val settings = session.scanSettings()
         publish { it.copy(status = "Reading the mesh", epochs = settings.epochs, running = true, runDir = dir.absolutePath) }
         val prepared = try {
-            session.beginSplatting(File(dir, "views"))
+            session.beginSplatting(File(dir, "views"), settings)
         } catch (error: Throwable) {
             android.util.Log.e("pocket-splat", "start", error)
             session.resumeAfterSplat()
@@ -100,7 +103,14 @@ internal object SplatRuntime {
         } else {
             emptyList()
         }
-        val train = if (settings.validation) usable.filter { frame -> validation.none { it.id == frame.id } } else usable
+        val validationIds = validation.mapTo(HashSet()) { it.id }
+        val sourceTrain = usable.filter { it.id !in validationIds }
+        val selection = if (settings.filterRedundantFrames && sourceTrain.isNotEmpty()) {
+            selectFrames(sourceTrain, prepared.coverage)
+        } else {
+            null
+        }
+        val train = selection?.train ?: sourceTrain
         if (train.isEmpty() && validation.isEmpty()) {
             session.resumeAfterSplat()
             fail(context, "No frames to train")
@@ -110,10 +120,11 @@ internal object SplatRuntime {
         val valPasses = if (validation.isEmpty()) 0 else settings.epochs / every
         val meanSteps = (settings.epochs * train.size).coerceAtLeast(1)
         val gridSteps = (meanSteps + valPasses * validation.size).coerceAtLeast(1)
-        writeRun(dir, settings, meanSteps, gridSteps)
-        val viewIndex = usable.mapIndexed { index, frame -> frame.id to index }.toMap()
+        writeRun(dir, settings, meanSteps, gridSteps, sourceTrain.size, train, validation, selection)
+        val droppedIds = selection?.droppedIds.orEmpty().toHashSet()
+        val viewIndex = usable.filter { it.id !in droppedIds }.mapIndexed { index, frame -> frame.id to index }.toMap()
         preview.splatDensity(settings.densifyInterval, settings.gradThreshold)
-        val seeded = preview.splatInitFromSeed(usable.size, width, height, settings.gaussBudget, meanSteps, gridSteps)
+        val seeded = preview.splatInitFromSeed(viewIndex.size, width, height, settings.gaussBudget, meanSteps, gridSteps)
         if (seeded) writeHyper(dir, settings, preview.splatHyperJson())
         if (!seeded) {
             session.resumeAfterSplat()
@@ -188,6 +199,30 @@ internal object SplatRuntime {
             )
         }
         worker = null
+    }
+
+    private fun selectFrames(train: List<TrainFrame>, coverage: FloatArray?): SplatFrameSelector.Selection? {
+        if (stop.get()) return null
+        if (coverage == null || coverage.isEmpty()) {
+            note("Mesh coverage unavailable. Keeping all ${train.size} train views.")
+            return null
+        }
+        publish { it.copy(status = "Checking frame coverage") }
+        val selection = try {
+            SplatFrameSelector.select(train, coverage, stop::get)
+        } catch (error: IOException) {
+            Log.w("pocket-splat", "Frame selection could not read training data", error)
+            null
+        } catch (error: OutOfMemoryError) {
+            Log.w("pocket-splat", "Frame selection exceeded available memory", error)
+            null
+        }
+        if (selection != null) {
+            note("Kept ${selection.train.size} of ${train.size} train views")
+        } else if (!stop.get()) {
+            note("Frame selection unavailable. Keeping all ${train.size} train views.")
+        }
+        return selection
     }
 
     private fun pass(
@@ -330,10 +365,39 @@ internal object SplatRuntime {
         publish { it.copy(log = (it.log + line).takeLast(12)) }
     }
 
-    private fun writeRun(dir: File, settings: ScanSettings, meanSteps: Int, gridSteps: Int) {
-        File(dir, "run.json").writeText(
-            """{"epochs":${settings.epochs},"validation":${settings.validation},"percent":${settings.validationPercent},"every":${settings.validationEvery},"budget":${settings.gaussBudget},"videoSeconds":${settings.videoSeconds},"meanSteps":$meanSteps,"gridSteps":$gridSteps}""",
-        )
+    private fun writeRun(
+        dir: File,
+        settings: ScanSettings,
+        meanSteps: Int,
+        gridSteps: Int,
+        sourceTrainCount: Int,
+        train: List<TrainFrame>,
+        validation: List<TrainFrame>,
+        selection: SplatFrameSelector.Selection?,
+    ) {
+        val filter = JSONObject()
+            .put("enabled", settings.filterRedundantFrames)
+            .put("sourceTrainCount", sourceTrainCount)
+        if (selection != null) {
+            filter.put("surfaceSamples", selection.surfaceSamples)
+            filter.put("coveredSamples", selection.coveredSamples)
+            filter.put("parallaxSamples", selection.parallaxSamples)
+            filter.put("droppedTrainIds", JSONArray(selection.droppedIds))
+            filter.put("unverifiedTrainIds", JSONArray(selection.unverifiedIds))
+        }
+        val run = JSONObject()
+            .put("epochs", settings.epochs)
+            .put("validation", settings.validation)
+            .put("percent", settings.validationPercent)
+            .put("every", settings.validationEvery)
+            .put("budget", settings.gaussBudget)
+            .put("videoSeconds", settings.videoSeconds)
+            .put("meanSteps", meanSteps)
+            .put("gridSteps", gridSteps)
+            .put("trainIds", JSONArray(train.map { it.id }))
+            .put("valIds", JSONArray(validation.map { it.id }))
+            .put("frameSelection", filter)
+        File(dir, "run.json").writeText(run.toString())
     }
 
     private fun writeHyper(dir: File, settings: ScanSettings, training: String) {

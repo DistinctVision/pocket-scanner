@@ -91,6 +91,7 @@ private data class VideoMode(
 data class SplatPrepared(
     val voxel: Float,
     val frames: List<TrainFrame>,
+    val coverage: FloatArray?,
 )
 
 class RealSenseSession(
@@ -387,6 +388,7 @@ class RealSenseSession(
         videoSeconds: Int,
         densifyInterval: Int,
         gradThreshold: Float,
+        filterRedundantFrames: Boolean,
     ) {
         val share = if (percent == 8 || percent == 10) percent else 5
         val next = settings.get().copy(
@@ -398,6 +400,7 @@ class RealSenseSession(
             videoSeconds = videoSeconds.coerceIn(1, 30),
             densifyInterval = densifyInterval.coerceIn(1, 100_000),
             gradThreshold = if (gradThreshold.isFinite() && gradThreshold >= 0f) gradThreshold else settings.get().gradThreshold,
+            filterRedundantFrames = filterRedundantFrames,
         )
         settings.set(next)
         mesh?.replaceSettings(next)
@@ -475,6 +478,7 @@ class RealSenseSession(
                     gradThreshold = json.optDouble("gradThreshold", 2e-4).toFloat().let { value ->
                         if (value.isFinite() && value >= 0f) value else 2e-4f
                     },
+                    filterRedundantFrames = json.optBoolean("filterRedundantFrames", true),
                 ),
             )
             frontierOn.set(json.optBoolean("frontier", false))
@@ -501,6 +505,7 @@ class RealSenseSession(
         json.put("videoSeconds", scan.videoSeconds)
         json.put("densifyInterval", scan.densifyInterval)
         json.put("gradThreshold", scan.gradThreshold.toDouble())
+        json.put("filterRedundantFrames", scan.filterRedundantFrames)
         json.put("frontier", frontierOn.get())
         try {
             settingsFile().writeText(json.toString())
@@ -514,22 +519,25 @@ class RealSenseSession(
     }
 
     /** Copies color views, reads the mesh, then stops the camera and frees the volume. */
-    fun beginSplatting(dir: File): SplatPrepared {
-        val cap = settings.get().gaussBudget
+    fun beginSplatting(dir: File, config: ScanSettings): SplatPrepared {
+        val cap = config.gaussBudget
+        val collectCoverage = config.filterRedundantFrames
         val meshFile = File(scanDir, "mesh.ply")
         val haveSeed =
-            (meshFile.isFile && meshFile.length() > 16 && preview?.captureSeedFromFile(meshFile.absolutePath, cap) == true) ||
-                preview?.captureSeed(cap) == true
+            (meshFile.isFile && meshFile.length() > 16 &&
+                preview?.captureSeedFromFile(meshFile.absolutePath, cap, collectCoverage) == true) ||
+                preview?.captureSeed(cap, collectCoverage) == true
         if (!haveSeed) error("The mesh could not be read")
         val frames = mesh?.exportTraining(dir) ?: error("No scan to train")
         if (frames.isEmpty()) error("No full frames to train")
         val seeded = preview?.seedVoxel() ?: 0f
         haltCapture()
         preview?.dropMesh()
+        val coverage = if (collectCoverage) preview?.takeSeedCoverage() else null
         volumeConfigured.set(false)
         publish { it.copy(phase = "idle", framesOnDisk = false, saveLine = "", refineDetail = "") }
-        val voxel = if (seeded > 1e-4f) seeded else settings.get().reviewVoxelCm / 100f
-        return SplatPrepared(voxel, frames)
+        val voxel = if (seeded > 1e-4f) seeded else config.reviewVoxelCm / 100f
+        return SplatPrepared(voxel, frames, coverage)
     }
 
     fun resumeAfterSplat() {

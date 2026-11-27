@@ -36,8 +36,9 @@ struct Preview {
     void dropQueue();
     void dropMesh();
     // Keeps the measured surface in this process. The Java heap never sees the vertices.
-    bool captureSeed(int cap);
-    bool captureSeedFromFile(const char* path, int cap);
+    bool captureSeed(int cap, bool collectCoverage);
+    bool captureSeedFromFile(const char* path, int cap, bool collectCoverage);
+    std::vector<float> takeSeedCoverage();
     const char* splatError() const;
     const char* splatHyper() const;
     float seedVoxel() const { return seedVoxelSize; }
@@ -86,6 +87,7 @@ private:
     SplatTrainer* splat = nullptr;
     std::vector<float> seed;
     float seedVoxelSize = 0.f;
+    std::vector<float> seedCoverage;
     VkDescriptorSetLayout graphicsSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout graphicsLayout = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;
