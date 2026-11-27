@@ -20,6 +20,13 @@ class View:
     depth: str
 
 
+@dataclass(frozen=True)
+class TrainingMesh:
+    seed: np.ndarray
+    voxel: float
+    coverage_points: np.ndarray | None
+
+
 class Capture:
     def __init__(self, archive: ZipFile):
         self.archive = archive
@@ -50,28 +57,45 @@ class Capture:
             view for view in self.views if (view.width, view.height) == (self.width, self.height)
         ]
 
-    def images(self, view: View) -> tuple[np.ndarray, np.ndarray]:
+    def color(self, view: View) -> Image.Image:
         with self.archive.open(view.color) as stream, Image.open(stream) as image:
             if image.size != (view.width, view.height):
                 raise ValueError(f"Unexpected PNG dimensions for frame {view.id}")
-            rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / np.float32(255)
+            return image.convert("RGB")
+
+    def depth(self, view: View) -> np.ndarray:
         raw = self.archive.read(view.depth)
         if len(raw) != view.height * view.width * 2:
             raise ValueError(f"Unexpected Z16 size for frame {view.id}")
         depth = np.frombuffer(raw, dtype="<u2").astype(np.float32) / self.depth_scale
-        return rgb, depth.reshape(view.height, view.width)
+        return depth.reshape(view.height, view.width)
+
+    def images(self, view: View) -> tuple[np.ndarray, np.ndarray]:
+        rgb = np.asarray(self.color(view), dtype=np.float32) / np.float32(255)
+        return rgb, self.depth(view)
 
     def seed(self, budget: int, mesh: Path | None = None):
+        loaded = self.training_mesh(budget, mesh)
+        return loaded.seed, loaded.voxel
+
+    def training_mesh(
+        self, budget: int, mesh: Path | None = None, *, include_coverage: bool = False,
+    ) -> TrainingMesh:
         if mesh is not None:
             with mesh.open("rb") as stream:
-                return mesh_seed(stream, budget)
+                return read_training_mesh(stream, budget, include_coverage=include_coverage)
         if "mesh.ply" not in self.archive.namelist():
             raise ValueError("The package has no mesh.ply. Export the mesh in Android and pass --mesh.")
         with self.archive.open("mesh.ply") as stream:
-            return mesh_seed(stream, budget)
+            return read_training_mesh(stream, budget, include_coverage=include_coverage)
 
 
 def mesh_seed(stream, budget: int):
+    mesh = read_training_mesh(stream, budget)
+    return mesh.seed, mesh.voxel
+
+
+def read_training_mesh(stream, budget: int, *, include_coverage: bool = False) -> TrainingMesh:
     """Port of Volume::readMeshSeed and MeshSeed for the app's binary PLY."""
     if stream.readline().strip() != b"ply":
         raise ValueError("Expected a Pocket Scanner PLY mesh")
@@ -137,4 +161,9 @@ def mesh_seed(stream, budget: int):
     valid = length > 1e-8
     seed[valid, 3:6] /= length[valid, None]
     seed[~valid, 3:6] = (0, 0, 1)
-    return seed, voxel
+    coverage = None
+    if include_coverage:
+        # Evaluate the measured surface before the Gaussian budget truncates it.
+        centers = xyz.reshape(-1, 3, 3).mean(axis=1)
+        coverage = np.concatenate((xyz[first[order]], centers))
+    return TrainingMesh(seed, voxel, coverage)

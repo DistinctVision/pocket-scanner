@@ -2,13 +2,65 @@
 
 import unittest
 from dataclasses import replace
+from io import BytesIO
+from struct import pack
 
 import numpy as np
 
-from .capture import View
+from .capture import View, read_training_mesh
+from .frame_selection import Observation, observe_depth, prune_views
 from .gpu import GRID_CELL, Gpu, Rasterizer, read_buffer
 from .population import Hyper, apply_density, density_plan, logit, seed_gaussians
 from .trainer import Trainer
+
+
+class FrameSelectionTest(unittest.TestCase):
+    def test_depth_support_rejects_occluded_and_unknown_surface_samples(self):
+        pose = np.eye(4, dtype=np.float32)
+        pose[0, 3] = 0.5
+        view = View(1, 32, 32, pose, (20, 20, 16, 16), "", "")
+        depth = np.ones((32, 32), dtype=np.float32)
+        depth[15:18, 22:25] = 0
+        points = np.array(
+            [[.5, 0, 1], [.5, 0, 1.3], [.85, 0, 1], [3, 0, 1]], dtype=np.float32,
+        )
+        indices, distances, agreement = observe_depth(view, depth, points)
+        np.testing.assert_array_equal(indices, [0])
+        np.testing.assert_array_equal(distances, [1])
+        self.assertEqual(agreement, 0.5)
+
+    def test_redundancy_preserves_the_only_translated_view_and_unverified_views(self):
+        points = np.array([[0, 0, 1], [0, .2, 1]], dtype=np.float32)
+        positions = np.array([[0, 0, 0], [0, 0, 0], [.12, 0, 0], [0, .2, 0], [0, 0, 0]], dtype=np.float32)
+        observed = ([0], [0], [0], [1], [])
+        observations = [
+            Observation(
+                np.array(indices, dtype=np.intp),
+                np.linalg.norm(points[indices] - positions[i], axis=1), 1.0, 1.0,
+            )
+            for i, indices in enumerate(observed)
+        ]
+        result = prune_views(len(points), positions, observations, [2, 1, 0, 3, 4])
+        self.assertEqual(result.kept_indices, (0, 2, 3, 4))
+        self.assertEqual(result.dropped_indices, (1,))
+        self.assertEqual(result.unverified_indices, (4,))
+        self.assertEqual(result.covered_samples, 2)
+        self.assertEqual(result.parallax_samples, 1)
+
+    def test_coverage_samples_are_independent_of_the_gaussian_budget(self):
+        header = (
+            b"ply\nformat binary_little_endian 1.0\ncomment voxel 0.08\n"
+            b"element vertex 4\nproperty float x\nproperty float y\nproperty float z\n"
+            b"property uchar red\nproperty uchar green\nproperty uchar blue\n"
+            b"element face 2\nproperty list uchar int vertex_indices\nend_header\n"
+        )
+        vertices = b"".join(pack("<3f3B", x, y, 1, 0, 0, 0) for x, y in ((0, 0), (1, 0), (0, 1), (1, 1)))
+        faces = pack("<B3iB3i", 3, 0, 1, 2, 3, 1, 3, 2)
+        mesh = read_training_mesh(BytesIO(header + vertices + faces), 3, include_coverage=True)
+        self.assertEqual(len(mesh.seed), 3)
+        self.assertEqual(len(mesh.coverage_points), 6)
+        np.testing.assert_array_equal(mesh.coverage_points[3], [1, 1, 1])
+        np.testing.assert_allclose(mesh.coverage_points[4:], [[1/3, 1/3, 1], [2/3, 2/3, 1]])
 
 
 class DensityTest(unittest.TestCase):

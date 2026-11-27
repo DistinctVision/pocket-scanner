@@ -13,6 +13,7 @@ from zipfile import BadZipFile, ZipFile
 from PIL import Image
 
 from .capture import Capture
+from .frame_selection import select_training_frames
 from .gpu import Gpu
 from .population import Hyper, seed_gaussians
 from .trainer import Metrics, Trainer
@@ -40,6 +41,10 @@ def options():
     parser.add_argument("--validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--validation-percent", choices=(5, 8, 10), type=int, default=5)
     parser.add_argument("--validation-every", type=at_least(1), default=5)
+    parser.add_argument(
+        "--filter-redundant-frames", action=argparse.BooleanOptionalAction, default=True,
+        help="discard train views whose measured coverage and parallax are already represented (default: enabled)",
+    )
     parser.add_argument("--max-frames", type=at_least(1), help="debug with the first N usable views by ID")
     parser.add_argument("--hyper", type=Path, help="JSON object with overrides named as in SplatHyper")
     parser.add_argument("--tensorboard", action="store_true", help="write per-view and per-epoch scalars")
@@ -147,18 +152,42 @@ def run(args):
         step = math.floor(100 / args.validation_percent + 0.5) if args.validation else len(views) + 1
         train = [(i, view) for i, view in views if not args.validation or i % step]
         val = [(i, view) for i, view in views if args.validation and i % step == 0]
+        selection_info = {"enabled": args.filter_redundant_frames, "sourceTrainCount": len(train)}
+        mesh = capture.training_mesh(
+            args.budget, args.mesh, include_coverage=args.filter_redundant_frames and bool(train),
+        )
+        if mesh.coverage_points is not None:
+            logger.info("Checking measured coverage and parallax for %d train views", len(train))
+            selection = select_training_frames(capture, [view for _, view in train], mesh.coverage_points)
+            selection_info.update({
+                "surfaceSamples": len(mesh.coverage_points),
+                "coveredSamples": selection.covered_samples,
+                "parallaxSamples": selection.parallax_samples,
+                "droppedTrainIds": [train[i][1].id for i in selection.dropped_indices],
+                "unverifiedTrainIds": [train[i][1].id for i in selection.unverified_indices],
+            })
+            train = [train[i] for i in selection.kept_indices]
+            logger.info(
+                "Kept %d/%d train views, with measured coverage at %d mesh samples and parallax at %d",
+                len(train), selection_info["sourceTrainCount"], selection.covered_samples,
+                selection.parallax_samples,
+            )
+        # Allocate grids only for the views used by the run, in source order.
+        grid_indices = {index: i for i, index in enumerate(sorted(index for index, _ in train + val))}
+        train = [(grid_indices[index], view) for index, view in train]
+        val = [(grid_indices[index], view) for index, view in val]
         mean_steps = max(1, args.epochs * len(train))
         grid_steps = mean_steps + (args.epochs // args.validation_every) * len(val)
-        seed, voxel = capture.seed(args.budget, args.mesh)
-        gauss, extent = seed_gaussians(seed, voxel, hyper)
-        del seed
+        voxel = mesh.voxel
+        gauss, extent = seed_gaussians(mesh.seed, voxel, hyper)
+        del mesh
         logger.info(
             "%s: %d train, %d validation, %d×%d, %d seed Gaussians, voxel %.3f m",
             args.scan.name, len(train), len(val), capture.width, capture.height, len(gauss), voxel,
         )
         gpu = Gpu(args.backend)
         trainer = Trainer(
-            gpu, gauss, extent, capture.width, capture.height, len(views),
+            gpu, gauss, extent, capture.width, capture.height, len(grid_indices),
             hyper, args.budget, mean_steps, grid_steps,
         )
         del gauss
@@ -171,6 +200,7 @@ def run(args):
             "every": args.validation_every, "budget": args.budget, "seedCount": trainer.count,
             "meanSteps": mean_steps, "gridSteps": grid_steps,
             "trainIds": [view.id for _, view in train], "valIds": [view.id for _, view in val],
+            "frameSelection": selection_info,
         })
         write_json(args.output / "hyperparameters.json", asdict(hyper) | {
             "budget": args.budget, "extent": extent, "meanSteps": mean_steps, "gridSteps": grid_steps,
