@@ -14,10 +14,10 @@ StructuredBuffer<uint> ids;
 StructuredBuffer<float> imageGrad;
 
 [[vk::binding(4, 0)]]
-RWStructuredBuffer<int> accum;
+RWStructuredBuffer<uint> accum;
 
 [[vk::binding(5, 0)]]
-StructuredBuffer<float> trans;
+StructuredBuffer<PixelBlend> pixels;
 
 [[vk::binding(6, 0)]]
 StructuredBuffer<float> depthGrad;
@@ -35,35 +35,40 @@ BackPush pc;
 
 groupshared uint batchId[128];
 groupshared Splat2D batch[128];
-groupshared int tileGrad[128 * 10];
-
-int quantize(float value) {
-    return int(clamp(value * kGradScale, -2000000000.0, 2000000000.0));
-}
+groupshared uint tileGrad[128 * 10];
 
 void addLocal(int slot, int param, float value) {
-    int q = quantize(value);
-    if (q != 0) InterlockedAdd(tileGrad[slot * 10 + param], q);
+    if (value == 0.0) return;
+    int index = slot * 10 + param;
+    uint previous;
+    InterlockedOr(tileGrad[index], 0u, previous);
+    uint expected;
+    do {
+        expected = previous;
+        InterlockedCompareExchange(tileGrad[index], expected,
+                                   asuint(asfloat(expected) + value), previous);
+    } while (previous != expected);
 }
 
-void shadeBack<let kMode : int>(int x, int y, inout float T, inout float3 behind, inout float behindZ, int n) {
-    if (x >= pc.width || y >= pc.height) return;
+void shadeBack<let kMode : int>(int x, int y, PixelBlend pixel, inout float T,
+                                inout float3 behind, inout float behindZ, int base, int n) {
+    n = min(n, pixel.end - base);
+    if (n <= 0) return;
     int pix = y * pc.width + x;
     float3 dC = 0;
     float dZpix = 0;
     // Read in every specialization so the push block stays the same size.
     float weight = pc.depthWeight;
     if (kMode != 1) dC = float3(imageGrad[pix * 3], imageGrad[pix * 3 + 1], imageGrad[pix * 3 + 2]);
-    if (kMode != 0) dZpix = depthGrad[pix] * weight;
+    if (kMode != 0) dZpix = depthGrad[pix] * weight / (1.0 - pixel.transmittance);
     float2 p = float2(float(x), float(y)) + 0.5;
     for (int i = n - 1; i >= 0; --i) {
         Splat2D s = batch[i];
         float2 d = p - s.xyDepthRadius.xy;
-        float q = s.conicAlpha.x * d.x * d.x + 2.0 * s.conicAlpha.y * d.x * d.y + s.conicAlpha.z * d.y * d.y;
-        if (q > 12.0) continue;
-        float a = s.conicAlpha.w * exp(-0.5 * q);
-        if (a < 1.0 / 255.0) continue;
-        float Tbefore = T / max(1.0 - a, 1e-4);
+        float G;
+        float a = splatAlpha(s, d, G);
+        if (a < kMinAlpha) continue;
+        float Tbefore = T / (1.0 - a);
         float dla = 0;
         float3 dColor = 0;
         float dDepth = 0;
@@ -72,33 +77,34 @@ void shadeBack<let kMode : int>(int x, int y, inout float T, inout float3 behind
             dla += dot(dC, dA);
             dColor = dC * (a * Tbefore);
         }
+        // Shifting every contributing depth by the final expected depth
+        // incorporates the derivative of the alpha denominator.
+        float z = s.xyDepthRadius.z - pixel.depth;
         if (kMode != 0) {
-            float z = s.xyDepthRadius.z;
             dla += dZpix * (z - behindZ) * Tbefore;
             dDepth = dZpix * (a * Tbefore);
         }
-        float G = exp(-0.5 * q);
-        float sig = clamp(s.conicAlpha.w, 1e-6, 1.0 - 1e-6);
-        float dG = dla * sig;
-        float dLogit = dla * G * sig * (1.0 - sig);
-        float dQ = dG * G * (-0.5);
-        float ddx = dQ * (2.0 * s.conicAlpha.x * d.x + 2.0 * s.conicAlpha.y * d.y);
-        float ddy = dQ * (2.0 * s.conicAlpha.y * d.x + 2.0 * s.conicAlpha.z * d.y);
-        addLocal(i, 0, -ddx);
-        addLocal(i, 1, -ddy);
-        addLocal(i, 2, dQ * d.x * d.x);
-        addLocal(i, 3, dQ * 2.0 * d.x * d.y);
-        addLocal(i, 4, dQ * d.y * d.y);
+        float sig = s.conicAlpha.w;
+        if (sig * G < kMaxAlpha) {
+            float dQ = -0.5 * dla * sig * G;
+            float ddx = dQ * (2.0 * s.conicAlpha.x * d.x + 2.0 * s.conicAlpha.y * d.y);
+            float ddy = dQ * (2.0 * s.conicAlpha.y * d.x + 2.0 * s.conicAlpha.z * d.y);
+            addLocal(i, 0, -ddx);
+            addLocal(i, 1, -ddy);
+            addLocal(i, 2, dQ * d.x * d.x);
+            addLocal(i, 3, dQ * 2.0 * d.x * d.y);
+            addLocal(i, 4, dQ * d.y * d.y);
+            addLocal(i, 8, dla * G * sig * (1.0 - sig));
+        }
         if (kMode != 1) {
             addLocal(i, 5, dColor.x);
             addLocal(i, 6, dColor.y);
             addLocal(i, 7, dColor.z);
         }
-        addLocal(i, 8, dLogit);
         if (kMode != 0) addLocal(i, 9, dDepth);
         T = Tbefore;
         if (kMode != 1) behind = s.colorAlive.xyz * a + behind * (1.0 - a);
-        if (kMode != 0) behindZ = s.xyDepthRadius.z * a + behindZ * (1.0 - a);
+        if (kMode != 0) behindZ = z * a + behindZ * (1.0 - a);
     }
 }
 
@@ -113,8 +119,12 @@ void blendBackOne<let kMode : int>(uint3 gid : SV_GroupID, uint3 gtid : SV_Group
     int y0 = int(gid.y) * kTile + (local0 >> 4);
     int x1 = int(gid.x) * kTile + (local1 & 15);
     int y1 = int(gid.y) * kTile + (local1 >> 4);
-    float T0 = (x0 < pc.width && y0 < pc.height) ? trans[y0 * pc.width + x0] : 1.0;
-    float T1 = (x1 < pc.width && y1 < pc.height) ? trans[y1 * pc.width + x1] : 1.0;
+    PixelBlend pixel0 = (PixelBlend)0;
+    PixelBlend pixel1 = (PixelBlend)0;
+    if (x0 < pc.width && y0 < pc.height) pixel0 = pixels[y0 * pc.width + x0];
+    if (x1 < pc.width && y1 < pc.height) pixel1 = pixels[y1 * pc.width + x1];
+    float T0 = pixel0.transmittance;
+    float T1 = pixel1.transmittance;
     float3 behind0 = 0;
     float3 behind1 = 0;
     float behindZ0 = 0;
@@ -131,15 +141,14 @@ void blendBackOne<let kMode : int>(uint3 gid : SV_GroupID, uint3 gtid : SV_Group
         [unroll]
         for (int k = 0; k < 10; ++k) tileGrad[int(lane) * 10 + k] = 0;
         GroupMemoryBarrierWithGroupSync();
-        shadeBack<kMode>(x0, y0, T0, behind0, behindZ0, n);
-        shadeBack<kMode>(x1, y1, T1, behind1, behindZ1, n);
+        shadeBack<kMode>(x0, y0, pixel0, T0, behind0, behindZ0, cursor, n);
+        shadeBack<kMode>(x1, y1, pixel1, T1, behind1, behindZ1, cursor, n);
         GroupMemoryBarrierWithGroupSync();
         if (int(lane) < n) {
             uint id = batchId[lane];
             [unroll]
             for (int param = 0; param < kParams; ++param) {
-                int q = tileGrad[int(lane) * 10 + param];
-                if (q != 0) InterlockedAdd(accum[id * 12 + param], q);
+                addFloat(accum, int(id) * 12 + param, asfloat(tileGrad[int(lane) * 10 + param]));
             }
         }
         GroupMemoryBarrierWithGroupSync();

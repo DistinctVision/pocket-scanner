@@ -42,6 +42,7 @@ struct Preview {
     const char* splatHyper() const;
     float seedVoxel() const { return seedVoxelSize; }
     int splatGaussianCount() const;
+    void splatDensity(int interval, float threshold);
     bool splatInitFromSeed(int views, int width, int height, int budget, int meanSteps, int gridSteps);
     bool splatInit(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps);
     bool splatStep(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy,

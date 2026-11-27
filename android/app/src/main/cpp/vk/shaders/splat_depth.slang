@@ -1,8 +1,10 @@
+#include "splat_common.slang"
+
 // Inverse-depth L1 on pixels where both the RealSense depth and the expected depth are valid.
 // The stored gradient is d|1/z - 1/gt| / d(z), before the  extent * lambda / N  scale.
 
 [[vk::binding(0, 0)]]
-StructuredBuffer<float> expected;
+StructuredBuffer<PixelBlend> pixels;
 
 [[vk::binding(1, 0)]]
 StructuredBuffer<float> depthGt;
@@ -30,7 +32,7 @@ void depthLoss(uint3 tid : SV_DispatchThreadID) {
     float hits = 0;
     int n = pc.width * pc.height;
     for (int p = int(tid.x); p < n; p += 256) {
-        float pred = expected[p];
+        float pred = pixels[p].depth;
         float gt = depthGt[p];
         float grad = 0;
         if (pred > pc.depthMin && gt > pc.depthMin) {

@@ -22,6 +22,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -89,6 +90,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -954,7 +956,7 @@ internal fun SettingsPanel(
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
     onRefine: (Boolean, Int) -> Unit,
-    onSplatting: (Int, Boolean, Int, Int, Int, Int) -> Unit,
+    onSplatting: (Int, Boolean, Int, Int, Int, Int, Int, Float) -> Unit,
     onClose: () -> Unit,
 ) {
     var voxel by remember { mutableIntStateOf(applied.voxelCm) }
@@ -970,7 +972,24 @@ internal fun SettingsPanel(
     var validationEvery by remember { mutableIntStateOf(applied.validationEvery) }
     var gaussBudget by remember { mutableIntStateOf(applied.gaussBudget) }
     var videoSeconds by remember { mutableIntStateOf(applied.videoSeconds) }
+    var densifyInterval by remember { mutableIntStateOf(applied.densifyInterval) }
+    var gradThreshold by remember { mutableStateOf(applied.gradThreshold) }
+    var epochsText by remember { mutableStateOf(applied.epochs.toString()) }
+    var densifyText by remember { mutableStateOf(applied.densifyInterval.toString()) }
+    var thresholdText by remember { mutableStateOf(formatKnob(applied.gradThreshold)) }
     val scheme = MaterialTheme.colorScheme
+    fun pushSplatting() {
+        onSplatting(
+            epochs,
+            validation,
+            validationPercent,
+            validationEvery,
+            gaussBudget,
+            videoSeconds,
+            densifyInterval,
+            gradThreshold,
+        )
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1034,6 +1053,8 @@ internal fun SettingsPanel(
                         validationEvery = validationEvery,
                         gaussBudget = gaussBudget,
                         videoSeconds = videoSeconds,
+                        densifyInterval = densifyInterval,
+                        gradThreshold = gradThreshold,
                     ),
                 )
             },
@@ -1082,16 +1103,19 @@ internal fun SettingsPanel(
             color = scheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
-        LabeledSlider(
+        NumberField(
             title = "Epochs",
-            value = "$epochs",
             detail = "Training stops after this many passes over the frames.",
-            sliderValue = epochs.toFloat(),
-            range = 1f..500f,
-        ) {
-            epochs = it.toInt().coerceIn(1, 500)
-            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
-        }
+            text = epochsText,
+            keyboard = KeyboardType.Number,
+            onText = { raw ->
+                epochsText = raw.filter { it.isDigit() }.take(3)
+                epochsText.toIntOrNull()?.coerceIn(1, 500)?.let {
+                    epochs = it
+                    pushSplatting()
+                }
+            },
+        )
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1102,13 +1126,13 @@ internal fun SettingsPanel(
                 checked = validation,
                 onCheckedChange = {
                     validation = it
-                    onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
+                    pushSplatting()
                 },
             )
         }
         ChoiceRow("Validation share", listOf(5, 8, 10), validationPercent, { "$it%" }) {
             validationPercent = it
-            onSplatting(epochs, validation, it, validationEvery, gaussBudget, videoSeconds)
+            pushSplatting()
         }
         LabeledSlider(
             title = "Validation interval",
@@ -1118,7 +1142,7 @@ internal fun SettingsPanel(
             range = 1f..20f,
         ) {
             validationEvery = it.toInt().coerceIn(1, 20)
-            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
+            pushSplatting()
         }
         LabeledSlider(
             title = "Gaussians",
@@ -1128,7 +1152,7 @@ internal fun SettingsPanel(
             range = 0.5f..5f,
         ) {
             gaussBudget = (it * 1_000_000f).toInt().coerceIn(500_000, 5_000_000)
-            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
+            pushSplatting()
         }
         LabeledSlider(
             title = "Video",
@@ -1138,9 +1162,69 @@ internal fun SettingsPanel(
             range = 1f..30f,
         ) {
             videoSeconds = it.toInt().coerceIn(1, 30)
-            onSplatting(epochs, validation, validationPercent, validationEvery, gaussBudget, videoSeconds)
+            pushSplatting()
         }
+        NumberField(
+            title = "Densify interval",
+            detail = "Adam steps between clone, split, and prune.",
+            text = densifyText,
+            keyboard = KeyboardType.Number,
+            onText = { raw ->
+                densifyText = raw.filter { it.isDigit() }.take(6)
+                densifyText.toIntOrNull()?.coerceIn(1, 100_000)?.let {
+                    densifyInterval = it
+                    pushSplatting()
+                }
+            },
+        )
+        NumberField(
+            title = "Gradient threshold",
+            detail = "A gaussian grows when its average view-space gradient is above this.",
+            text = thresholdText,
+            keyboard = KeyboardType.Ascii,
+            onText = { raw ->
+                thresholdText = raw.filter { it.isDigit() || it == '.' || it == 'e' || it == 'E' || it == '+' || it == '-' }.take(16)
+                val value = thresholdText.toFloatOrNull()
+                if (value != null && value.isFinite() && value >= 0f) {
+                    gradThreshold = value
+                    pushSplatting()
+                }
+            },
+        )
     }
+}
+
+@Composable
+private fun NumberField(
+    title: String,
+    detail: String,
+    text: String,
+    keyboard: KeyboardType,
+    onText: (String) -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(title, color = scheme.onSurface, style = MaterialTheme.typography.labelLarge)
+        Text(detail, color = scheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        OutlinedTextField(
+            value = text,
+            onValueChange = onText,
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = keyboard),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+private fun formatKnob(value: Float): String {
+    if (!value.isFinite()) return ""
+    val abs = kotlin.math.abs(value)
+    val text = if (abs != 0f && (abs < 1e-3f || abs >= 1e4f)) {
+        String.format(java.util.Locale.US, "%.0e", value)
+    } else {
+        String.format(java.util.Locale.US, "%.8f", value).trimEnd('0').trimEnd('.')
+    }
+    return text.replace("e-0", "e-").replace("e+0", "e+").replace("E-0", "e-").replace("E+0", "e+")
 }
 
 @Composable

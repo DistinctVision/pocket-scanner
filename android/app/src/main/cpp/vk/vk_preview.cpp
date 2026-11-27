@@ -891,6 +891,11 @@ bool Preview::captureSeedFromFile(const char* path, int cap) {
     return true;
 }
 
+void Preview::splatDensity(int interval, float threshold) {
+    if (splat == nullptr) splat = new SplatTrainer(&core);
+    splat->setDensity(interval, threshold);
+}
+
 bool Preview::splatInitFromSeed(int views, int width, int height, int budget, int meanSteps, int gridSteps) {
     if (seed.size() < 27) return false;
     if (splat == nullptr) splat = new SplatTrainer(&core);

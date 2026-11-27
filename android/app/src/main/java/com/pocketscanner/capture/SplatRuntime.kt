@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -111,6 +112,7 @@ internal object SplatRuntime {
         val gridSteps = (meanSteps + valPasses * validation.size).coerceAtLeast(1)
         writeRun(dir, settings, meanSteps, gridSteps)
         val viewIndex = usable.mapIndexed { index, frame -> frame.id to index }.toMap()
+        preview.splatDensity(settings.densifyInterval, settings.gradThreshold)
         val seeded = preview.splatInitFromSeed(usable.size, width, height, settings.gaussBudget, meanSteps, gridSteps)
         if (seeded) writeHyper(dir, settings, preview.splatHyperJson())
         if (!seeded) {
@@ -590,6 +592,8 @@ private class VideoEncoder(private val width: Int, private val height: Int, dest
 }
 
 class TrainService : Service() {
+    private var wake: PowerManager.WakeLock? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -599,7 +603,24 @@ class TrainService : Service() {
         } else {
             startForeground(TrainNotes.ID, notification)
         }
+        if (wake == null) {
+            val power = getSystemService(PowerManager::class.java)
+            @Suppress("DEPRECATION")
+            val level = PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                PowerManager.ON_AFTER_RELEASE
+            wake = power.newWakeLock(level, "pocketscanner:train").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
         return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        wake?.let { if (it.isHeld) it.release() }
+        wake = null
+        super.onDestroy()
     }
 
     companion object {
