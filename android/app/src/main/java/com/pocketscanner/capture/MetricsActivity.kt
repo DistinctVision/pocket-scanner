@@ -175,6 +175,19 @@ private fun RunDetail(dir: File, live: TrainUi, onBack: () -> Unit) {
             LinearProgressIndicator(progress = { live.fraction.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
         }
         MetricColumn(lines = lines, height = 180.dp)
+        pair.second.lastOrNull()?.let { latest ->
+            val mae = latest.depthMae
+            val rmse = latest.depthRmse
+            val coverage = latest.depthCoverage
+            if (mae != null && rmse != null && coverage != null) {
+                Text(
+                    String.format(Locale.US, "Validation depth   MAE %.2f cm   RMSE %.2f cm   Coverage %.1f%%",
+                        mae * 100, rmse * 100, coverage * 100),
+                    color = scheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
         Text("Validation renders", color = scheme.onSurface, style = MaterialTheme.typography.titleSmall)
         if (pictures.isEmpty()) {
             Text("No validation pictures yet", color = scheme.onSurfaceVariant)
@@ -290,7 +303,12 @@ private fun runLine(dir: File): String {
     val valPsnr = if (!validation) "validation off" else held.lastOrNull()?.let { "val %.2f".format(Locale.US, it.psnr) } ?: "val —"
     val epochs = if (planned > 0) "$done / $planned epochs" else "$done epochs"
     val knobs = hyperKnobs(dir)
-    return if (knobs.isEmpty()) "$epochs · $trainPsnr · $valPsnr" else "$epochs · $trainPsnr · $valPsnr · $knobs"
+    val profile = if (header?.optString("profile") == "long") "Long training" else null
+    val filter = header?.optJSONObject("frameSelection")?.let {
+        if (it.optBoolean("enabled")) "Filter on" else "Filter off"
+    }
+    return listOfNotNull(profile, filter, epochs, trainPsnr, valPsnr, knobs.takeIf { it.isNotEmpty() })
+        .joinToString(" · ")
 }
 
 private fun hyperLines(dir: File): List<String> {

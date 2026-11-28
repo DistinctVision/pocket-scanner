@@ -46,6 +46,7 @@ data class ScanSettings(
     val densifyInterval: Int = 100,
     val gradThreshold: Float = 2e-4f,
     val filterRedundantFrames: Boolean = true,
+    val longSplatTraining: Boolean = true,
 ) {
     val integrateHeight: Int get() = integrateWidth * 3 / 4
 

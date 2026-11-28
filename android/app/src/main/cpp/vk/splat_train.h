@@ -14,6 +14,7 @@ struct SplatHyper {
     float lrQuat = 1e-3f;
     float lrOpacity = 5e-2f;
     float lrColor = 2.5e-3f;
+    float lrColorEnd = 1.f;
     float lrGrid = 2e-3f;
     float lrGridStart = 0.01f;
     float lrGridEnd = 0.01f;
@@ -57,14 +58,16 @@ struct SplatHyper {
 // One training run. The preview thread owns the Vulkan queue, so every call
 // happens there. Gaussians stay on the device for the whole run.
 struct SplatTrainer {
+    static constexpr int kMetricCount = 8;
     explicit SplatTrainer(VkCore* core);
     ~SplatTrainer();
 
-    void setDensity(int interval, float threshold);
+    void configure(bool longProfile, int interval, float threshold);
     bool init(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps);
+    bool setResolution(int width, int height);
     // metricsAfter is the validation pass: the grid steps, then the numbers are read.
     bool step(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy,
-              int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[4]);
+              int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[kMetricCount]);
     bool render(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb);
     bool readCorrected(uint8_t* rgb);
     bool writePly(const char* path);
@@ -82,8 +85,9 @@ private:
     bool uploadGaussians(const float* verts, float voxel);
     bool uploadIdentity();
     bool projectAndBlend(const float pose[16], float fx, float fy, float cx, float cy, int mode);
-    bool depthLoss(const float* depth, float& loss, float& weight);
-    bool metricsOf(float out[4]);
+    bool depthLoss(const float* depth, bool measureQuality, float* metrics, float& weight);
+    void recordSsimForward(VkCommandBuffer cmd);
+    bool metricsOf(float* out);
     bool grow(void* buffer, uint64_t bytes);
     void bindScans();
     bool scratchFor(int n);
@@ -104,6 +108,8 @@ private:
     int views = 0;
     int width = 0;
     int height = 0;
+    int fullWidth = 0;
+    int fullHeight = 0;
     int tilesX = 0;
     int tilesY = 0;
     int gaussStep = 0;
@@ -114,6 +120,7 @@ private:
     int meanSteps = 1;
     int gridSteps = 1;
     float extent = 1.f;
+    bool longTraining = false;
     SplatHyper hyper;
     std::string hyperRecord;
     char error[160] = {};

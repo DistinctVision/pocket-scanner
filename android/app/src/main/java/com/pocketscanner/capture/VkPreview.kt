@@ -307,7 +307,8 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
     private external fun nativeSplatHyper(handle: Long): String
     private external fun nativeSeedVoxel(handle: Long): Float
     private external fun nativeSplatGaussianCount(handle: Long): Int
-    private external fun nativeSplatDensity(handle: Long, interval: Int, threshold: Float)
+    private external fun nativeSplatConfigure(handle: Long, longTraining: Boolean, interval: Int, threshold: Float)
+    private external fun nativeSplatSetResolution(handle: Long, width: Int, height: Int): Boolean
     private external fun nativeSplatInitFromSeed(handle: Long, views: Int, width: Int, height: Int, budget: Int, meanSteps: Int, gridSteps: Int): Boolean
     private external fun nativeDropMesh(handle: Long)
     private external fun nativeSplatInit(
@@ -371,10 +372,14 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         if (handle == 0L) 0 else view.nativeSplatGaussianCount(handle)
     }
 
-    fun splatDensity(interval: Int, threshold: Float) {
+    fun splatConfigure(longTraining: Boolean, interval: Int, threshold: Float) {
         onGpu(Unit) { view, handle ->
-            if (handle != 0L) view.nativeSplatDensity(handle, interval, threshold)
+            if (handle != 0L) view.nativeSplatConfigure(handle, longTraining, interval, threshold)
         }
+    }
+
+    fun splatSetResolution(width: Int, height: Int): Boolean = onGpu(false) { view, handle ->
+        handle != 0L && view.nativeSplatSetResolution(handle, width, height)
     }
 
     fun splatInitFromSeed(views: Int, width: Int, height: Int, budget: Int, meanSteps: Int, gridSteps: Int): Boolean = onGpu(false) { view, handle ->
@@ -406,7 +411,7 @@ class VkPreview(context: Context) : TextureView(context), TextureView.SurfaceTex
         metricsAfter: Boolean,
     ): FloatArray? = onGpu(null) { gpu, handle ->
         if (handle == 0L) return@onGpu null
-        val metrics = FloatArray(4)
+        val metrics = FloatArray(8)
         val ok = gpu.nativeSplatStep(
             handle, rgb, depth, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics,
         )

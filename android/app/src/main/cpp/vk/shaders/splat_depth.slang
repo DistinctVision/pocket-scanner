@@ -25,37 +25,59 @@ struct DepthPush {
 [[vk::push_constant]]
 DepthPush pc;
 
-void reduceDepthLoss(int lane, int stride) {
+void reduceDepthLoss<let measureQuality : bool>(int lane, int stride) {
     float sum = 0;
     float hits = 0;
+    float measured = 0;
+    float absolute = 0;
+    float squared = 0;
     int n = pc.width * pc.height;
     for (int p = lane; p < n; p += stride) {
         float pred = pixels[p].depth;
         float gt = depthGt[p];
         float grad = 0;
-        if (pred > pc.depthMin && gt > pc.depthMin) {
+        bool valid = isfinite(gt) && gt > pc.depthMin;
+        if (measureQuality && valid) measured += 1.0;
+        if (valid && isfinite(pred) && pred > pc.depthMin) {
             float invP = 1.0 / pred;
             float invG = 1.0 / gt;
             float diff = invP - invG;
             sum += abs(diff);
             hits += 1.0;
+            if (measureQuality) {
+                float error = pred - gt;
+                absolute += abs(error);
+                squared += error * error;
+            }
             float sign = diff > 0.0 ? 1.0 : (diff < 0.0 ? -1.0 : 0.0);
             grad = sign * (-invP * invP);
         }
-        depthGrad[p] = grad;
+        if (!measureQuality) depthGrad[p] = grad;
     }
-    partial[lane * 2] = sum;
-    partial[lane * 2 + 1] = hits;
+    int base = lane * (measureQuality ? 5 : 2);
+    partial[base] = sum;
+    partial[base + 1] = hits;
+    if (measureQuality) {
+        partial[base + 2] = measured;
+        partial[base + 3] = absolute;
+        partial[base + 4] = squared;
+    }
 }
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void depthLoss(uint3 tid : SV_DispatchThreadID) {
-    reduceDepthLoss(int(tid.x), 256);
+    reduceDepthLoss<false>(int(tid.x), 256);
 }
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void depthLossWide(uint3 tid : SV_DispatchThreadID) {
-    reduceDepthLoss(int(tid.x), 8192);
+    reduceDepthLoss<false>(int(tid.x), 8192);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void depthQualityWide(uint3 tid : SV_DispatchThreadID) {
+    reduceDepthLoss<true>(int(tid.x), 8192);
 }

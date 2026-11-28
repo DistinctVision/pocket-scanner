@@ -43,11 +43,12 @@ struct Preview {
     const char* splatHyper() const;
     float seedVoxel() const { return seedVoxelSize; }
     int splatGaussianCount() const;
-    void splatDensity(int interval, float threshold);
+    void splatConfigure(bool longTraining, int interval, float threshold);
+    bool splatSetResolution(int width, int height);
     bool splatInitFromSeed(int views, int width, int height, int budget, int meanSteps, int gridSteps);
     bool splatInit(const float* verts, int count, float voxel, int views, int width, int height, int budget, int meanSteps, int gridSteps);
     bool splatStep(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy,
-                   int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[4]);
+                   int view, bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[SplatTrainer::kMetricCount]);
     bool splatRender(const float pose[16], float fx, float fy, float cx, float cy, uint8_t* rgb);
     bool splatRead(uint8_t* rgb);
     bool splatWritePly(const char* path);

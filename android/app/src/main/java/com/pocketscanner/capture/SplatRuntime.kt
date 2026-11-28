@@ -36,7 +36,17 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-data class TrainMetric(val epoch: Int, val l1: Float, val ssim: Float, val psnr: Float, val gaussians: Int = 0, val depth: Float = 0f)
+data class TrainMetric(
+    val epoch: Int,
+    val l1: Float,
+    val ssim: Float,
+    val psnr: Float,
+    val gaussians: Int = 0,
+    val depth: Float = 0f,
+    val depthMae: Float? = null,
+    val depthRmse: Float? = null,
+    val depthCoverage: Float? = null,
+)
 
 data class TrainUi(
     val status: String = "Preparing",
@@ -64,7 +74,15 @@ internal object SplatRuntime {
         stop.set(false)
         ui = TrainUi(running = true, status = "Preparing")
         val app = context.applicationContext
-        worker = Thread({ run(app) }, "splat-train").also { it.start() }
+        worker = Thread({
+            try {
+                run(app)
+            } catch (error: Exception) {
+                Log.e("pocket-splat", "Training failed", error)
+                CaptureRuntime.session?.resumeAfterSplat()
+                fail(app, error.message?.lineSequence()?.firstOrNull() ?: "Training failed")
+            }
+        }, "splat-train").also { it.start() }
     }
 
     fun requestStop() {
@@ -84,7 +102,7 @@ internal object SplatRuntime {
         val dir = File(context.getExternalFilesDir(null), "splat-$stamp")
         dir.mkdirs()
         val settings = session.scanSettings()
-        publish { it.copy(status = "Reading the mesh", epochs = settings.epochs, running = true, runDir = dir.absolutePath) }
+        publish { it.copy(status = "Reading the mesh", running = true, runDir = dir.absolutePath) }
         val prepared = try {
             session.beginSplatting(File(dir, "views"), settings)
         } catch (error: Throwable) {
@@ -98,7 +116,7 @@ internal object SplatRuntime {
         val height = frames.first().height
         val usable = frames.filter { it.width == width && it.height == height }
         val step = (100.0 / settings.validationPercent).roundToInt().coerceAtLeast(1)
-        val validation = if (settings.validation) {
+        val validation = if (settings.validation && usable.size > 1) {
             usable.filterIndexed { index, _ -> index % step == 0 }
         } else {
             emptyList()
@@ -106,26 +124,34 @@ internal object SplatRuntime {
         val validationIds = validation.mapTo(HashSet()) { it.id }
         val sourceTrain = usable.filter { it.id !in validationIds }
         val selection = if (settings.filterRedundantFrames && sourceTrain.isNotEmpty()) {
-            selectFrames(sourceTrain, prepared.coverage)
+            selectFrames(sourceTrain, prepared.coverage, prepared.voxel, settings.longSplatTraining)
         } else {
             null
         }
-        val train = selection?.train ?: sourceTrain
-        if (train.isEmpty() && validation.isEmpty()) {
+        if (stop.get()) {
+            session.resumeAfterSplat()
+            publish { it.copy(status = "Stopped", running = false, finished = true) }
+            worker = null
+            return
+        }
+        val train = selection?.main?.train ?: sourceTrain
+        val polish = selection?.polish?.train ?: train
+        if (train.isEmpty()) {
             session.resumeAfterSplat()
             fail(context, "No frames to train")
             return
         }
-        val every = settings.validationEvery.coerceAtLeast(1)
-        val valPasses = if (validation.isEmpty()) 0 else settings.epochs / every
-        val meanSteps = (settings.epochs * train.size).coerceAtLeast(1)
-        val gridSteps = (meanSteps + valPasses * validation.size).coerceAtLeast(1)
-        writeRun(dir, settings, meanSteps, gridSteps, sourceTrain.size, train, validation, selection)
-        val droppedIds = selection?.droppedIds.orEmpty().toHashSet()
-        val viewIndex = usable.filter { it.id !in droppedIds }.mapIndexed { index, frame -> frame.id to index }.toMap()
-        preview.splatDensity(settings.densifyInterval, settings.gradThreshold)
-        val seeded = preview.splatInitFromSeed(viewIndex.size, width, height, settings.gaussBudget, meanSteps, gridSteps)
-        if (seeded) writeHyper(dir, settings, preview.splatHyperJson())
+        val plan = SplatTrainingPlan(
+            settings.longSplatTraining, settings.epochs, settings.validationEvery,
+            settings.gaussBudget, train.size, validation.size,
+        )
+        publish { it.copy(epochs = plan.epochs) }
+        writeRun(dir, settings, plan, sourceTrain.size, train, polish, validation, selection)
+        val usedIds = (train + polish + validation).mapTo(HashSet()) { it.id }
+        val viewIndex = usable.filter { it.id in usedIds }.mapIndexed { index, frame -> frame.id to index }.toMap()
+        preview.splatConfigure(plan.longTraining, settings.densifyInterval, settings.gradThreshold)
+        val seeded = preview.splatInitFromSeed(viewIndex.size, width, height, plan.budget, plan.meanSteps, plan.gridSteps)
+        if (seeded) writeHyper(dir, settings, plan, preview.splatHyperJson())
         if (!seeded) {
             session.resumeAfterSplat()
             fail(context, "The GPU trainer did not start")
@@ -141,42 +167,62 @@ internal object SplatRuntime {
         val video = File(dir, "video.mp4")
         var finishedEpochs = 0
         var failed = false
-        for (epoch in 1..settings.epochs) {
+        val fullInput = SplatFrameInput(width, height, width, height)
+        val coarseInput = if (plan.longTraining) {
+            SplatFrameInput(width, height, maxOf(16, width / 2), maxOf(16, height / 2))
+        } else {
+            fullInput
+        }
+        val trainOrder = plan.trainingOrder(train)
+        val polishOrder = if (plan.longTraining) plan.trainingOrder(polish) else trainOrder
+        for (epoch in 1..plan.epochs) {
             if (stop.get()) break
-            if (train.isNotEmpty()) {
-                publish { it.copy(fraction = 0f, status = "Epoch $epoch / ${settings.epochs}, train") }
-                val trainMean = pass(context, preview, train, viewIndex, width, height, epoch, settings.epochs, "train", updateGauss = true, metricsAfter = false, pngDir = null)
-                if (trainMean == null) {
-                    failed = !stop.get()
-                    break
-                }
-                val counted = trainMean.copy(gaussians = preview.splatGaussianCount())
-                trainSeries.add(counted)
-                append(metrics, epoch, "train", counted)
-                note("Epoch $epoch train  L1 ${fmt(trainMean.l1)}  SSIM ${fmt(trainMean.ssim)}  PSNR ${fmt(trainMean.psnr)}  depth ${fmt(trainMean.depth)}")
-                publish { it.copy(epoch = epoch, train = trainSeries.toList(), fraction = 1f) }
+            val refining = epoch > plan.mainEpochs
+            val input = if (epoch <= plan.coarseEpochs) coarseInput else fullInput
+            val label = if (refining) "refine" else "train"
+            val order = if (refining) polishOrder else trainOrder
+            val batch = List(plan.stepsPerEpoch) { order.next() }
+            publish { it.copy(fraction = 0f, status = "Epoch $epoch / ${plan.epochs}, $label") }
+            val trainMean = pass(context, preview, batch, viewIndex, input, epoch, plan, label, null)
+            if (trainMean == null) {
+                failed = !stop.get()
+                break
             }
-            val validateNow = validation.isNotEmpty() && epoch % every == 0
-            if (validateNow) {
+            trainSeries.add(trainMean)
+            append(metrics, "train", trainMean, plan, input)
+            note("Epoch $epoch $label  L1 ${fmt(trainMean.l1)}  SSIM ${fmt(trainMean.ssim)}  PSNR ${fmt(trainMean.psnr)}  depth ${fmt(trainMean.depth)}")
+            publish { it.copy(epoch = epoch, train = trainSeries.toList(), fraction = 1f) }
+
+            if (validation.isNotEmpty() && plan.validatesAt(epoch)) {
                 if (stop.get()) break
-                publish { it.copy(fraction = 0f, status = "Epoch $epoch / ${settings.epochs}, validation") }
-                val valMean = pass(context, preview, validation, viewIndex, width, height, epoch, settings.epochs, "validation", updateGauss = false, metricsAfter = true, pngDir = valDir)
+                publish { it.copy(fraction = 0f, status = "Epoch $epoch / ${plan.epochs}, validation") }
+                val valMean = pass(context, preview, validation, viewIndex, fullInput, epoch, plan, "validation", valDir)
                 if (valMean == null) {
                     failed = !stop.get()
                     break
                 }
                 valSeries.add(valMean)
-                append(metrics, epoch, "val", valMean)
-                note("Epoch $epoch val  L1 ${fmt(valMean.l1)}  SSIM ${fmt(valMean.ssim)}  PSNR ${fmt(valMean.psnr)}  depth ${fmt(valMean.depth)}")
-                publish { it.copy(validation = valSeries.toList(), image = latestImage(valDir), fraction = 0f, status = "Rendering video") }
-                if (!stop.get()) encodeVideo(context, preview, usable, width, height, video, epoch, settings.epochs, settings.videoSeconds)
+                append(metrics, "val", valMean, plan, fullInput)
+                val depthInfo = valMean.depthMae?.let { "  depth MAE ${fmt(it * 100)} cm" }.orEmpty()
+                note("Epoch $epoch val  L1 ${fmt(valMean.l1)}  SSIM ${fmt(valMean.ssim)}  PSNR ${fmt(valMean.psnr)}$depthInfo")
+                publish { it.copy(validation = valSeries.toList(), image = latestImage(valDir)) }
+                if (!plan.longTraining && !stop.get()) {
+                    publish { it.copy(fraction = 0f, status = "Rendering video") }
+                    encodeVideo(context, preview, usable, width, height, video, epoch, plan.epochs, settings.videoSeconds)
+                }
+            }
+            if (plan.longTraining && epoch == plan.mainEpochs && !stop.get()) {
+                val checkpoint = File(dir, "scene-${plan.meanSteps.toString().padStart(6, '0')}.ply")
+                if (!preview.splatWritePly(checkpoint.absolutePath)) note("Could not save the main training scene")
             }
             finishedEpochs = epoch
-            TrainService.update(context, epoch, settings.epochs, 1f)
+            TrainService.update(context, epoch, plan.epochs, 1f)
         }
-        if (!failed && !settings.validation && finishedEpochs > 0 && !stop.get()) {
+        if (!failed && (plan.longTraining || validation.isEmpty()) && finishedEpochs > 0 && !stop.get() &&
+            preview.splatSetResolution(width, height)
+        ) {
             publish { it.copy(fraction = 0f, status = "Rendering video") }
-            encodeVideo(context, preview, usable, width, height, video, finishedEpochs, settings.epochs, settings.videoSeconds)
+            encodeVideo(context, preview, usable, width, height, video, finishedEpochs, plan.epochs, settings.videoSeconds)
         }
         if (failed) {
             TrainService.stop(context)
@@ -185,9 +231,13 @@ internal object SplatRuntime {
             worker = null
             return
         }
-        val early = stop.get() || finishedEpochs < settings.epochs
+        val early = stop.get() || finishedEpochs < plan.epochs
         publish { it.copy(status = "Writing the scene") }
-        preview.splatWritePly(File(dir, "scene.ply").absolutePath)
+        if (!preview.splatWritePly(File(dir, "scene.ply").absolutePath)) {
+            session.resumeAfterSplat()
+            fail(context, "Could not write the scene")
+            return
+        }
         TrainService.stop(context)
         session.resumeAfterSplat()
         publish {
@@ -201,7 +251,9 @@ internal object SplatRuntime {
         worker = null
     }
 
-    private fun selectFrames(train: List<TrainFrame>, coverage: FloatArray?): SplatFrameSelector.Selection? {
+    private fun selectFrames(
+        train: List<TrainFrame>, coverage: FloatArray?, voxel: Float, includePolish: Boolean,
+    ): SplatFrameSelector.Stages? {
         if (stop.get()) return null
         if (coverage == null || coverage.isEmpty()) {
             note("Mesh coverage unavailable. Keeping all ${train.size} train views.")
@@ -209,7 +261,7 @@ internal object SplatRuntime {
         }
         publish { it.copy(status = "Checking frame coverage") }
         val selection = try {
-            SplatFrameSelector.select(train, coverage, stop::get)
+            SplatFrameSelector.selectStages(train, coverage, voxel, includePolish, stop::get)
         } catch (error: IOException) {
             Log.w("pocket-splat", "Frame selection could not read training data", error)
             null
@@ -218,7 +270,8 @@ internal object SplatRuntime {
             null
         }
         if (selection != null) {
-            note("Kept ${selection.train.size} of ${train.size} train views")
+            note("Kept ${selection.main.train.size} of ${train.size} train views")
+            selection.polish?.let { note("Kept ${it.train.size} views for refinement") }
         } else if (!stop.get()) {
             note("Frame selection unavailable. Keeping all ${train.size} train views.")
         }
@@ -230,41 +283,43 @@ internal object SplatRuntime {
         preview: VkPreview,
         frames: List<TrainFrame>,
         viewIndex: Map<Int, Int>,
-        width: Int,
-        height: Int,
+        input: SplatFrameInput,
         epoch: Int,
-        epochs: Int,
+        plan: SplatTrainingPlan,
         passName: String,
-        updateGauss: Boolean,
-        metricsAfter: Boolean,
         pngDir: File?,
     ): TrainMetric? {
-        if (frames.isEmpty()) return null
+        if (!preview.splatSetResolution(input.width, input.height)) {
+            publish { it.copy(status = "Could not change training resolution") }
+            return null
+        }
+        val validate = pngDir != null
         var l1 = 0.0
         var ssim = 0.0
         var psnr = 0.0
         var depthLoss = 0.0
-        val rgb = FloatArray(width * height * 3)
-        val depth = FloatArray(width * height)
+        var matches = 0.0
+        var targets = 0.0
+        var depthAbs = 0.0
+        var depthSquared = 0.0
         frames.forEachIndexed { index, frame ->
             if (stop.get()) return null
-            val bytes = frame.rgb.readBytes()
-            val n = minOf(rgb.size, bytes.size)
-            for (i in 0 until n) rgb[i] = (bytes[i].toInt() and 255) / 255f
-            depth.fill(0f)
-            if (frame.depth.isFile) {
-                val raw = frame.depth.readBytes()
-                val view = java.nio.ByteBuffer.wrap(raw).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                val samples = minOf(depth.size, raw.size / 4)
-                for (i in 0 until samples) depth[i] = view.float
+            try {
+                input.load(frame)
+            } catch (error: Exception) {
+                val reason = "Frame ${frame.id}: ${error.message ?: "could not read input"}"
+                publish { it.copy(status = reason) }
+                note(reason)
+                return null
             }
             val metrics = preview.splatStep(
-                rgb, depth, frame.pose, frame.fx, frame.fy, frame.cx, frame.cy,
-                viewIndex[frame.id] ?: 0, updateGauss, true, metricsAfter,
+                input.rgb, input.depth, frame.pose,
+                frame.fx * input.scaleX, frame.fy * input.scaleY, frame.cx * input.scaleX, frame.cy * input.scaleY,
+                viewIndex.getValue(frame.id), !validate, !plan.longTraining, validate,
             )
-            if (metrics == null) {
+            if (metrics == null || metrics.any { !it.isFinite() }) {
                 if (!stop.get()) {
-                    val reason = preview.splatError().ifBlank { "The rasterizer stopped" }
+                    val reason = preview.splatError().ifBlank { "GPU training failed on frame ${frame.id}" }
                     publish { it.copy(status = reason) }
                     note(reason)
                 }
@@ -274,19 +329,29 @@ internal object SplatRuntime {
             ssim += metrics[1]
             psnr += metrics[2]
             depthLoss += metrics[3]
+            matches += metrics[4]
+            targets += metrics[5]
+            depthAbs += metrics[6]
+            depthSquared += metrics[7]
             if (pngDir != null) {
                 val rendered = preview.splatRender(frame.pose, frame.fx, frame.fy, frame.cx, frame.cy, corrected = true)
-                val image = rendered?.let { bitmapOf(it, width, height) }
+                val image = rendered?.let { bitmapOf(it, input.width, input.height) }
                 if (image != null) {
                     FileOutputStream(File(pngDir, "${frame.id}.png")).use { image.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 }
             }
             val fraction = (index + 1f) / frames.size
-            publish { it.copy(epoch = epoch, fraction = fraction, status = "Epoch $epoch / $epochs, $passName") }
-            TrainService.update(context, epoch, epochs, fraction)
+            publish { it.copy(epoch = epoch, fraction = fraction, status = "Epoch $epoch / ${plan.epochs}, $passName") }
+            TrainService.update(context, epoch, plan.epochs, fraction)
         }
         val count = frames.size.toDouble()
-        return TrainMetric(epoch, (l1 / count).toFloat(), (ssim / count).toFloat(), (psnr / count).toFloat(), depth = (depthLoss / count).toFloat())
+        return TrainMetric(
+            epoch, (l1 / count).toFloat(), (ssim / count).toFloat(), (psnr / count).toFloat(),
+            gaussians = preview.splatGaussianCount(), depth = (depthLoss / count).toFloat(),
+            depthMae = if (matches > 0) (depthAbs / matches).toFloat() else null,
+            depthRmse = if (matches > 0) sqrt(depthSquared / matches).toFloat() else null,
+            depthCoverage = if (targets > 0) (matches / targets).toFloat() else null,
+        )
     }
 
     private fun encodeVideo(
@@ -368,52 +433,93 @@ internal object SplatRuntime {
     private fun writeRun(
         dir: File,
         settings: ScanSettings,
-        meanSteps: Int,
-        gridSteps: Int,
+        plan: SplatTrainingPlan,
         sourceTrainCount: Int,
         train: List<TrainFrame>,
+        polish: List<TrainFrame>,
         validation: List<TrainFrame>,
-        selection: SplatFrameSelector.Selection?,
+        selections: SplatFrameSelector.Stages?,
     ) {
-        val filter = JSONObject()
-            .put("enabled", settings.filterRedundantFrames)
+        fun selectionJson(
+            result: SplatFrameSelector.Selection, position: Float, rotation: Int,
+        ) = JSONObject()
+            .put("surfaceSamples", result.surfaceSamples)
+            .put("coveredSamples", result.coveredSamples)
+            .put("parallaxSamples", result.parallaxSamples)
+            .put("retainedCoveredSamples", result.retainedCoveredSamples)
+            .put("retainedParallaxSamples", result.retainedParallaxSamples)
+            .put("droppedTrainIds", JSONArray(result.droppedIds))
+            .put("unverifiedTrainIds", JSONArray(result.unverifiedIds))
+            .put("nearPositionMeters", position.toDouble())
+            .put("nearRotationDegrees", rotation)
+
+        val filter = selections?.main?.let {
+            selectionJson(it, SplatFrameSelector.MAIN_POSITION, SplatFrameSelector.MAIN_ROTATION)
+        } ?: JSONObject()
+        filter.put("enabled", settings.filterRedundantFrames)
             .put("sourceTrainCount", sourceTrainCount)
-        if (selection != null) {
-            filter.put("surfaceSamples", selection.surfaceSamples)
-            filter.put("coveredSamples", selection.coveredSamples)
-            filter.put("parallaxSamples", selection.parallaxSamples)
-            filter.put("droppedTrainIds", JSONArray(selection.droppedIds))
-            filter.put("unverifiedTrainIds", JSONArray(selection.unverifiedIds))
+        selections?.polish?.let {
+            filter.put("polish", selectionJson(it, SplatFrameSelector.POLISH_POSITION, SplatFrameSelector.POLISH_ROTATION))
         }
         val run = JSONObject()
-            .put("epochs", settings.epochs)
-            .put("validation", settings.validation)
+            .put("profile", if (plan.longTraining) "long" else "custom")
+            .put("epochs", plan.epochs)
+            .put("mainEpochs", plan.mainEpochs)
+            .put("coarseEpochs", plan.coarseEpochs)
+            .put("stepsPerEpoch", plan.stepsPerEpoch)
+            .put("validation", validation.isNotEmpty())
             .put("percent", settings.validationPercent)
-            .put("every", settings.validationEvery)
-            .put("budget", settings.gaussBudget)
+            .put("every", plan.validationEvery)
+            .put("budget", plan.budget)
             .put("videoSeconds", settings.videoSeconds)
-            .put("meanSteps", meanSteps)
-            .put("gridSteps", gridSteps)
+            .put("meanSteps", plan.meanSteps)
+            .put("gridSteps", plan.gridSteps)
             .put("trainIds", JSONArray(train.map { it.id }))
             .put("valIds", JSONArray(validation.map { it.id }))
             .put("frameSelection", filter)
-        File(dir, "run.json").writeText(run.toString())
+        if (plan.longTraining) {
+            run.put("polishTrainIds", JSONArray(polish.map { it.id }))
+            run.put("shuffleSeed", SplatTrainingPlan.SHUFFLE_SEED)
+        }
+        File(dir, "run.json").writeText(run.toString(2))
     }
 
-    private fun writeHyper(dir: File, settings: ScanSettings, training: String) {
+    private fun writeHyper(dir: File, settings: ScanSettings, plan: SplatTrainingPlan, training: String) {
         val json = runCatching { JSONObject(training) }.getOrElse { JSONObject() }
-        json.put("epochs", settings.epochs)
+        json.put("epochs", plan.epochs)
         json.put("validation", settings.validation)
         json.put("validationPercent", settings.validationPercent)
-        json.put("validationEvery", settings.validationEvery)
+        json.put("validationEvery", plan.validationEvery)
         json.put("videoSeconds", settings.videoSeconds)
+        if (plan.longTraining) {
+            json.put("polish", JSONObject().put("lrScale", 0.002).put("lrOpacity", 0.02))
+        }
         File(dir, "hyperparameters.json").writeText(json.toString(2))
     }
 
-    private fun append(file: File, epoch: Int, split: String, metric: TrainMetric) {
-        file.appendText(
-            """{"epoch":$epoch,"split":"$split","l1":${metric.l1},"ssim":${metric.ssim},"psnr":${metric.psnr},"depth":${metric.depth},"gaussians":${metric.gaussians}}""" + "\n",
-        )
+    private fun append(file: File, split: String, metric: TrainMetric, plan: SplatTrainingPlan, input: SplatFrameInput) {
+        val row = JSONObject()
+            .put("epoch", metric.epoch)
+            .put("split", split)
+            .put("l1", metric.l1.toDouble())
+            .put("ssim", metric.ssim.toDouble())
+            .put("psnr", metric.psnr.toDouble())
+            .put("depth", metric.depth.toDouble())
+            .put("gaussians", metric.gaussians)
+            .put("gauss_step", metric.epoch * plan.stepsPerEpoch)
+            .put("width", input.width)
+            .put("height", input.height)
+        if (split == "val") {
+            if (plan.longTraining) {
+                row.put("raw_l1", metric.l1.toDouble())
+                row.put("raw_ssim", metric.ssim.toDouble())
+                row.put("raw_psnr", metric.psnr.toDouble())
+            }
+            metric.depthMae?.let { row.put("depth_mae_m", it.toDouble()) }
+            metric.depthRmse?.let { row.put("depth_rmse_m", it.toDouble()) }
+            metric.depthCoverage?.let { row.put("depth_coverage", it.toDouble()) }
+        }
+        file.appendText(row.toString() + "\n")
     }
 
     private fun fmt(value: Float) = String.format(Locale.US, "%.3f", value)
@@ -439,6 +545,9 @@ internal object SplatRuntime {
                     number(line, "psnr") ?: return@forEachLine,
                     number(line, "gaussians")?.toInt() ?: 0,
                     number(line, "depth") ?: 0f,
+                    number(line, "depth_mae_m"),
+                    number(line, "depth_rmse_m"),
+                    number(line, "depth_coverage"),
                 )
                 if (line.contains("\"val\"")) validation.add(metric) else train.add(metric)
             }

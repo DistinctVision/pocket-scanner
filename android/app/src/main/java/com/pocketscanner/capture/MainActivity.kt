@@ -956,7 +956,7 @@ internal fun SettingsPanel(
     onApply: (ScanSettings) -> Unit,
     onReset: () -> Unit,
     onRefine: (Boolean, Int) -> Unit,
-    onSplatting: (Int, Boolean, Int, Int, Int, Int, Int, Float, Boolean) -> Unit,
+    onSplatting: (ScanSettings) -> Unit,
     onClose: () -> Unit,
 ) {
     var voxel by remember { mutableIntStateOf(applied.voxelCm) }
@@ -975,21 +975,25 @@ internal fun SettingsPanel(
     var densifyInterval by remember { mutableIntStateOf(applied.densifyInterval) }
     var gradThreshold by remember { mutableStateOf(applied.gradThreshold) }
     var filterRedundantFrames by remember { mutableStateOf(applied.filterRedundantFrames) }
+    var longSplatTraining by remember { mutableStateOf(applied.longSplatTraining) }
     var epochsText by remember { mutableStateOf(applied.epochs.toString()) }
     var densifyText by remember { mutableStateOf(applied.densifyInterval.toString()) }
     var thresholdText by remember { mutableStateOf(formatKnob(applied.gradThreshold)) }
     val scheme = MaterialTheme.colorScheme
     fun pushSplatting() {
         onSplatting(
-            epochs,
-            validation,
-            validationPercent,
-            validationEvery,
-            gaussBudget,
-            videoSeconds,
-            densifyInterval,
-            gradThreshold,
-            filterRedundantFrames,
+            applied.copy(
+                epochs = epochs,
+                validation = validation,
+                validationPercent = validationPercent,
+                validationEvery = validationEvery,
+                gaussBudget = gaussBudget,
+                videoSeconds = videoSeconds,
+                densifyInterval = densifyInterval,
+                gradThreshold = gradThreshold,
+                filterRedundantFrames = filterRedundantFrames,
+                longSplatTraining = longSplatTraining,
+            ),
         )
     }
     Column(
@@ -1058,6 +1062,7 @@ internal fun SettingsPanel(
                         densifyInterval = densifyInterval,
                         gradThreshold = gradThreshold,
                         filterRedundantFrames = filterRedundantFrames,
+                        longSplatTraining = longSplatTraining,
                     ),
                 )
             },
@@ -1106,19 +1111,42 @@ internal fun SettingsPanel(
             color = scheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
-        NumberField(
-            title = "Epochs",
-            detail = "Training stops after this many passes over the frames.",
-            text = epochsText,
-            keyboard = KeyboardType.Number,
-            onText = { raw ->
-                epochsText = raw.filter { it.isDigit() }.take(3)
-                epochsText.toIntOrNull()?.coerceIn(1, 500)?.let {
-                    epochs = it
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Long training", style = MaterialTheme.typography.labelLarge)
+            Switch(
+                checked = longSplatTraining,
+                onCheckedChange = {
+                    longSplatTraining = it
                     pushSplatting()
-                }
-            },
-        )
+                },
+            )
+        }
+        if (longSplatTraining) {
+            Text(
+                "6,144 training steps plus 768 refinement steps. Up to 100,000 gaussians.",
+                color = scheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (!longSplatTraining) {
+            NumberField(
+                title = "Epochs",
+                detail = "Training stops after this many passes over the frames.",
+                text = epochsText,
+                keyboard = KeyboardType.Number,
+                onText = { raw ->
+                    epochsText = raw.filter { it.isDigit() }.take(3)
+                    epochsText.toIntOrNull()?.coerceIn(1, 500)?.let {
+                        epochs = it
+                        pushSplatting()
+                    }
+                },
+            )
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1137,15 +1165,17 @@ internal fun SettingsPanel(
             validationPercent = it
             pushSplatting()
         }
-        LabeledSlider(
-            title = "Validation interval",
-            value = "$validationEvery epochs",
-            detail = "Validation runs after this many training epochs.",
-            sliderValue = validationEvery.toFloat(),
-            range = 1f..20f,
-        ) {
-            validationEvery = it.toInt().coerceIn(1, 20)
-            pushSplatting()
+        if (!longSplatTraining) {
+            LabeledSlider(
+                title = "Validation interval",
+                value = "$validationEvery epochs",
+                detail = "Validation runs after this many training epochs.",
+                sliderValue = validationEvery.toFloat(),
+                range = 1f..20f,
+            ) {
+                validationEvery = it.toInt().coerceIn(1, 20)
+                pushSplatting()
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1161,15 +1191,17 @@ internal fun SettingsPanel(
                 },
             )
         }
-        LabeledSlider(
-            title = "Gaussians",
-            value = String.format(java.util.Locale.US, "%.1f million", gaussBudget / 1_000_000f),
-            detail = "Most measured mesh vertices kept for the run.",
-            sliderValue = gaussBudget / 1_000_000f,
-            range = 0.5f..5f,
-        ) {
-            gaussBudget = (it * 1_000_000f).toInt().coerceIn(500_000, 5_000_000)
-            pushSplatting()
+        if (!longSplatTraining) {
+            LabeledSlider(
+                title = "Gaussians",
+                value = String.format(java.util.Locale.US, "%.1f million", gaussBudget / 1_000_000f),
+                detail = "Most measured mesh vertices kept for the run.",
+                sliderValue = gaussBudget / 1_000_000f,
+                range = 0.5f..5f,
+            ) {
+                gaussBudget = (it * 1_000_000f).toInt().coerceIn(500_000, 5_000_000)
+                pushSplatting()
+            }
         }
         LabeledSlider(
             title = "Video",
@@ -1181,33 +1213,35 @@ internal fun SettingsPanel(
             videoSeconds = it.toInt().coerceIn(1, 30)
             pushSplatting()
         }
-        NumberField(
-            title = "Densify interval",
-            detail = "Adam steps between clone, split, and prune.",
-            text = densifyText,
-            keyboard = KeyboardType.Number,
-            onText = { raw ->
-                densifyText = raw.filter { it.isDigit() }.take(6)
-                densifyText.toIntOrNull()?.coerceIn(1, 100_000)?.let {
-                    densifyInterval = it
-                    pushSplatting()
-                }
-            },
-        )
-        NumberField(
-            title = "Gradient threshold",
-            detail = "A gaussian grows when its average view-space gradient is above this.",
-            text = thresholdText,
-            keyboard = KeyboardType.Ascii,
-            onText = { raw ->
-                thresholdText = raw.filter { it.isDigit() || it == '.' || it == 'e' || it == 'E' || it == '+' || it == '-' }.take(16)
-                val value = thresholdText.toFloatOrNull()
-                if (value != null && value.isFinite() && value >= 0f) {
-                    gradThreshold = value
-                    pushSplatting()
-                }
-            },
-        )
+        if (!longSplatTraining) {
+            NumberField(
+                title = "Densify interval",
+                detail = "Adam steps between clone, split, and prune.",
+                text = densifyText,
+                keyboard = KeyboardType.Number,
+                onText = { raw ->
+                    densifyText = raw.filter { it.isDigit() }.take(6)
+                    densifyText.toIntOrNull()?.coerceIn(1, 100_000)?.let {
+                        densifyInterval = it
+                        pushSplatting()
+                    }
+                },
+            )
+            NumberField(
+                title = "Gradient threshold",
+                detail = "A gaussian grows when its average view-space gradient is above this.",
+                text = thresholdText,
+                keyboard = KeyboardType.Ascii,
+                onText = { raw ->
+                    thresholdText = raw.filter { it.isDigit() || it == '.' || it == 'e' || it == 'E' || it == '+' || it == '-' }.take(16)
+                    val value = thresholdText.toFloatOrNull()
+                    if (value != null && value.isFinite() && value >= 0f) {
+                        gradThreshold = value
+                        pushSplatting()
+                    }
+                },
+            )
+        }
     }
 }
 

@@ -15,13 +15,16 @@
 #include "splat_back_ed_spv.h"
 #include "splat_back_rgbed_spv.h"
 #include "splat_depth_spv.h"
+#include "splat_depth_quality_spv.h"
 #include "splat_params_spv.h"
 #include "bilagrid_slice_spv.h"
 #include "bilagrid_tv_spv.h"
 #include "splat_adam_spv.h"
 #include "splat_adam_grid_spv.h"
-#include "ssim_fwd_spv.h"
-#include "ssim_back_spv.h"
+#include "ssim_fwd_rows_spv.h"
+#include "ssim_fwd_columns_spv.h"
+#include "ssim_back_rows_spv.h"
+#include "ssim_back_columns_spv.h"
 #include "ssim_reduce_spv.h"
 
 #include <android/log.h>
@@ -42,6 +45,7 @@ namespace {
 
 constexpr int kGridCell = 12 * 8 * 16 * 16;
 constexpr int kScan = 128;
+constexpr int kLossLanes = 8192;
 
 struct Gauss {
     float meanOp[4];
@@ -190,13 +194,14 @@ struct SplatTrainer::Kernels {
     ComputeKernel scanG, scanG2, scanG3, scanG4, addG, addG2, addG3;
     ComputeKernel scanH, scanH2, scanH3, scanH4, addH, addH2, addH3;
     ComputeKernel hist, scatter, ranges;
-    ComputeKernel ssimFwd, ssimBack, reduce;
+    ComputeKernel depthQuality, ssimFwdRows, ssimFwdColumns, ssimBackRows, ssimBackColumns, reduce;
     Buffer gauss, grad, moment, vel, densify;
     Buffer splat2d, tileCount, tileOffset, image, pixelBlend, corrected, target, depthGt, depthGrad;
     Buffer dstGrad, srcGrad, accum;
     Buffer sumA, sumAex, sumB, sumBex, sumC, sumCex;
     Buffer keyA, keyB, idA, idB, histCounts, histEx, digitTotals, digitBase, tileRange;
     Buffer grid, gridM, gridV, gridGrad, stats, partial, stageTarget, stageImage, stageSmall;
+    Buffer ssimRows;
     int pairCount = 0;
 };
 
@@ -211,7 +216,8 @@ void SplatTrainer::destroy() {
         &gpu->backRgb, &gpu->backEd, &gpu->backRgbEd, &gpu->depth, &gpu->params, &gpu->slice,
         &gpu->tv, &gpu->adam, &gpu->adamGrid, &gpu->scanG, &gpu->scanG2, &gpu->scanG3, &gpu->scanG4, &gpu->addG,
         &gpu->addG2, &gpu->addG3, &gpu->scanH, &gpu->scanH2, &gpu->scanH3, &gpu->scanH4, &gpu->addH, &gpu->addH2,
-        &gpu->addH3, &gpu->hist, &gpu->scatter, &gpu->ranges, &gpu->ssimFwd, &gpu->ssimBack, &gpu->reduce};
+        &gpu->addH3, &gpu->hist, &gpu->scatter, &gpu->ranges, &gpu->depthQuality, &gpu->ssimFwdRows,
+        &gpu->ssimFwdColumns, &gpu->ssimBackRows, &gpu->ssimBackColumns, &gpu->reduce};
     for (ComputeKernel* kernel : kernels) core->destroy(*kernel);
     Buffer* buffers[] = {
         &gpu->gauss, &gpu->grad, &gpu->moment, &gpu->vel, &gpu->densify, &gpu->splat2d, &gpu->tileCount, &gpu->tileOffset,
@@ -220,7 +226,7 @@ void SplatTrainer::destroy() {
         &gpu->sumA, &gpu->sumAex, &gpu->sumB, &gpu->sumBex, &gpu->sumC, &gpu->sumCex, &gpu->keyA, &gpu->keyB,
         &gpu->idA, &gpu->idB, &gpu->histCounts, &gpu->histEx, &gpu->digitTotals, &gpu->digitBase, &gpu->tileRange,
         &gpu->grid, &gpu->gridM, &gpu->gridV, &gpu->gridGrad, &gpu->stats, &gpu->partial, &gpu->stageTarget,
-        &gpu->stageImage, &gpu->stageSmall};
+        &gpu->stageImage, &gpu->stageSmall, &gpu->ssimRows};
     for (Buffer* buffer : buffers) core->destroy(*buffer);
     gpu->pairCount = 0;
     count = 0;
@@ -241,11 +247,13 @@ bool SplatTrainer::kernels() {
     const int b0123456[] = {0, 1, 2, 3, 4, 5, 6};
     const int b012456[] = {0, 1, 2, 4, 5, 6};
     const int depthB[] = {0, 1, 2, 3};
+    const int depthQualityB[] = {0, 1, 3};
     const int scatterB[] = {0, 1, 2, 3, 4, 5};
     const int keysB[] = {0, 1, 2, 3};
     const int b05[] = {0, 5};
-    const int ssimF[] = {0, 1, 2};
-    const int ssimB[] = {0, 1, 2, 4};
+    const int ssimInputs[] = {0, 1, 7};
+    const int ssimScratch[] = {2, 7};
+    const int ssimOutput[] = {0, 1, 4, 7};
     const int red[] = {1, 2, 5, 6};
     auto block = [&](ComputeKernel& out) {
         return make(splat_scan_spv, sizeof(splat_scan_spv), b012, 3, sizeof(ScanPush), out);
@@ -266,13 +274,17 @@ bool SplatTrainer::kernels() {
            make(splat_back_ed_spv, sizeof(splat_back_ed_spv), b012456, 6, sizeof(BackPush), gpu->backEd) &&
            make(splat_back_rgbed_spv, sizeof(splat_back_rgbed_spv), b0123456, 7, sizeof(BackPush), gpu->backRgbEd) &&
            make(splat_depth_spv, sizeof(splat_depth_spv), depthB, 4, sizeof(DepthPush), gpu->depth) &&
+           make(splat_depth_quality_spv, sizeof(splat_depth_quality_spv), depthQualityB, 3, sizeof(DepthPush), gpu->depthQuality) &&
            make(splat_params_spv, sizeof(splat_params_spv), b01234, 5, sizeof(ParamPush), gpu->params) &&
-           make(bilagrid_slice_spv, sizeof(bilagrid_slice_spv), b012345, 6, sizeof(GridPush), gpu->slice) &&
-           make(bilagrid_tv_spv, sizeof(bilagrid_tv_spv), b05, 2, sizeof(GridPush), gpu->tv) &&
+           (hyper.lrGrid == 0.f || (
+               make(bilagrid_slice_spv, sizeof(bilagrid_slice_spv), b012345, 6, sizeof(GridPush), gpu->slice) &&
+               make(bilagrid_tv_spv, sizeof(bilagrid_tv_spv), b05, 2, sizeof(GridPush), gpu->tv) &&
+               make(splat_adam_grid_spv, sizeof(splat_adam_grid_spv), b0123, 4, sizeof(GridAdamPush), gpu->adamGrid))) &&
            make(splat_adam_spv, sizeof(splat_adam_spv), b0123, 4, sizeof(AdamPush), gpu->adam) &&
-           make(splat_adam_grid_spv, sizeof(splat_adam_grid_spv), b0123, 4, sizeof(GridAdamPush), gpu->adamGrid) &&
-           make(ssim_fwd_spv, sizeof(ssim_fwd_spv), ssimF, 3, sizeof(SsimPush), gpu->ssimFwd) &&
-           make(ssim_back_spv, sizeof(ssim_back_spv), ssimB, 4, sizeof(SsimPush), gpu->ssimBack) &&
+           make(ssim_fwd_rows_spv, sizeof(ssim_fwd_rows_spv), ssimInputs, 3, sizeof(SsimPush), gpu->ssimFwdRows) &&
+           make(ssim_fwd_columns_spv, sizeof(ssim_fwd_columns_spv), ssimScratch, 2, sizeof(SsimPush), gpu->ssimFwdColumns) &&
+           make(ssim_back_rows_spv, sizeof(ssim_back_rows_spv), ssimScratch, 2, sizeof(SsimPush), gpu->ssimBackRows) &&
+           make(ssim_back_columns_spv, sizeof(ssim_back_columns_spv), ssimOutput, 4, sizeof(SsimPush), gpu->ssimBackColumns) &&
            make(ssim_reduce_spv, sizeof(ssim_reduce_spv), red, 4, sizeof(SsimPush), gpu->reduce) &&
            block(gpu->scanG) && block(gpu->scanG2) && block(gpu->scanG3) && block(gpu->scanG4) &&
            block(gpu->scanH) && block(gpu->scanH2) && block(gpu->scanH3) && block(gpu->scanH4) &&
@@ -284,6 +296,7 @@ bool SplatTrainer::buffers() {
     const VkDeviceSize tiles = static_cast<VkDeviceSize>(tilesX) * tilesY;
     const VkDeviceSize gaussBytes = static_cast<VkDeviceSize>(count) * sizeof(Gauss);
     const VkDeviceSize gridBytes = static_cast<VkDeviceSize>(views) * kGridCell * sizeof(float);
+    const bool gridEnabled = hyper.lrGrid != 0.f;
     auto dev = [&](VkDeviceSize size, VkBufferUsageFlags extra, Buffer& out) {
         return core->buffer(size, kStorage | extra, kDevice, out);
     };
@@ -299,12 +312,10 @@ bool SplatTrainer::buffers() {
         !dev(counts, copy, gpu->tileOffset) ||
         !dev(pixels * 3 * sizeof(float), copy, gpu->image) ||
         !dev(pixels * (2 * sizeof(float) + sizeof(int32_t)), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->pixelBlend) ||
-        !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gpu->corrected) ||
         !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->target) ||
         !dev(pixels * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->depthGt) ||
         !dev(pixels * sizeof(float), 0, gpu->depthGrad) ||
         !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->dstGrad) ||
-        !dev(pixels * 3 * sizeof(float), 0, gpu->srcGrad) ||
         !dev(static_cast<VkDeviceSize>(count) * 12 * sizeof(int), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->accum) ||
         !dev(256 * 1024, copy, gpu->sumA) ||
         !dev(256 * 1024, copy, gpu->sumAex) ||
@@ -315,17 +326,23 @@ bool SplatTrainer::buffers() {
         !dev(64, copy, gpu->digitTotals) ||
         !dev(64, copy, gpu->digitBase) ||
         !dev(tiles * 2 * sizeof(int), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->tileRange) ||
-        !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->grid) ||
-        !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridM) ||
-        !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridV) ||
-        !dev(static_cast<VkDeviceSize>(views) * kGridCell * sizeof(int), VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridGrad) ||
+        (gridEnabled && (
+            !dev(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gpu->corrected) ||
+            !dev(pixels * 3 * sizeof(float), 0, gpu->srcGrad) ||
+            !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->grid) ||
+            !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridM) ||
+            !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridV) ||
+            !dev(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, gpu->gridGrad))) ||
         !dev(pixels * 12 * sizeof(float), 0, gpu->stats) ||
-        !core->buffer(256 * 3 * sizeof(float), kStorage, kHost, gpu->partial) ||
+        !dev(pixels * 15 * sizeof(float), 0, gpu->ssimRows) ||
+        !core->buffer(kLossLanes * 5 * sizeof(float), kStorage, kHost, gpu->partial) ||
         !core->buffer(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, kHost, gpu->stageTarget) ||
         !core->buffer(pixels * 3 * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, gpu->stageImage) ||
         !core->buffer(256, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, kHost, gpu->stageSmall)) {
         return false;
     }
+    const Buffer& color = gridEnabled ? gpu->corrected : gpu->image;
+    const Buffer& colorGradient = gridEnabled ? gpu->srcGrad : gpu->dstGrad;
     bindAt(core, gpu->project, 0, gpu->gauss);
     bindAt(core, gpu->project, 1, gpu->splat2d);
     bindAt(core, gpu->countTiles, 0, gpu->splat2d);
@@ -339,7 +356,7 @@ bool SplatTrainer::buffers() {
     bindAt(core, gpu->blendRgbEd, 3, gpu->image);
     bindAt(core, gpu->blendRgbEd, 4, gpu->pixelBlend);
     bindAt(core, gpu->backRgb, 0, gpu->splat2d);
-    bindAt(core, gpu->backRgb, 3, gpu->srcGrad);
+    bindAt(core, gpu->backRgb, 3, colorGradient);
     bindAt(core, gpu->backRgb, 4, gpu->accum);
     bindAt(core, gpu->backRgb, 5, gpu->pixelBlend);
     bindAt(core, gpu->backEd, 0, gpu->splat2d);
@@ -347,7 +364,7 @@ bool SplatTrainer::buffers() {
     bindAt(core, gpu->backEd, 5, gpu->pixelBlend);
     bindAt(core, gpu->backEd, 6, gpu->depthGrad);
     bindAt(core, gpu->backRgbEd, 0, gpu->splat2d);
-    bindAt(core, gpu->backRgbEd, 3, gpu->srcGrad);
+    bindAt(core, gpu->backRgbEd, 3, colorGradient);
     bindAt(core, gpu->backRgbEd, 4, gpu->accum);
     bindAt(core, gpu->backRgbEd, 5, gpu->pixelBlend);
     bindAt(core, gpu->backRgbEd, 6, gpu->depthGrad);
@@ -355,37 +372,46 @@ bool SplatTrainer::buffers() {
     bindAt(core, gpu->depth, 1, gpu->depthGt);
     bindAt(core, gpu->depth, 2, gpu->depthGrad);
     bindAt(core, gpu->depth, 3, gpu->partial);
+    bindAt(core, gpu->depthQuality, 0, gpu->pixelBlend);
+    bindAt(core, gpu->depthQuality, 1, gpu->depthGt);
+    bindAt(core, gpu->depthQuality, 3, gpu->partial);
     bindAt(core, gpu->params, 0, gpu->gauss);
     bindAt(core, gpu->params, 1, gpu->accum);
     bindAt(core, gpu->params, 2, gpu->grad);
     bindAt(core, gpu->params, 3, gpu->densify);
     bindAt(core, gpu->params, 4, gpu->tileCount);
-    bindAt(core, gpu->slice, 0, gpu->grid);
-    bindAt(core, gpu->slice, 1, gpu->image);
-    bindAt(core, gpu->slice, 2, gpu->corrected);
-    bindAt(core, gpu->slice, 3, gpu->dstGrad);
-    bindAt(core, gpu->slice, 4, gpu->srcGrad);
-    bindAt(core, gpu->slice, 5, gpu->gridGrad);
-    bindAt(core, gpu->tv, 0, gpu->grid);
-    bindAt(core, gpu->tv, 5, gpu->gridGrad);
+    if (gridEnabled) {
+        bindAt(core, gpu->slice, 0, gpu->grid);
+        bindAt(core, gpu->slice, 1, gpu->image);
+        bindAt(core, gpu->slice, 2, gpu->corrected);
+        bindAt(core, gpu->slice, 3, gpu->dstGrad);
+        bindAt(core, gpu->slice, 4, gpu->srcGrad);
+        bindAt(core, gpu->slice, 5, gpu->gridGrad);
+        bindAt(core, gpu->tv, 0, gpu->grid);
+        bindAt(core, gpu->tv, 5, gpu->gridGrad);
+        bindAt(core, gpu->adamGrid, 0, gpu->grid);
+        bindAt(core, gpu->adamGrid, 1, gpu->gridGrad);
+        bindAt(core, gpu->adamGrid, 2, gpu->gridM);
+        bindAt(core, gpu->adamGrid, 3, gpu->gridV);
+    }
     bindAt(core, gpu->adam, 0, gpu->gauss);
     bindAt(core, gpu->adam, 1, gpu->grad);
     bindAt(core, gpu->adam, 2, gpu->moment);
     bindAt(core, gpu->adam, 3, gpu->vel);
-    bindAt(core, gpu->adamGrid, 0, gpu->grid);
-    bindAt(core, gpu->adamGrid, 1, gpu->gridGrad);
-    bindAt(core, gpu->adamGrid, 2, gpu->gridM);
-    bindAt(core, gpu->adamGrid, 3, gpu->gridV);
-    bindAt(core, gpu->ssimFwd, 0, gpu->corrected);
-    bindAt(core, gpu->ssimFwd, 1, gpu->target);
-    bindAt(core, gpu->ssimFwd, 2, gpu->stats);
-    bindAt(core, gpu->ssimBack, 0, gpu->corrected);
-    bindAt(core, gpu->ssimBack, 1, gpu->target);
-    bindAt(core, gpu->ssimBack, 2, gpu->stats);
-    bindAt(core, gpu->ssimBack, 4, gpu->dstGrad);
+    bindAt(core, gpu->ssimFwdRows, 0, color);
+    bindAt(core, gpu->ssimFwdRows, 1, gpu->target);
+    bindAt(core, gpu->ssimFwdRows, 7, gpu->ssimRows);
+    bindAt(core, gpu->ssimFwdColumns, 2, gpu->stats);
+    bindAt(core, gpu->ssimFwdColumns, 7, gpu->ssimRows);
+    bindAt(core, gpu->ssimBackRows, 2, gpu->stats);
+    bindAt(core, gpu->ssimBackRows, 7, gpu->ssimRows);
+    bindAt(core, gpu->ssimBackColumns, 0, color);
+    bindAt(core, gpu->ssimBackColumns, 1, gpu->target);
+    bindAt(core, gpu->ssimBackColumns, 4, gpu->dstGrad);
+    bindAt(core, gpu->ssimBackColumns, 7, gpu->ssimRows);
     bindAt(core, gpu->reduce, 1, gpu->target);
     bindAt(core, gpu->reduce, 2, gpu->stats);
-    bindAt(core, gpu->reduce, 5, gpu->corrected);
+    bindAt(core, gpu->reduce, 5, color);
     bindAt(core, gpu->reduce, 6, gpu->partial);
     return true;
 }
@@ -456,8 +482,9 @@ bool SplatTrainer::uploadGaussians(const float* verts, float voxel) {
 }
 
 bool SplatTrainer::uploadIdentity() {
-    std::vector<float> host(static_cast<size_t>(views) * kGridCell, 0.f);
-    for (int view = 0; view < views; ++view) {
+    const int gridViews = hyper.lrGrid == 0.f ? 0 : views;
+    std::vector<float> host(static_cast<size_t>(gridViews) * kGridCell, 0.f);
+    for (int view = 0; view < gridViews; ++view) {
         for (int l = 0; l < 8; ++l) {
             for (int y = 0; y < 16; ++y) {
                 for (int x = 0; x < 16; ++x) {
@@ -471,18 +498,23 @@ bool SplatTrainer::uploadIdentity() {
         }
     }
     Buffer stage{};
-    if (!core->buffer(host.size() * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, kHost, stage)) return false;
-    std::memcpy(stage.mapped, host.data(), host.size() * sizeof(float));
+    if (gridViews) {
+        if (!core->buffer(host.size() * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, kHost, stage)) return false;
+        std::memcpy(stage.mapped, host.data(), host.size() * sizeof(float));
+    }
     bool ok = submit(core, [&](VkCommandBuffer cmd) {
-        VkBufferCopy region{};
-        region.size = host.size() * sizeof(float);
-        vkCmdCopyBuffer(cmd, stage.buffer, gpu->grid.buffer, 1, &region);
-        vkCmdFillBuffer(cmd, gpu->moment.buffer, 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, gpu->vel.buffer, 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, gpu->densify.buffer, 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, gpu->gridM.buffer, 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, gpu->gridV.buffer, 0, VK_WHOLE_SIZE, 0);
-        for (const Buffer* buffer : {&gpu->grid, &gpu->moment, &gpu->vel, &gpu->densify, &gpu->gridM, &gpu->gridV}) {
+        if (gridViews) {
+            VkBufferCopy region{};
+            region.size = host.size() * sizeof(float);
+            vkCmdCopyBuffer(cmd, stage.buffer, gpu->grid.buffer, 1, &region);
+            barrier(cmd, gpu->grid.buffer, gpu->grid.size);
+            for (const Buffer* buffer : {&gpu->gridM, &gpu->gridV}) {
+                vkCmdFillBuffer(cmd, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
+                barrier(cmd, buffer->buffer, buffer->size);
+            }
+        }
+        for (const Buffer* buffer : {&gpu->moment, &gpu->vel, &gpu->densify}) {
+            vkCmdFillBuffer(cmd, buffer->buffer, 0, VK_WHOLE_SIZE, 0);
             barrier(cmd, buffer->buffer, buffer->size);
         }
     });
@@ -511,6 +543,7 @@ std::string SplatHyper::json() const {
         << ",\"lrQuat\":" << num(lrQuat)
         << ",\"lrOpacity\":" << num(lrOpacity)
         << ",\"lrColor\":" << num(lrColor)
+        << ",\"lrColorEnd\":" << num(lrColorEnd)
         << ",\"lrGrid\":" << num(lrGrid)
         << ",\"lrGridStart\":" << num(lrGridStart)
         << ",\"lrGridEnd\":" << num(lrGridEnd)
@@ -546,30 +579,49 @@ std::string SplatHyper::json() const {
     return out.str();
 }
 
-void SplatTrainer::setDensity(int interval, float threshold) {
+void SplatTrainer::configure(bool longProfile, int interval, float threshold) {
+    longTraining = longProfile;
+    hyper = SplatHyper{};
+    if (longTraining) {
+        hyper.seedContour = 1.25f;
+        hyper.lrMean = 0.00035f;
+        hyper.lrMeanEnd = 0.08f;
+        hyper.lrColor = 0.006f;
+        hyper.lrColorEnd = 0.25f;
+        hyper.lrGrid = 0.f;
+        hyper.depthLambda = 0.04f;
+        hyper.densifyFrom = 256;
+        hyper.densifyUntil = 5120;
+        hyper.densifyInterval = 256;
+        hyper.gradThreshold = 0.001f;
+        hyper.percentDense = 0.003f;
+        hyper.opacityResetEvery = 0;
+        return;
+    }
     if (interval >= 1) hyper.densifyInterval = interval;
     if (std::isfinite(threshold) && threshold >= 0.f) hyper.gradThreshold = threshold;
 }
 
 bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, int w, int h, int cap, int meanHorizon, int gridHorizon) {
     destroy();
+    error[0] = '\0';
     if (n < 3 || viewCount < 1 || w < 16 || h < 16) return false;
     budget = cap >= 3 ? cap : n;
     count = std::min(n, budget);
     capacity = count;
     meanSteps = std::max(1, meanHorizon);
-    gridSteps = std::max(1, gridHorizon);
+    gridSteps = hyper.lrGrid == 0.f ? 0 : std::max(1, gridHorizon);
     hyper.budget = budget;
     hyper.meanSteps = meanSteps;
     hyper.gridSteps = gridSteps;
     views = viewCount;
-    width = w;
-    height = h;
-    tilesX = (w + 15) / 16;
-    tilesY = (h + 15) / 16;
+    fullWidth = width = w;
+    fullHeight = height = h;
+    tilesX = (width + 15) / 16;
+    tilesY = (height + 15) / 16;
     gaussStep = 0;
     gridStep = 0;
-    gridViewSteps.assign(views, 0);
+    gridViewSteps.assign(hyper.lrGrid == 0.f ? 0 : views, 0);
     if (!kernels() || !buffers() || !uploadGaussians(verts, voxel) || !uploadIdentity()) {
         LOGE("splat init failed");
         destroy();
@@ -578,6 +630,15 @@ bool SplatTrainer::init(const float* verts, int n, float voxel, int viewCount, i
     hyper.extent = extent;
     hyperRecord = hyper.json();
     LOGI("splat %d gaussians, budget %d, extent %.2f m, %d views, %dx%d", count, budget, extent, views, width, height);
+    return true;
+}
+
+bool SplatTrainer::setResolution(int w, int h) {
+    if (count == 0 || w < 16 || h < 16 || w > fullWidth || h > fullHeight) return false;
+    width = w;
+    height = h;
+    tilesX = (width + 15) / 16;
+    tilesY = (height + 15) / 16;
     return true;
 }
 
@@ -904,8 +965,8 @@ bool SplatTrainer::projectAndBlend(const float pose[16], float fx, float fy, flo
     });
 }
 
-bool SplatTrainer::depthLoss(const float* depth, float& loss, float& weight) {
-    loss = 0.f;
+bool SplatTrainer::depthLoss(const float* depth, bool measureQuality, float* metrics, float& weight) {
+    metrics[3] = 0.f;
     weight = 0.f;
     if (depth == nullptr) return true;
     const int pixels = width * height;
@@ -919,41 +980,54 @@ bool SplatTrainer::depthLoss(const float* depth, float& loss, float& weight) {
             region.size = static_cast<VkDeviceSize>(pixels) * sizeof(float);
             vkCmdCopyBuffer(cmd, gpu->stageTarget.buffer, gpu->depthGt.buffer, 1, &region);
             barrier(cmd, gpu->depthGt.buffer, gpu->depthGt.size);
-            dispatch(cmd, gpu->depth, &push, sizeof(push), 1, 1);
-            barrier(cmd, gpu->depthGrad.buffer, gpu->depthGrad.size);
+            ComputeKernel& kernel = measureQuality ? gpu->depthQuality : gpu->depth;
+            dispatch(cmd, kernel, &push, sizeof(push), kLossLanes / 256, 1);
+            if (!measureQuality) barrier(cmd, gpu->depthGrad.buffer, gpu->depthGrad.size);
         })) {
         return false;
     }
     hostRead(core, gpu->partial);
     auto* part = static_cast<const float*>(gpu->partial.mapped);
-    double sum = 0;
-    double hits = 0;
-    for (int i = 0; i < 256; ++i) {
-        sum += part[i * 2];
-        hits += part[i * 2 + 1];
+    double totals[5]{};
+    const int stride = measureQuality ? 5 : 2;
+    for (int i = 0; i < kLossLanes; ++i) {
+        for (int j = 0; j < stride; ++j) totals[j] += part[i * stride + j];
     }
-    if (hits > 0.0) {
-        loss = static_cast<float>(sum / hits);
-        weight = hyper.extent * hyper.depthLambda / static_cast<float>(hits);
+    if (totals[1] > 0.0) {
+        metrics[3] = static_cast<float>(totals[0] / totals[1]);
+        weight = hyper.extent * hyper.depthLambda / static_cast<float>(totals[1]);
+    }
+    if (measureQuality) {
+        for (int j = 1; j < stride; ++j) metrics[3 + j] = static_cast<float>(totals[j]);
     }
     return true;
 }
 
-bool SplatTrainer::metricsOf(float out[4]) {
+void SplatTrainer::recordSsimForward(VkCommandBuffer cmd) {
+    SsimPush push{};
+    push.width = width;
+    push.height = height;
+    dispatch(cmd, gpu->ssimFwdRows, &push, sizeof(push), (width + 15) / 16, (height + 7) / 8);
+    barrier(cmd, gpu->ssimRows.buffer, gpu->ssimRows.size);
+    dispatch(cmd, gpu->ssimFwdColumns, &push, sizeof(push), (width + 15) / 16, (height + 7) / 8);
+    barrier(cmd, gpu->stats.buffer, gpu->stats.size);
+}
+
+bool SplatTrainer::metricsOf(float* out) {
     SsimPush push{};
     push.width = width;
     push.height = height;
     const int pixels = width * height;
     if (!submit(core, [&](VkCommandBuffer cmd) {
-            dispatch(cmd, gpu->ssimFwd, &push, sizeof(push), (width + 7) / 8, (height + 7) / 8);
-            barrier(cmd, gpu->stats.buffer, gpu->stats.size);
-            dispatch(cmd, gpu->reduce, &push, sizeof(push), 1, 1);
+            recordSsimForward(cmd);
+            dispatch(cmd, gpu->reduce, &push, sizeof(push), kLossLanes / 256, 1);
         })) {
         return false;
     }
-    auto* part = static_cast<float*>(gpu->partial.mapped);
+    hostRead(core, gpu->partial);
+    auto* part = static_cast<const float*>(gpu->partial.mapped);
     double l1 = 0, mse = 0, ssim = 0;
-    for (int i = 0; i < 256; ++i) {
+    for (int i = 0; i < kLossLanes; ++i) {
         l1 += part[i * 3];
         mse += part[i * 3 + 1];
         ssim += part[i * 3 + 2];
@@ -1264,7 +1338,7 @@ bool SplatTrainer::densify() {
 }
 
 bool SplatTrainer::step(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy, int view,
-                        bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[4]) {
+                        bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[kMetricCount]) {
     if (gpu->gauss.buffer == VK_NULL_HANDLE || view < 0 || view >= views) return false;
     const int pixels = width * height;
     std::memcpy(gpu->stageTarget.mapped, rgb, static_cast<size_t>(pixels) * 3 * sizeof(float));
@@ -1278,10 +1352,10 @@ bool SplatTrainer::step(const float* rgb, const float* depth, const float pose[1
     }
     const int mode = depth == nullptr ? 0 : 2;
     if (!projectAndBlend(pose, fx, fy, cx, cy, mode)) return false;
-    float depthMean = 0.f;
     float depthWeight = 0.f;
-    if (!depthLoss(depth, depthMean, depthWeight)) return false;
-    metrics[3] = depthMean;
+    if (!depthLoss(depth, metricsAfter && !updateGauss, metrics, depthWeight)) return false;
+    const bool gridEnabled = hyper.lrGrid != 0.f;
+    updateGrid = updateGrid && gridEnabled;
     GridPush grid{};
     grid.width = width;
     grid.height = height;
@@ -1289,14 +1363,15 @@ bool SplatTrainer::step(const float* rgb, const float* depth, const float pose[1
     grid.views = views;
     grid.backward = 0;
     grid.tv = hyper.tvLambda;
-    if (!submit(core, [&](VkCommandBuffer cmd) {
+    if (gridEnabled && !submit(core, [&](VkCommandBuffer cmd) {
             dispatch(cmd, gpu->slice, &grid, sizeof(grid), (width + 7) / 8, (height + 7) / 8);
             barrier(cmd, gpu->corrected.buffer, gpu->corrected.size);
         })) {
         return false;
     }
-    if (!updateGrid) return metricsOf(metrics);
-    if (!metricsAfter && !metricsOf(metrics)) return false;
+    if (!updateGauss && !updateGrid) return metricsOf(metrics);
+    const bool fitBeforeMetrics = metricsAfter && updateGrid;
+    if (!fitBeforeMetrics && !metricsOf(metrics)) return false;
     SsimPush ssim{};
     ssim.width = width;
     ssim.height = height;
@@ -1322,22 +1397,25 @@ bool SplatTrainer::step(const float* rgb, const float* depth, const float pose[1
     param.height = height;
     param.collectDensity = gaussStep < hyper.densifyUntil;
     if (!submit(core, [&](VkCommandBuffer cmd) {
-            if (metricsAfter) {
-                dispatch(cmd, gpu->ssimFwd, &ssim, sizeof(ssim), (width + 7) / 8, (height + 7) / 8);
-                barrier(cmd, gpu->stats.buffer, gpu->stats.size);
+            if (fitBeforeMetrics) recordSsimForward(cmd);
+            if (gridEnabled) {
+                const VkDeviceSize gridBytes = kGridCell * sizeof(uint32_t);
+                vkCmdFillBuffer(cmd, gpu->gridGrad.buffer, view * gridBytes, gridBytes, 0);
+                barrier(cmd, gpu->gridGrad.buffer, gpu->gridGrad.size);
             }
-            const VkDeviceSize gridBytes = kGridCell * sizeof(uint32_t);
-            vkCmdFillBuffer(cmd, gpu->gridGrad.buffer, view * gridBytes, gridBytes, 0);
-            barrier(cmd, gpu->gridGrad.buffer, gpu->gridGrad.size);
-            dispatch(cmd, gpu->ssimBack, &ssim, sizeof(ssim), (width + 7) / 8, (height + 7) / 8);
+            dispatch(cmd, gpu->ssimBackRows, &ssim, sizeof(ssim), (width + 15) / 16, (height + 7) / 8);
+            barrier(cmd, gpu->ssimRows.buffer, gpu->ssimRows.size);
+            dispatch(cmd, gpu->ssimBackColumns, &ssim, sizeof(ssim), (width + 15) / 16, (height + 7) / 8);
             barrier(cmd, gpu->dstGrad.buffer, gpu->dstGrad.size);
-            grid.backward = 1;
-            dispatch(cmd, gpu->slice, &grid, sizeof(grid), (width + 7) / 8, (height + 7) / 8);
+            if (gridEnabled) {
+                grid.backward = 1;
+                dispatch(cmd, gpu->slice, &grid, sizeof(grid), (width + 7) / 8, (height + 7) / 8);
+                barrier(cmd, gpu->srcGrad.buffer, gpu->srcGrad.size);
+            }
             if (updateGauss) {
                 vkCmdFillBuffer(cmd, gpu->accum.buffer, 0, VK_WHOLE_SIZE, 0);
                 barrier(cmd, gpu->accum.buffer, gpu->accum.size);
                 if (gpu->pairCount > 0) {
-                    barrier(cmd, gpu->srcGrad.buffer, gpu->srcGrad.size);
                     ComputeKernel* backKernel = mode == 2 ? &gpu->backRgbEd : &gpu->backRgb;
                     dispatch(cmd, *backKernel, &back, sizeof(back), tilesX, tilesY);
                     barrier(cmd, gpu->accum.buffer, gpu->accum.size);
@@ -1346,11 +1424,13 @@ bool SplatTrainer::step(const float* rgb, const float* depth, const float pose[1
                 barrier(cmd, gpu->grad.buffer, gpu->grad.size);
                 barrier(cmd, gpu->densify.buffer, gpu->densify.size);
             }
-            GridPush tv = grid;
-            tv.backward = 0;
-            barrier(cmd, gpu->gridGrad.buffer, gpu->gridGrad.size);
-            dispatch(cmd, gpu->tv, &tv, sizeof(tv), (kGridCell + 63) / 64, 1);
-            barrier(cmd, gpu->gridGrad.buffer, gpu->gridGrad.size);
+            if (updateGrid) {
+                GridPush tv = grid;
+                tv.backward = 0;
+                barrier(cmd, gpu->gridGrad.buffer, gpu->gridGrad.size);
+                dispatch(cmd, gpu->tv, &tv, sizeof(tv), (kGridCell + 63) / 64, 1);
+                barrier(cmd, gpu->gridGrad.buffer, gpu->gridGrad.size);
+            }
         })) {
         return false;
     }
@@ -1361,10 +1441,11 @@ bool SplatTrainer::step(const float* rgb, const float* depth, const float pose[1
         adam.step = gaussStep;
         const float meanProgress = std::min(1.f, static_cast<float>(gaussStep) / static_cast<float>(hyper.meanSteps));
         adam.lrMean = hyper.lrMean * std::pow(hyper.lrMeanEnd, meanProgress);
-        adam.lrColor = hyper.lrColor;
-        adam.lrOp = hyper.lrOpacity;
+        adam.lrColor = hyper.lrColor * std::pow(hyper.lrColorEnd, meanProgress);
+        const bool polish = longTraining && gaussStep > hyper.meanSteps;
+        adam.lrOp = polish ? 0.02f : hyper.lrOpacity;
         adam.lrQuat = hyper.lrQuat;
-        adam.lrScale = hyper.lrScale;
+        adam.lrScale = polish ? 0.002f : hyper.lrScale;
         adam.eps = hyper.adamEps;
         adam.beta1 = hyper.beta1;
         adam.beta2 = hyper.beta2;
@@ -1378,6 +1459,7 @@ bool SplatTrainer::step(const float* rgb, const float* depth, const float pose[1
         }
         if (!densify()) return false;
     }
+    if (!updateGrid) return true;
     ++gridStep;
     GridAdamPush gridAdam{};
     gridAdam.offset = view * kGridCell;
@@ -1445,7 +1527,8 @@ bool SplatTrainer::readCorrected(uint8_t* rgb) {
     if (!submit(core, [&](VkCommandBuffer cmd) {
             VkBufferCopy region{};
             region.size = static_cast<VkDeviceSize>(pixels) * 3 * sizeof(float);
-            vkCmdCopyBuffer(cmd, gpu->corrected.buffer, gpu->stageImage.buffer, 1, &region);
+            const Buffer& image = hyper.lrGrid == 0.f ? gpu->image : gpu->corrected;
+            vkCmdCopyBuffer(cmd, image.buffer, gpu->stageImage.buffer, 1, &region);
         })) {
         return false;
     }

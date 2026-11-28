@@ -108,15 +108,18 @@ slang_shader("${SHADER_DIR}/splat_blend.slang" blendRgbEd compute splat_blend_rg
 slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackwardRgb compute splat_back_rgb_spv)
 slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackwardEd compute splat_back_ed_spv)
 slang_shader("${SHADER_DIR}/splat_blend_back.slang" blendBackwardRgbEd compute splat_back_rgbed_spv)
-slang_shader("${SHADER_DIR}/splat_depth.slang" depthLoss compute splat_depth_spv)
+slang_shader("${SHADER_DIR}/splat_depth.slang" depthLossWide compute splat_depth_spv)
+slang_shader("${SHADER_DIR}/splat_depth.slang" depthQualityWide compute splat_depth_quality_spv)
 slang_shader("${SHADER_DIR}/splat_params.slang" paramGrad compute splat_params_spv)
 slang_shader("${SHADER_DIR}/bilagrid.slang" sliceGrid compute bilagrid_slice_spv)
 slang_shader("${SHADER_DIR}/bilagrid.slang" gridTv compute bilagrid_tv_spv)
 slang_shader("${SHADER_DIR}/splat_adam.slang" adamGauss compute splat_adam_spv)
 slang_shader("${SHADER_DIR}/splat_adam_grid.slang" adamGrid compute splat_adam_grid_spv)
-slang_shader("${SHADER_DIR}/ssim.slang" ssimForward compute ssim_fwd_spv)
-slang_shader("${SHADER_DIR}/ssim.slang" ssimBackward compute ssim_back_spv)
-slang_shader("${SHADER_DIR}/ssim.slang" reduceLoss compute ssim_reduce_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" ssimForwardRows compute ssim_fwd_rows_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" ssimForwardColumns compute ssim_fwd_columns_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" ssimBackwardRows compute ssim_back_rows_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" ssimBackwardColumns compute ssim_back_columns_spv)
+slang_shader("${SHADER_DIR}/ssim.slang" reduceLossWide compute ssim_reduce_spv)
 list(APPEND SHADER_HEADERS
     "${SHADER_OUT}/integrate_spv.h"
     "${SHADER_OUT}/clear_draw_spv.h"
@@ -139,13 +142,16 @@ list(APPEND SHADER_HEADERS
     "${SHADER_OUT}/splat_back_ed_spv.h"
     "${SHADER_OUT}/splat_back_rgbed_spv.h"
     "${SHADER_OUT}/splat_depth_spv.h"
+    "${SHADER_OUT}/splat_depth_quality_spv.h"
     "${SHADER_OUT}/splat_params_spv.h"
     "${SHADER_OUT}/bilagrid_slice_spv.h"
     "${SHADER_OUT}/bilagrid_tv_spv.h"
     "${SHADER_OUT}/splat_adam_spv.h"
     "${SHADER_OUT}/splat_adam_grid_spv.h"
-    "${SHADER_OUT}/ssim_fwd_spv.h"
-    "${SHADER_OUT}/ssim_back_spv.h"
+    "${SHADER_OUT}/ssim_fwd_rows_spv.h"
+    "${SHADER_OUT}/ssim_fwd_columns_spv.h"
+    "${SHADER_OUT}/ssim_back_rows_spv.h"
+    "${SHADER_OUT}/ssim_back_columns_spv.h"
     "${SHADER_OUT}/ssim_reduce_spv.h")
 
 add_library(pocket_vk SHARED

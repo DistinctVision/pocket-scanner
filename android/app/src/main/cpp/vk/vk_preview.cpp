@@ -901,9 +901,13 @@ std::vector<float> Preview::takeSeedCoverage() {
     return samples;
 }
 
-void Preview::splatDensity(int interval, float threshold) {
+void Preview::splatConfigure(bool longTraining, int interval, float threshold) {
     if (splat == nullptr) splat = new SplatTrainer(&core);
-    splat->setDensity(interval, threshold);
+    splat->configure(longTraining, interval, threshold);
+}
+
+bool Preview::splatSetResolution(int width, int height) {
+    return splat != nullptr && splat->setResolution(width, height);
 }
 
 bool Preview::splatInitFromSeed(int views, int width, int height, int budget, int meanSteps, int gridSteps) {
@@ -923,7 +927,7 @@ bool Preview::splatInit(const float* verts, int count, float voxel, int views, i
 }
 
 bool Preview::splatStep(const float* rgb, const float* depth, const float pose[16], float fx, float fy, float cx, float cy, int view,
-                        bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[4]) {
+                        bool updateGauss, bool updateGrid, bool metricsAfter, float metrics[SplatTrainer::kMetricCount]) {
     return splat != nullptr && splat->step(rgb, depth, pose, fx, fy, cx, cy, view, updateGauss, updateGrid, metricsAfter, metrics);
 }
 

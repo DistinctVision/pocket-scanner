@@ -379,28 +379,20 @@ class RealSenseSession(
         return true
     }
 
-    fun setSplatting(
-        epochs: Int,
-        validation: Boolean,
-        percent: Int,
-        every: Int,
-        budget: Int,
-        videoSeconds: Int,
-        densifyInterval: Int,
-        gradThreshold: Float,
-        filterRedundantFrames: Boolean,
-    ) {
-        val share = if (percent == 8 || percent == 10) percent else 5
-        val next = settings.get().copy(
-            epochs = epochs.coerceIn(1, 500),
-            validation = validation,
-            validationPercent = share,
-            validationEvery = every.coerceIn(1, 50),
-            gaussBudget = budget.coerceIn(100_000, 5_000_000),
-            videoSeconds = videoSeconds.coerceIn(1, 30),
-            densifyInterval = densifyInterval.coerceIn(1, 100_000),
-            gradThreshold = if (gradThreshold.isFinite() && gradThreshold >= 0f) gradThreshold else settings.get().gradThreshold,
-            filterRedundantFrames = filterRedundantFrames,
+    fun setSplatting(config: ScanSettings) {
+        val current = settings.get()
+        val share = config.validationPercent
+        val next = current.copy(
+            epochs = config.epochs.coerceIn(1, 500),
+            validation = config.validation,
+            validationPercent = if (share == 8 || share == 10) share else 5,
+            validationEvery = config.validationEvery.coerceIn(1, 50),
+            gaussBudget = config.gaussBudget.coerceIn(100_000, 5_000_000),
+            videoSeconds = config.videoSeconds.coerceIn(1, 30),
+            densifyInterval = config.densifyInterval.coerceIn(1, 100_000),
+            gradThreshold = config.gradThreshold.takeIf { it.isFinite() && it >= 0f } ?: current.gradThreshold,
+            filterRedundantFrames = config.filterRedundantFrames,
+            longSplatTraining = config.longSplatTraining,
         )
         settings.set(next)
         mesh?.replaceSettings(next)
@@ -479,6 +471,7 @@ class RealSenseSession(
                         if (value.isFinite() && value >= 0f) value else 2e-4f
                     },
                     filterRedundantFrames = json.optBoolean("filterRedundantFrames", true),
+                    longSplatTraining = json.optBoolean("longSplatTraining", true),
                 ),
             )
             frontierOn.set(json.optBoolean("frontier", false))
@@ -506,6 +499,7 @@ class RealSenseSession(
         json.put("densifyInterval", scan.densifyInterval)
         json.put("gradThreshold", scan.gradThreshold.toDouble())
         json.put("filterRedundantFrames", scan.filterRedundantFrames)
+        json.put("longSplatTraining", scan.longSplatTraining)
         json.put("frontier", frontierOn.get())
         try {
             settingsFile().writeText(json.toString())
@@ -520,7 +514,7 @@ class RealSenseSession(
 
     /** Copies color views, reads the mesh, then stops the camera and frees the volume. */
     fun beginSplatting(dir: File, config: ScanSettings): SplatPrepared {
-        val cap = config.gaussBudget
+        val cap = if (config.longSplatTraining) SplatTrainingPlan.LONG_BUDGET else config.gaussBudget
         val collectCoverage = config.filterRedundantFrames
         val meshFile = File(scanDir, "mesh.ply")
         val haveSeed =
