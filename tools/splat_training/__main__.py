@@ -4,16 +4,22 @@ import argparse
 import json
 import logging
 import math
+import random
 import sys
 import time
 from dataclasses import asdict, fields, replace
+from itertools import islice
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
 from PIL import Image
 
 from .capture import Capture
-from .frame_selection import select_training_frames
+from .frame_selection import (
+    NEAR_POSITION_M,
+    NEAR_ROTATION_DEGREES,
+    select_training_frames,
+)
 from .gpu import Gpu
 from .population import Hyper, seed_gaussians
 from .trainer import Metrics, Trainer
@@ -37,6 +43,15 @@ def options():
     parser.add_argument("--mesh", type=Path, help="override the mesh.ply inside the recording")
     parser.add_argument("--backend", choices=("auto", "metal", "vulkan"), default="auto")
     parser.add_argument("--epochs", type=at_least(1), default=100)
+    parser.add_argument(
+        "--steps-per-epoch", type=at_least(1),
+        help="run a fixed number of Gaussian updates per epoch for comparisons across datasets",
+    )
+    parser.add_argument(
+        "--coarse-epochs", type=at_least(0), default=0,
+        help="train at half resolution for the first N epochs and evaluate at full resolution throughout",
+    )
+    parser.add_argument("--shuffle-seed", type=int, help="deterministically shuffle each traversal of train views")
     parser.add_argument("--budget", type=at_least(3), default=3_000_000)
     parser.add_argument("--validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--validation-percent", choices=(5, 8, 10), type=int, default=5)
@@ -45,9 +60,18 @@ def options():
         "--filter-redundant-frames", action=argparse.BooleanOptionalAction, default=True,
         help="discard train views whose measured coverage and parallax are already represented (default: enabled)",
     )
+    parser.add_argument(
+        "--filter-pose-distance", type=float, default=NEAR_POSITION_M, metavar="METERS",
+        help="maximum distance from an original pose to a retained representative",
+    )
+    parser.add_argument(
+        "--filter-pose-angle", type=float, default=NEAR_ROTATION_DEGREES, metavar="DEGREES",
+        help="maximum relative camera rotation to a retained representative",
+    )
     parser.add_argument("--max-frames", type=at_least(1), help="debug with the first N usable views by ID")
     parser.add_argument("--hyper", type=Path, help="JSON object with overrides named as in SplatHyper")
     parser.add_argument("--tensorboard", action="store_true", help="write per-view and per-epoch scalars")
+    parser.add_argument("--save-validation-scenes", action="store_true", help="export a PLY after each validation pass")
     return parser.parse_args()
 
 
@@ -71,6 +95,8 @@ def read_hyper(path):
         raise ValueError("seedOpacity must be > 1/255 and <= 1")
     if not (0 <= hyper.beta1 < 1 and 0 <= hyper.beta2 < 1 and hyper.adamEps > 0):
         raise ValueError("Adam requires beta1 and beta2 in [0, 1) and positive adamEps")
+    if not 0 < hyper.lrColorEnd <= 1:
+        raise ValueError("lrColorEnd must be > 0 and <= 1")
     return hyper
 
 
@@ -92,7 +118,8 @@ class Logs:
         if self.board is not None:
             summary = self.summary_type()
             for name, value in values.items():
-                summary.value.add(tag=f"{prefix}/{name}", simple_value=value)
+                if value is not None:
+                    summary.value.add(tag=f"{prefix}/{name}", simple_value=value)
             self.board.add_event(self.event_type(wall_time=time.time(), step=step, summary=summary))
 
     def epoch(self, epoch, split, metrics, count):
@@ -102,9 +129,10 @@ class Logs:
         self.scalars(f"epoch/{split}", epoch, metrics | {"gaussians": count})
         if self.board is not None:
             self.board.flush()
+        raw = f"  raw PSNR {metrics['raw_psnr']:.3f}" if split == "val" else ""
         logger.info(
-            "Epoch %d %s  L1 %.5f  SSIM %.5f  PSNR %.3f  depth %.5f  Gaussians %d",
-            epoch, split, metrics["l1"], metrics["ssim"], metrics["psnr"], metrics["depth"], count,
+            "Epoch %d %s  L1 %.5f  SSIM %.5f  PSNR %.3f%s  depth %.5f  Gaussians %d",
+            epoch, split, metrics["l1"], metrics["ssim"], metrics["psnr"], raw, metrics["depth"], count,
         )
 
     def close(self):
@@ -114,21 +142,38 @@ class Logs:
 
 def run_pass(capture, views, trainer, logs, split, epoch, epochs):
     train = split == "train"
+    size = (trainer.raster.width, trainer.raster.height)
     sums = dict.fromkeys(Metrics.__dataclass_fields__, 0.0)
+    if not train:
+        sums.update(dict.fromkeys(("raw_l1", "raw_ssim", "raw_psnr"), 0.0))
+    depth_targets = depth_matches = 0
+    depth_abs_sum = depth_square_sum = 0.0
+    start = time.monotonic()
     for number, (index, view) in enumerate(views, start=1):
         try:
-            rgb, depth = capture.images(view)
+            rgb, depth = capture.images(view, size)
             metrics = asdict(trainer.step(view, index, rgb, depth, train=train))
+            if not train:
+                if trainer.uses_grid:
+                    metrics.update(trainer.raw_color_metrics())
+                else:
+                    metrics.update(raw_l1=metrics["l1"], raw_ssim=metrics["ssim"], raw_psnr=metrics["psnr"])
+                targets, matches, abs_sum, square_sum = trainer.validation_depth_totals(depth)
+                depth_targets += targets
+                depth_matches += matches
+                depth_abs_sum += abs_sum
+                depth_square_sum += square_sum
         except (ValueError, RuntimeError, OSError, KeyError) as error:
             raise RuntimeError(f"Epoch {epoch}, {split}, frame {view.id}: {error}") from error
         for key, value in metrics.items():
             sums[key] += value
         logs.scalars(
-            f"view/{split}", trainer.grid_step,
+            f"view/{split}", trainer.grid_step if trainer.uses_grid else trainer.gauss_step,
             metrics | {
                 "frame_id": view.id, "gaussians": trainer.count, "tile_pairs": trainer.raster.pair_count,
-                "lr_grid": trainer.hyper.grid_rate(trainer.grid_step, trainer.grid_steps),
+                "lr_grid": trainer.hyper.grid_rate(trainer.grid_step, trainer.grid_steps) if trainer.uses_grid else 0.0,
                 "lr_mean": trainer.hyper.mean_rate(trainer.gauss_step, trainer.mean_steps) if train else 0.0,
+                "lr_color": trainer.hyper.color_rate(trainer.gauss_step, trainer.mean_steps) if train else 0.0,
             },
         )
         if not train:
@@ -137,7 +182,29 @@ def run_pass(capture, views, trainer, logs, split, epoch, epochs):
             Image.fromarray(trainer.corrected_rgb()).save(val / f"{view.id}.png")
         if number == 1 or number % 25 == 0 or number == len(views):
             logger.info("Epoch %d/%d %s %d/%d (frame %d)", epoch, epochs, split, number, len(views), view.id)
-    logs.epoch(epoch, split, {key: value / len(views) for key, value in sums.items()}, trainer.count)
+    averaged = {key: value / len(views) for key, value in sums.items()}
+    if not train:
+        averaged.update({
+            "depth_coverage": depth_matches / depth_targets if depth_targets else None,
+            "depth_mae_m": depth_abs_sum / depth_matches if depth_matches else None,
+            "depth_rmse_m": math.sqrt(depth_square_sum / depth_matches) if depth_matches else None,
+            "depth_target_pixels": depth_targets,
+            "depth_matched_pixels": depth_matches,
+        })
+    logs.epoch(epoch, split, averaged | {
+        "gauss_step": trainer.gauss_step, "grid_step": trainer.grid_step,
+        "width": size[0], "height": size[1],
+        "seconds": time.monotonic() - start,
+    }, trainer.count)
+
+
+def training_views(views, shuffle_seed):
+    traversal = list(views)
+    rng = random.Random(shuffle_seed) if shuffle_seed is not None else None
+    while traversal:
+        if rng is not None:
+            rng.shuffle(traversal)
+        yield from traversal
 
 
 def write_json(path, values):
@@ -146,38 +213,55 @@ def write_json(path, values):
 
 def run(args):
     hyper = read_hyper(args.hyper)
+    if args.coarse_epochs >= args.epochs:
+        raise ValueError("--coarse-epochs must leave at least one full-resolution epoch")
+    if not math.isfinite(args.filter_pose_distance) or args.filter_pose_distance <= 0:
+        raise ValueError("--filter-pose-distance must be finite and positive")
+    if not 0 < args.filter_pose_angle <= 180:
+        raise ValueError("--filter-pose-angle must be > 0 and <= 180 degrees")
     with ZipFile(args.scan) as archive:
         capture = Capture(archive)
         views = list(enumerate(capture.views[:args.max_frames]))
-        step = math.floor(100 / args.validation_percent + 0.5) if args.validation else len(views) + 1
-        train = [(i, view) for i, view in views if not args.validation or i % step]
-        val = [(i, view) for i, view in views if args.validation and i % step == 0]
+        step = math.floor(100 / args.validation_percent + 0.5)
+        val = [(i, view) for i, view in views if args.validation and len(views) > 1 and i % step == 0]
+        val_indices = {i for i, _ in val}
+        train = [(i, view) for i, view in views if i not in val_indices]
         selection_info = {"enabled": args.filter_redundant_frames, "sourceTrainCount": len(train)}
         mesh = capture.training_mesh(
             args.budget, args.mesh, include_coverage=args.filter_redundant_frames and bool(train),
         )
         if mesh.coverage_points is not None:
             logger.info("Checking measured coverage and parallax for %d train views", len(train))
-            selection = select_training_frames(capture, [view for _, view in train], mesh.coverage_points)
+            selection = select_training_frames(
+                capture, [view for _, view in train], mesh.coverage_points, mesh.voxel,
+                near_position=args.filter_pose_distance, near_rotation=args.filter_pose_angle,
+            )
             selection_info.update({
                 "surfaceSamples": len(mesh.coverage_points),
                 "coveredSamples": selection.covered_samples,
                 "parallaxSamples": selection.parallax_samples,
+                "retainedCoveredSamples": selection.retained_covered_samples,
+                "retainedParallaxSamples": selection.retained_parallax_samples,
+                "nearPositionMeters": args.filter_pose_distance,
+                "nearRotationDegrees": args.filter_pose_angle,
                 "droppedTrainIds": [train[i][1].id for i in selection.dropped_indices],
                 "unverifiedTrainIds": [train[i][1].id for i in selection.unverified_indices],
             })
             train = [train[i] for i in selection.kept_indices]
             logger.info(
-                "Kept %d/%d train views, with measured coverage at %d mesh samples and parallax at %d",
-                len(train), selection_info["sourceTrainCount"], selection.covered_samples,
-                selection.parallax_samples,
+                "Kept %d/%d train views, preserving coverage at %d/%d samples and parallax at %d/%d",
+                len(train), selection_info["sourceTrainCount"], selection.retained_covered_samples,
+                selection.covered_samples, selection.retained_parallax_samples, selection.parallax_samples,
             )
         # Allocate grids only for the views used by the run, in source order.
         grid_indices = {index: i for i, index in enumerate(sorted(index for index, _ in train + val))}
         train = [(grid_indices[index], view) for index, view in train]
         val = [(grid_indices[index], view) for index, view in val]
-        mean_steps = max(1, args.epochs * len(train))
-        grid_steps = mean_steps + (args.epochs // args.validation_every) * len(val)
+        if not train:
+            raise ValueError("No train views. Disable validation or use more frames.")
+        steps_per_epoch = args.steps_per_epoch or len(train)
+        mean_steps = args.epochs * steps_per_epoch
+        grid_steps = mean_steps + (args.epochs // args.validation_every) * len(val) if hyper.lrGrid else 0
         voxel = mesh.voxel
         gauss, extent = seed_gaussians(mesh.seed, voxel, hyper)
         del mesh
@@ -186,8 +270,10 @@ def run(args):
             args.scan.name, len(train), len(val), capture.width, capture.height, len(gauss), voxel,
         )
         gpu = Gpu(args.backend)
+        full_size = (capture.width, capture.height)
+        coarse_size = tuple(max(16, side // 2) for side in full_size)
         trainer = Trainer(
-            gpu, gauss, extent, capture.width, capture.height, len(grid_indices),
+            gpu, gauss, extent, *(coarse_size if args.coarse_epochs else full_size), len(grid_indices),
             hyper, args.budget, mean_steps, grid_steps,
         )
         del gauss
@@ -198,6 +284,8 @@ def run(args):
             "width": capture.width, "height": capture.height, "voxel": voxel,
             "epochs": args.epochs, "validation": args.validation, "percent": args.validation_percent,
             "every": args.validation_every, "budget": args.budget, "seedCount": trainer.count,
+            "stepsPerEpoch": steps_per_epoch, "shuffleSeed": args.shuffle_seed,
+            "coarseEpochs": args.coarse_epochs, "coarseSize": coarse_size if args.coarse_epochs else None,
             "meanSteps": mean_steps, "gridSteps": grid_steps,
             "trainIds": [view.id for _, view in train], "valIds": [view.id for _, view in val],
             "frameSelection": selection_info,
@@ -207,11 +295,15 @@ def run(args):
         })
         logs = Logs(args.output, args.tensorboard)
         try:
+            stream = training_views(train, args.shuffle_seed)
             for epoch in range(1, args.epochs + 1):
-                if train:
-                    run_pass(capture, train, trainer, logs, "train", epoch, args.epochs)
+                trainer.set_resolution(*(coarse_size if epoch <= args.coarse_epochs else full_size))
+                run_pass(capture, list(islice(stream, steps_per_epoch)), trainer, logs, "train", epoch, args.epochs)
                 if val and epoch % args.validation_every == 0:
+                    trainer.set_resolution(*full_size)
                     run_pass(capture, val, trainer, logs, "val", epoch, args.epochs)
+                    if args.save_validation_scenes:
+                        trainer.export(args.output / f"scene-{trainer.gauss_step:06}.ply")
             trainer.export(args.output / "scene.ply")
         finally:
             logs.close()

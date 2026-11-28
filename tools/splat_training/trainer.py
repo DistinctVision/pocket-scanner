@@ -22,8 +22,6 @@ class Metrics:
 
 class Trainer:
     def __init__(self, gpu, gauss, extent, width, height, views, hyper, budget, mean_steps, grid_steps):
-        if min(width, height) < 16:
-            raise ValueError("Training frames must be at least 16×16")
         self.gpu = gpu
         self.hyper = hyper
         self.budget = budget
@@ -32,35 +30,48 @@ class Trainer:
         self.grid_steps = grid_steps
         self.gauss_step = 0
         self.grid_step = 0
-        self.grid_view_steps = [0] * views
+        self.uses_grid = hyper.lrGrid != 0
+        self.grid_view_steps = [0] * views if self.uses_grid else []
+        if self.uses_grid:
+            identity = np.zeros(GRID_SHAPE, dtype=np.float32)
+            identity[[0, 5, 10]] = 1
+            grids = np.tile(identity.reshape(-1), views)
+            self.grid = gpu.buffer(grids.nbytes, "Bilateral grids", grids)
+            self.grid_m = gpu.buffer(grids.nbytes, "Grid Adam first moments")
+            self.grid_v = gpu.buffer(grids.nbytes, "Grid Adam second moments")
+            self.grid_grad = gpu.buffer(grids.nbytes, "Grid gradients")
+            self.clear_grid_grad = np.zeros(GRID_CELL, dtype=np.uint32)
+            command = gpu.encoder()
+            command.clear_buffer(self.grid_m)
+            command.clear_buffer(self.grid_v)
+            gpu.submit(command)
+        self.capacity = 0
+        self.raster = None
+        self.set_resolution(width, height)
+        self.set_population(gauss)
+
+    def set_resolution(self, width, height):
+        if self.raster is not None and (self.raster.width, self.raster.height) == (width, height):
+            return
+        if min(width, height) < 16:
+            raise ValueError("Training frames must be at least 16×16")
+        gpu = self.gpu
         self.raster = Rasterizer(gpu, width, height)
+        if self.capacity:
+            self.raster.allocate_population(self.capacity)
         self.shape = (height, width, 3)
         self.threads = (width, height, 1)
         pixels = width * height
-
-        identity = np.zeros(GRID_SHAPE, dtype=np.float32)
-        identity[[0, 5, 10]] = 1
-        grids = np.tile(identity.reshape(-1), views)
-        self.grid = gpu.buffer(grids.nbytes, "Bilateral grids", grids)
-        self.grid_m = gpu.buffer(grids.nbytes, "Grid Adam first moments")
-        self.grid_v = gpu.buffer(grids.nbytes, "Grid Adam second moments")
-        self.grid_grad = gpu.buffer(grids.nbytes, "Grid gradients")
-        self.clear_grid_grad = np.zeros(GRID_CELL, dtype=np.uint32)
         self.target = gpu.buffer(pixels * 12, "RGB target")
         self.depth_gt = gpu.buffer(pixels * 4, "Depth target")
         self.depth_grad = gpu.buffer(pixels * 4, "Depth gradient")
-        self.corrected = gpu.buffer(pixels * 12, "Corrected RGB")
-        self.dst_grad = gpu.buffer(pixels * 12, "Corrected RGB gradient")
-        self.src_grad = gpu.buffer(pixels * 12, "Rendered RGB gradient")
+        self.corrected = gpu.buffer(pixels * 12, "Corrected RGB") if self.uses_grid else self.raster.image
+        self.dst_grad = gpu.buffer(pixels * 12, "Color gradient")
+        self.src_grad = gpu.buffer(pixels * 12, "Rendered RGB gradient") if self.uses_grid else self.dst_grad
         self.stats = gpu.buffer(pixels * 48, "SSIM stats and partial derivatives")
+        self.ssim_rows = gpu.buffer(pixels * 60, "SSIM horizontal convolution")
         self.color_partial = gpu.buffer(REDUCE * 3 * 4, "Color metric reduction")
         self.depth_partial = gpu.buffer(REDUCE * 2 * 4, "Depth metric reduction")
-        self.capacity = 0
-        self.set_population(gauss)
-        command = gpu.encoder()
-        command.clear_buffer(self.grid_m)
-        command.clear_buffer(self.grid_v)
-        gpu.submit(command)
 
     def set_population(self, values, moment=None, velocity=None):
         gpu = self.gpu
@@ -120,17 +131,45 @@ class Trainer:
             dstGrad=self.dst_grad, srcGrad=self.src_grad, gridGrad=self.grid_grad,
         )
 
-    def ssim_forward(self, command, pc, measure):
+    def color_forward(self, command, pc, image, measure):
         gpu = self.gpu
         gpu.dispatch(
-            command, "ssimForward", self.threads, pc,
-            rendered=self.corrected, target=self.target, stats=self.stats,
+            command, "ssimForwardRows", self.threads, pc,
+            rendered=image, target=self.target, rowSums=self.ssim_rows,
+        )
+        gpu.dispatch(
+            command, "ssimForwardColumns", self.threads, pc,
+            rowSums=self.ssim_rows, stats=self.stats,
         )
         if measure:
             gpu.dispatch(
-                command, "reduceLoss", REDUCE, pc,
-                target=self.target, stats=self.stats, corrected=self.corrected, partial=self.color_partial,
+                command, "reduceLossWide", REDUCE, pc,
+                target=self.target, stats=self.stats, corrected=image, partial=self.color_partial,
             )
+
+    def read_color_metrics(self):
+        l1, mse, ssim = read_buffer(self.color_partial, np.float32, (REDUCE, 3)).sum(
+            axis=0, dtype=np.float64,
+        ) / (self.raster.pixels * 3)
+        if not np.isfinite([l1, mse, ssim]).all():
+            raise RuntimeError("Non-finite color metrics")
+        psnr = -10 * math.log10(mse) if mse > 1e-12 else 100.0
+        return float(l1), float(ssim), psnr
+
+    def raw_color_metrics(self):
+        """Measure the last render against its target before any grid correction."""
+        command = self.gpu.encoder()
+        self.color_forward(command, self.raster.frame | {"scale": 0.0}, self.raster.image, measure=True)
+        self.gpu.submit(command)
+        return dict(zip(("raw_l1", "raw_ssim", "raw_psnr"), self.read_color_metrics()))
+
+    def validation_depth_totals(self, target):
+        blend = read_buffer(self.raster.blend, np.float32, self.shape)
+        rendered = blend[..., 2]
+        valid = np.isfinite(target) & (target > self.hyper.depthMin)
+        measured = valid & np.isfinite(rendered) & (rendered > self.hyper.depthMin)
+        difference = rendered[measured].astype(np.float64) - target[measured]
+        return int(valid.sum()), len(difference), float(np.abs(difference).sum()), float(np.dot(difference, difference))
 
     def step(self, view, index, rgb, depth, *, train):
         gpu = self.gpu
@@ -146,14 +185,15 @@ class Trainer:
         if with_depth:
             command.upload_buffer_data(self.depth_gt, 0, depth)
             gpu.dispatch(
-                command, "depthLoss", REDUCE, frame | {"depthMin": h.depthMin},
+                command, "depthLossWide", REDUCE, frame | {"depthMin": h.depthMin},
                 pixels=self.raster.blend, depthGt=self.depth_gt, depthGrad=self.depth_grad,
                 partial=self.depth_partial,
             )
-        self.slice_grid(command, grid)
+        if self.uses_grid:
+            self.slice_grid(command, grid)
         # Train metrics use the render before the updates. Validation computes
         # the same gradients here and measures the post-update grid below.
-        self.ssim_forward(command, ssim, measure=train)
+        self.color_forward(command, ssim, self.corrected, measure=train or not self.uses_grid)
         gpu.submit(command)
 
         depth_mean = depth_weight = 0.0
@@ -164,14 +204,24 @@ class Trainer:
             if hits:
                 depth_mean = float(depth_sum / hits)
                 depth_weight = self.extent * h.depthLambda / hits
+        if not math.isfinite(depth_mean):
+            raise RuntimeError(f"Non-finite depth loss at frame {view.id}, Gaussian step {self.gauss_step}")
+
+        if not train and not self.uses_grid:
+            return Metrics(*self.read_color_metrics(), depth_mean)
 
         command = gpu.encoder()
-        command.upload_buffer_data(self.grid_grad, index * GRID_CELL * 4, self.clear_grid_grad)
+        if self.uses_grid:
+            command.upload_buffer_data(self.grid_grad, index * GRID_CELL * 4, self.clear_grid_grad)
         gpu.dispatch(
-            command, "ssimBackward", self.threads, ssim,
-            rendered=self.corrected, target=self.target, stats=self.stats, imageGrad=self.dst_grad,
+            command, "ssimBackwardRows", self.threads, ssim, stats=self.stats, rowSums=self.ssim_rows,
         )
-        self.slice_grid(command, grid, backward=True)
+        gpu.dispatch(
+            command, "ssimBackwardColumns", self.threads, ssim,
+            rendered=self.corrected, target=self.target, rowSums=self.ssim_rows, imageGrad=self.dst_grad,
+        )
+        if self.uses_grid:
+            self.slice_grid(command, grid, backward=True)
         if train:
             command.clear_buffer(self.accum)
             self.raster.backward(command, self.accum, self.src_grad, self.depth_grad, depth_weight, with_depth)
@@ -181,7 +231,8 @@ class Trainer:
                 gaussians=self.gauss, accum=self.accum, grads=self.grad,
                 densify=self.density, tileCount=self.raster.counts,
             )
-        gpu.dispatch(command, "gridTv", GRID_CELL, grid, grid=self.grid, gridGrad=self.grid_grad)
+        if self.uses_grid:
+            gpu.dispatch(command, "gridTv", GRID_CELL, grid, grid=self.grid, gridGrad=self.grid_grad)
 
         adam = {"eps": h.adamEps, "beta1": h.beta1, "beta2": h.beta2}
         if train:
@@ -190,7 +241,8 @@ class Trainer:
                 command, "adamGauss", self.count,
                 adam | {
                     "count": self.count, "step": self.gauss_step,
-                    "lrMean": h.mean_rate(self.gauss_step, self.mean_steps), "lrColor": h.lrColor,
+                    "lrMean": h.mean_rate(self.gauss_step, self.mean_steps),
+                    "lrColor": h.color_rate(self.gauss_step, self.mean_steps),
                     "lrOp": h.lrOpacity, "lrQuat": h.lrQuat, "lrScale": h.lrScale,
                 },
                 value=self.gauss, grad=self.grad, moment=self.moment, vel=self.velocity,
@@ -200,28 +252,23 @@ class Trainer:
                 self.densify()
                 command = gpu.encoder()
 
-        self.grid_step += 1
-        self.grid_view_steps[index] += 1
-        gpu.dispatch(
-            command, "adamGrid", GRID_CELL,
-            adam | {
-                "offset": index * GRID_CELL, "count": GRID_CELL, "step": self.grid_view_steps[index],
-                "lr": h.grid_rate(self.grid_step, self.grid_steps),
-            },
-            gridValue=self.grid, gridGrad=self.grid_grad, gridMoment=self.grid_m, gridVel=self.grid_v,
-        )
-        if not train:
-            self.slice_grid(command, grid)
-            self.ssim_forward(command, ssim, measure=True)
+        if self.uses_grid:
+            self.grid_step += 1
+            self.grid_view_steps[index] += 1
+            gpu.dispatch(
+                command, "adamGrid", GRID_CELL,
+                adam | {
+                    "offset": index * GRID_CELL, "count": GRID_CELL, "step": self.grid_view_steps[index],
+                    "lr": h.grid_rate(self.grid_step, self.grid_steps),
+                },
+                gridValue=self.grid, gridGrad=self.grid_grad, gridMoment=self.grid_m, gridVel=self.grid_v,
+            )
+            if not train:
+                self.slice_grid(command, grid)
+                self.color_forward(command, ssim, self.corrected, measure=True)
         gpu.submit(command)
 
-        l1, mse, ssim_mean = read_buffer(self.color_partial, np.float32, (REDUCE, 3)).sum(
-            axis=0, dtype=np.float64,
-        ) / (self.raster.pixels * 3)
-        psnr = -10 * math.log10(mse) if mse > 1e-12 else 100.0
-        if not np.isfinite([l1, mse, ssim_mean, depth_mean]).all():
-            raise RuntimeError(f"Non-finite metrics at frame {view.id}, grid step {self.grid_step}")
-        return Metrics(float(l1), float(ssim_mean), psnr, depth_mean)
+        return Metrics(*self.read_color_metrics(), depth_mean)
 
     def corrected_rgb(self):
         rgb = read_buffer(self.corrected, np.float32, self.shape)

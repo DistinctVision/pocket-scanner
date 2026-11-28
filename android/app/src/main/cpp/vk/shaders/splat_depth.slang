@@ -25,13 +25,11 @@ struct DepthPush {
 [[vk::push_constant]]
 DepthPush pc;
 
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void depthLoss(uint3 tid : SV_DispatchThreadID) {
+void reduceDepthLoss(int lane, int stride) {
     float sum = 0;
     float hits = 0;
     int n = pc.width * pc.height;
-    for (int p = int(tid.x); p < n; p += 256) {
+    for (int p = lane; p < n; p += stride) {
         float pred = pixels[p].depth;
         float gt = depthGt[p];
         float grad = 0;
@@ -46,6 +44,18 @@ void depthLoss(uint3 tid : SV_DispatchThreadID) {
         }
         depthGrad[p] = grad;
     }
-    partial[int(tid.x) * 2] = sum;
-    partial[int(tid.x) * 2 + 1] = hits;
+    partial[lane * 2] = sum;
+    partial[lane * 2 + 1] = hits;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void depthLoss(uint3 tid : SV_DispatchThreadID) {
+    reduceDepthLoss(int(tid.x), 256);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void depthLossWide(uint3 tid : SV_DispatchThreadID) {
+    reduceDepthLoss(int(tid.x), 8192);
 }

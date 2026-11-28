@@ -4,12 +4,13 @@ import unittest
 from dataclasses import replace
 from io import BytesIO
 from struct import pack
+from unittest.mock import patch
 
 import numpy as np
 
 from .capture import View, read_training_mesh
 from .frame_selection import Observation, observe_depth, prune_views
-from .gpu import GRID_CELL, Gpu, Rasterizer, read_buffer
+from .gpu import ENTRIES, GRID_CELL, Gpu, Rasterizer, read_buffer
 from .population import Hyper, apply_density, density_plan, logit, seed_gaussians
 from .trainer import Trainer
 
@@ -40,12 +41,27 @@ class FrameSelectionTest(unittest.TestCase):
             )
             for i, indices in enumerate(observed)
         ]
-        result = prune_views(len(points), positions, observations, [2, 1, 0, 3, 4])
+        poses = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], len(positions), axis=0)
+        poses[:, :3, 3] = positions
+        result = prune_views(np.arange(len(points)), poses, observations, [2, 1, 0, 3, 4])
         self.assertEqual(result.kept_indices, (0, 2, 3, 4))
         self.assertEqual(result.dropped_indices, (1,))
         self.assertEqual(result.unverified_indices, (4,))
         self.assertEqual(result.covered_samples, 2)
         self.assertEqual(result.parallax_samples, 1)
+
+    def test_coverage_loss_is_limited_globally_and_in_small_patches(self):
+        patches = np.zeros(203, dtype=np.intp)
+        patches[-1] = 1
+        observed = ([0], [1], [2], [202], np.arange(3, 202))
+        observations = [
+            Observation(np.asarray(samples), np.ones(len(samples), dtype=np.float32), 1.0, 1.0)
+            for samples in observed
+        ]
+        poses = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], len(observations), axis=0)
+        result = prune_views(patches, poses, observations, list(range(len(observations))))
+        self.assertEqual(result.kept_indices, (2, 3, 4))
+        self.assertEqual(result.retained_covered_samples, 201)
 
     def test_coverage_samples_are_independent_of_the_gaussian_budget(self):
         header = (
@@ -88,7 +104,42 @@ class DensityTest(unittest.TestCase):
 class SlangTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.gpu = Gpu("auto")
+        with patch.dict(ENTRIES, {"ssim": (*ENTRIES["ssim"], "ssimForward", "ssimBackward")}):
+            cls.gpu = Gpu("auto")
+
+    def test_separable_ssim_matches_the_reference_forward_and_gradient(self):
+        gpu = self.gpu
+        shape = (17, 19, 3)
+        height, width, _ = shape
+        counts = (width, height, 1)
+        rng = np.random.default_rng(13)
+        a = rng.random(shape, dtype=np.float32)
+        b = rng.random(shape, dtype=np.float32)
+        rendered = gpu.buffer(a.nbytes, "Rendered", a)
+        target = gpu.buffer(b.nbytes, "Target", b)
+        stats = gpu.buffer(a.nbytes * 4, "Reference kernel statistics")
+        fast_stats = gpu.buffer(a.nbytes * 4, "Separable kernel statistics")
+        grad = gpu.buffer(a.nbytes, "Reference kernel gradient")
+        fast_grad = gpu.buffer(a.nbytes, "Separable kernel gradient")
+        rows = gpu.buffer(a.nbytes * 5, "Horizontal convolutions")
+        pc = {"width": width, "height": height, "scale": -0.2 / a.size}
+        command = gpu.encoder()
+        gpu.dispatch(command, "ssimForward", counts, pc, rendered=rendered, target=target, stats=stats)
+        gpu.dispatch(command, "ssimBackward", counts, pc, rendered=rendered, target=target, stats=stats, imageGrad=grad)
+        gpu.dispatch(command, "ssimForwardRows", counts, pc, rendered=rendered, target=target, rowSums=rows)
+        gpu.dispatch(command, "ssimForwardColumns", counts, pc, rowSums=rows, stats=fast_stats)
+        gpu.dispatch(command, "ssimBackwardRows", counts, pc, rowSums=rows, stats=fast_stats)
+        gpu.dispatch(command, "ssimBackwardColumns", counts, pc, rendered=rendered, target=target, rowSums=rows, imageGrad=fast_grad)
+        gpu.submit(command)
+        stat_shape = shape + (4,)
+        np.testing.assert_allclose(
+            read_buffer(fast_stats, np.float32, stat_shape),
+            read_buffer(stats, np.float32, stat_shape), atol=2e-5, rtol=5e-4,
+        )
+        np.testing.assert_allclose(
+            read_buffer(fast_grad, np.float32, shape), read_buffer(grad, np.float32, shape),
+            atol=2e-8, rtol=5e-4,
+        )
 
     def test_gpu_radix_sort_is_stable_across_workgroups(self):
         raster = Rasterizer(self.gpu, 80, 48)
@@ -127,6 +178,7 @@ class SlangTest(unittest.TestCase):
         self.assertGreater(val.depth, .08)
         self.assertLess(val.l1, np.abs(rgb - rendered).mean())
         self.assertAlmostEqual(val.l1, float(np.abs(rgb - corrected).mean()), places=6)
+        self.assertAlmostEqual(trainer.raw_color_metrics()["raw_l1"], float(np.abs(rgb - rendered).mean()), places=6)
         np.testing.assert_array_equal(trainer.gaussians(), gauss)
         after_grid = read_buffer(trainer.grid, np.float32, (2, GRID_CELL))
         np.testing.assert_array_equal(before_grid[0], after_grid[0])
@@ -139,6 +191,33 @@ class SlangTest(unittest.TestCase):
         self.assertFalse(np.array_equal(trainer.gaussians(), gauss))
         self.assertEqual(trainer.grid_view_steps, [1, 1])
         self.assertEqual(trainer.gauss_step, 1)
+
+    def test_coarse_updates_keep_optimizer_state_for_full_resolution_validation(self):
+        hyper = replace(Hyper(), lrGrid=0)
+        seed = np.array([[0, 0, 1, 0, 0, 1, .4, .2, .1]], dtype=np.float32)
+        gauss, extent = seed_gaussians(seed, .08, hyper)
+        trainer = Trainer(self.gpu, gauss, extent, 16, 16, 1, hyper, 10, 2, 0)
+        view = View(1, 32, 32, np.eye(4, dtype=np.float32), (64, 64, 16, 16), "", "")
+        trainer.step(view, 0, np.zeros((16, 16, 3), dtype=np.float32), None, train=True)
+        trained = trainer.gaussians()
+        self.assertFalse(np.array_equal(trained, gauss))
+        moment = read_buffer(trainer.moment, np.float32, gauss.shape)
+        trainer.set_resolution(32, 32)
+        rgb = np.full((32, 32, 3), .4, dtype=np.float32)
+        depth = np.full((32, 32), 1.1, dtype=np.float32)
+        depth[0, 0] = 0
+        metrics = trainer.step(view, 0, rgb, depth, train=False)
+        valid, matched, abs_sum, square_sum = trainer.validation_depth_totals(depth)
+        self.assertEqual(valid, 1023)
+        self.assertGreater(matched, 0)
+        self.assertLess(matched, valid)
+        self.assertGreater(abs_sum, 0)
+        self.assertGreater(square_sum, 0)
+        self.assertAlmostEqual(metrics.l1, trainer.raw_color_metrics()["raw_l1"], places=6)
+        np.testing.assert_array_equal(trainer.gaussians(), trained)
+        np.testing.assert_array_equal(read_buffer(trainer.moment, np.float32, gauss.shape), moment)
+        self.assertEqual(trainer.gauss_step, 1)
+        self.assertEqual(trainer.grid_step, 0)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+{
+  "seedContour": 1.25,
+  "densifyFrom": 128,
+  "densifyUntil": 320,
+  "densifyInterval": 64,
+  "gradThreshold": 0.001
+}

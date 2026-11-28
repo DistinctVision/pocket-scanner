@@ -70,9 +70,17 @@ class Capture:
         depth = np.frombuffer(raw, dtype="<u2").astype(np.float32) / self.depth_scale
         return depth.reshape(view.height, view.width)
 
-    def images(self, view: View) -> tuple[np.ndarray, np.ndarray]:
-        rgb = np.asarray(self.color(view), dtype=np.float32) / np.float32(255)
-        return rgb, self.depth(view)
+    def images(self, view: View, size: tuple[int, int] | None = None) -> tuple[np.ndarray, np.ndarray]:
+        color = self.color(view)
+        depth = self.depth(view)
+        if size is not None and size != color.size:
+            color = color.resize(size, Image.Resampling.BOX)
+            width, height = size
+            # Nearest depth keeps missing measurements and occlusion edges intact.
+            x = (np.arange(width) * 2 + 1) * view.width // (2 * width)
+            y = (np.arange(height) * 2 + 1) * view.height // (2 * height)
+            depth = depth[np.ix_(y, x)]
+        return np.asarray(color, dtype=np.float32) / np.float32(255), depth
 
     def seed(self, budget: int, mesh: Path | None = None):
         loaded = self.training_mesh(budget, mesh)

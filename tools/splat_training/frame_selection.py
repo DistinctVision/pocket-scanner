@@ -1,6 +1,7 @@
 """Remove redundant training views while preserving observed surface support."""
 
 from dataclasses import dataclass
+from math import cos, radians
 
 import numpy as np
 from PIL import Image
@@ -13,8 +14,13 @@ DEPTH_TOLERANCE_M = 0.04
 DEPTH_TOLERANCE_RELATIVE = 0.015
 PAIR_DISTANCE_M = 0.05
 PAIR_ANGLE_DEGREES = 3
-POSE_POSITION_STEP_M = 0.14
-POSE_DIRECTION_STEP = 0.12
+PATCH_VOXELS = 5
+PATCH_COVERAGE_PERCENT = 92
+PATCH_PARALLAX_PERCENT = 75
+GLOBAL_COVERAGE_PERCENT = 99
+GLOBAL_PARALLAX_PERCENT = 95
+NEAR_POSITION_M = 0.35
+NEAR_ROTATION_DEGREES = 18
 PAIR_ANGLE_TERM = np.float32(2 * (1 - np.cos(np.deg2rad(PAIR_ANGLE_DEGREES))))
 SAMPLE_BATCH_SIZE = 65_536
 NEIGHBOR_Y, NEIGHBOR_X = np.indices((3, 3)).reshape(2, 9) - 1
@@ -27,6 +33,8 @@ class FrameSelection:
     unverified_indices: tuple[int, ...]
     covered_samples: int
     parallax_samples: int
+    retained_covered_samples: int
+    retained_parallax_samples: int
 
 
 @dataclass(frozen=True)
@@ -88,25 +96,6 @@ def image_sharpness(image: Image.Image) -> float:
     return float(np.quantile(np.abs(laplacian), 0.85))
 
 
-def removal_order(views: list[View], observations: list[Observation]) -> list[int]:
-    positions = np.stack([view.pose[:3, 3] for view in views])
-    forwards = np.stack([view.pose[:3, 2] for view in views])
-    lengths = np.linalg.norm(forwards, axis=1, keepdims=True)
-    np.divide(forwards, lengths, out=forwards, where=lengths > 0)
-    scaled = np.column_stack((positions / POSE_POSITION_STEP_M, forwards / POSE_DIRECTION_STEP))
-    buckets = np.copysign(np.floor(np.abs(scaled) + 0.5), scaled).astype(np.int64)
-
-    # Prefer better Z16 alignment and then sharper images within a group of
-    # similar poses. Unique measured support always overrides this ordering.
-    ranked = sorted(
-        range(len(views)),
-        key=lambda i: (observations[i].depth_agreement, observations[i].sharpness, -views[i].id),
-    )
-    best_by_pose = {tuple(buckets[i]): i for i in ranked}
-    best = set(best_by_pose.values())
-    return [i for i in ranked if i not in best] + [i for i in ranked if i in best]
-
-
 def pair_samples(lookup: np.ndarray, other: Observation, baseline_squared: float) -> np.ndarray:
     left = lookup[other.indices]
     right = other.distances
@@ -116,22 +105,35 @@ def pair_samples(lookup: np.ndarray, other: Observation, baseline_squared: float
 
 
 def prune_views(
-    sample_count: int, positions: np.ndarray, observations: list[Observation], order: list[int],
+    patches: np.ndarray, poses: np.ndarray, observations: list[Observation], order: list[int],
+    *, near_position: float = NEAR_POSITION_M, near_rotation: float = NEAR_ROTATION_DEGREES,
 ) -> FrameSelection:
     count = len(observations)
+    sample_count = len(patches)
+    patch_count = int(patches.max()) + 1 if sample_count else 0
     lookup = np.zeros(sample_count, dtype=np.float32)
     covered = np.zeros(sample_count, dtype=np.int32)
     pairs = np.zeros(sample_count, dtype=np.int64)
     neighbors: list[list[tuple[int, float]]] = [[] for _ in observations]
-    unverified = []
+    verified = np.array([len(observation.indices) > 0 for observation in observations], dtype=bool)
+    # Every verified original view must still have a nearby representative.
+    # The relative rotation includes roll as well as the viewing direction.
+    positions = poses[:, :3, 3]
+    rotations = poses[:, :3, :3].reshape(count, 9)
+    nearby = np.zeros((count, count), dtype=bool)
+    np.fill_diagonal(nearby, verified)
+    near_rotation_trace = 1 + 2 * cos(radians(near_rotation))
     for i, observation in enumerate(observations):
-        if len(observation.indices) == 0:
-            unverified.append(i)
+        if not verified[i]:
             continue
         covered[observation.indices] += 1
         lookup[observation.indices] = observation.distances
         baselines = np.sum(np.square(positions[i + 1:] - positions[i]), axis=1)
-        for offset in np.flatnonzero(baselines >= PAIR_DISTANCE_M ** 2):
+        close = (baselines <= near_position ** 2) & (
+            rotations[i + 1:] @ rotations[i] >= near_rotation_trace
+        ) & verified[i + 1:]
+        nearby[i, i + 1:] = nearby[i + 1:, i] = close
+        for offset in np.flatnonzero((baselines >= PAIR_DISTANCE_M ** 2) & verified[i + 1:]):
             j = i + 1 + int(offset)
             baseline = float(baselines[offset])
             supported = pair_samples(lookup, observations[j], baseline)
@@ -141,50 +143,79 @@ def prune_views(
                 neighbors[j].append((i, baseline))
         lookup[observation.indices] = 0
 
-    covered_samples = int(np.count_nonzero(covered))
-    parallax_samples = int(np.count_nonzero(pairs))
-    minimum_views = np.minimum(covered, 2)
+    patch_coverage = np.bincount(patches[covered > 0], minlength=patch_count)
+    patch_parallax = np.bincount(patches[pairs > 0], minlength=patch_count)
+    # Round allowable loss down. Small patches keep all their measured support.
+    coverage_allowance = patch_coverage * (100 - PATCH_COVERAGE_PERCENT) // 100
+    parallax_allowance = patch_parallax * (100 - PATCH_PARALLAX_PERCENT) // 100
+    covered_samples = int(patch_coverage.sum())
+    parallax_samples = int(patch_parallax.sum())
+    remaining_coverage_loss = covered_samples * (100 - GLOBAL_COVERAGE_PERCENT) // 100
+    remaining_parallax_loss = parallax_samples * (100 - GLOBAL_PARALLAX_PERCENT) // 100
+    representatives = nearby.sum(axis=1)
     active = np.ones(count, dtype=bool)
-    lost_pairs = np.zeros_like(pairs)
+    incident_pairs = np.zeros_like(pairs)
     for i in order:
+        represented = nearby[i]
+        if not verified[i] or np.any(representatives[represented] <= 1):
+            continue
         observation = observations[i]
         samples = observation.indices
-        if len(samples) == 0 or np.any(covered[samples] <= minimum_views[samples]):
+        uncovered = samples[covered[samples] == 1]
+        if len(uncovered) > remaining_coverage_loss:
+            continue
+        coverage_loss = np.bincount(patches[uncovered], minlength=patch_count)
+        if np.any(coverage_loss > coverage_allowance):
             continue
 
         lookup[samples] = observation.distances
         for j, baseline in neighbors[i]:
             if active[j]:
-                lost_pairs[pair_samples(lookup, observations[j], baseline)] += 1
+                incident_pairs[pair_samples(lookup, observations[j], baseline)] += 1
         lookup[samples] = 0
 
-        lost = lost_pairs[samples]
-        if not np.any((lost > 0) & (lost == pairs[samples])):
+        incident = incident_pairs[samples]
+        lost_parallax = samples[(incident > 0) & (incident == pairs[samples])]
+        parallax_loss = np.bincount(patches[lost_parallax], minlength=patch_count)
+        if len(lost_parallax) <= remaining_parallax_loss and np.all(parallax_loss <= parallax_allowance):
             active[i] = False
             covered[samples] -= 1
-            pairs[samples] -= lost
-        lost_pairs[samples] = 0
+            pairs[samples] -= incident
+            coverage_allowance -= coverage_loss
+            parallax_allowance -= parallax_loss
+            remaining_coverage_loss -= len(uncovered)
+            remaining_parallax_loss -= len(lost_parallax)
+            representatives[represented] -= 1
+        incident_pairs[samples] = 0
 
     return FrameSelection(
         tuple(np.flatnonzero(active).tolist()),
         tuple(np.flatnonzero(~active).tolist()),
-        tuple(unverified),
+        tuple(np.flatnonzero(~verified).tolist()),
         covered_samples,
         parallax_samples,
+        int(np.count_nonzero(covered)),
+        int(np.count_nonzero(pairs)),
     )
 
 
-def select_training_frames(capture: Capture, views: list[View], points: np.ndarray) -> FrameSelection:
+def select_training_frames(
+    capture: Capture, views: list[View], points: np.ndarray, voxel: float,
+    *, near_position: float = NEAR_POSITION_M, near_rotation: float = NEAR_ROTATION_DEGREES,
+) -> FrameSelection:
     if not views:
-        return FrameSelection((), (), (), 0, 0)
+        return FrameSelection((), (), (), 0, 0, 0, 0)
     observations = []
     for view in views:
         indices, distances, agreement = observe_depth(view, capture.depth(view), points)
         sharpness = image_sharpness(capture.color(view)) if len(indices) else 0.0
         observations.append(Observation(indices, distances, agreement, sharpness))
+    _, patches = np.unique(np.floor(points / (PATCH_VOXELS * voxel)), axis=0, return_inverse=True)
+    order = sorted(
+        range(len(views)),
+        key=lambda i: (observations[i].depth_agreement, observations[i].sharpness, -views[i].id),
+    )
     return prune_views(
-        len(points),
-        np.stack([view.pose[:3, 3] for view in views]),
-        observations,
-        removal_order(views, observations),
+        patches, np.stack([view.pose for view in views]), observations, order,
+        near_position=near_position, near_rotation=near_rotation,
     )

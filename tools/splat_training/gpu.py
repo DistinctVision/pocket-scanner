@@ -11,7 +11,7 @@ import slangpy as spy
 SHADERS = Path(__file__).resolve().parents[2] / "android/app/src/main/cpp/vk/shaders"
 TILE = 16
 SCAN = 128
-REDUCE = 256
+REDUCE = 8192
 GRID_SHAPE = (12, 8, 16, 16)
 GRID_CELL = prod(GRID_SHAPE)
 BUFFER_USAGE = (
@@ -29,12 +29,12 @@ ENTRIES = {
     "splat_ranges": ("markRanges",),
     "splat_blend": ("blendRgb", "blendRgbEd"),
     "splat_blend_back": ("blendBackwardRgb", "blendBackwardRgbEd"),
-    "splat_depth": ("depthLoss",),
+    "splat_depth": ("depthLossWide",),
     "splat_params": ("paramGrad",),
     "splat_adam": ("adamGauss",),
     "splat_adam_grid": ("adamGrid",),
     "bilagrid": ("sliceGrid", "gridTv"),
-    "ssim": ("ssimForward", "ssimBackward", "reduceLoss"),
+    "ssim": ("ssimForwardRows", "ssimForwardColumns", "ssimBackwardRows", "ssimBackwardColumns", "reduceLossWide"),
 }
 
 
@@ -111,7 +111,7 @@ class Rasterizer:
         self.ranges = gpu.buffer(self.tiles * 8, "Tile ranges")
         self.tail = gpu.buffer(8, "Last tile offset and count")
         self.totals = gpu.buffer(16 * 4, "Radix digit totals")
-        self.bases = gpu.buffer(16 * 4, "Radix digit offsets")
+        self.zero_bases = gpu.buffer(16 * 4, "Zero offsets for a full histogram scan", np.zeros(16, dtype=np.int32))
         self.scan_sums = {}
         self.pair_capacity = 0
         self.pair_count = 0
@@ -122,15 +122,17 @@ class Rasterizer:
         self.offsets = self.gpu.buffer(count * 4, "Exclusive tile offsets")
 
     def camera(self, view, count):
+        fx, fy, cx, cy = view.intrinsics
+        scale_x, scale_y = self.width / view.width, self.height / view.height
         return self.frame | {
             "count": count,
             "row0": spy.float4(*view.pose[0]),
             "row1": spy.float4(*view.pose[1]),
             "row2": spy.float4(*view.pose[2]),
-            "intr": spy.float4(*view.intrinsics),
+            "intr": spy.float4(fx * scale_x, fy * scale_y, cx * scale_x, cy * scale_y),
         }
 
-    def scan(self, command, src, dst, count, base=0, level=0):
+    def scan(self, command, src, dst, count, level=0):
         """Hierarchical exclusive scan with the app's block and add kernels."""
         groups = ceil_div(count, SCAN)
         scratch = self.scan_sums.get(level)
@@ -143,13 +145,13 @@ class Rasterizer:
         sums, prefixes = scratch
         self.gpu.dispatch(
             command, "scanBlock", count,
-            {"n": count, "inBase": base, "outBase": base, "sumBase": 0},
+            {"n": count, "inBase": 0, "outBase": 0, "sumBase": 0},
             input=src, output=dst, sums=sums,
         )
         if groups > 1:
             self.scan(command, sums, prefixes, groups, level=level + 1)
             self.gpu.dispatch(
-                command, "scanAdd", count, {"n": count, "dataBase": base, "prefixBase": 0},
+                command, "scanAdd", count, {"n": count, "dataBase": 0, "prefixBase": 0},
                 data=dst, prefix=prefixes,
             )
 
@@ -172,29 +174,20 @@ class Rasterizer:
         blocks = ceil_div(count, SCAN)
         # Higher tile digits are all zero, so their stable passes are identities.
         bits = 32 + (self.tiles - 1).bit_length()
+        command = gpu.encoder()
         for shift in range(0, bits, 4):
             pc = {"n": count, "blocks": blocks, "shift": shift}
-            command = gpu.encoder()
             command.clear_buffer(self.totals)
             gpu.dispatch(command, "radixHist", count, pc, keys=keys, hist=self.hist, digitTotals=self.totals)
-            for digit in range(16):
-                self.scan(command, self.hist, self.hist_ex, blocks, digit * blocks)
-            gpu.submit(command)
-            totals = read_buffer(self.totals, np.int32, (16,))
-            if int(totals.sum()) != count:
-                raise RuntimeError(f"Radix histogram totals {totals.sum()} for {count} tile pairs")
-            bases = np.empty(16, dtype=np.int32)
-            bases[0] = 0
-            np.cumsum(totals[:-1], out=bases[1:])
-            command = gpu.encoder()
-            command.upload_buffer_data(self.bases, 0, bases)
+            # The digit-major histogram scan includes the offset of each digit.
+            self.scan(command, self.hist, self.hist_ex, blocks * 16)
             gpu.dispatch(
                 command, "radixScatter", count, pc, keysIn=keys, idsIn=ids, keysOut=keys_out,
-                idsOut=ids_out, histEx=self.hist_ex, digitBase=self.bases,
+                idsOut=ids_out, histEx=self.hist_ex, digitBase=self.zero_bases,
             )
-            gpu.submit(command)
             keys, keys_out = keys_out, keys
             ids, ids_out = ids_out, ids
+        gpu.submit(command)
         return keys, ids
 
     def render(self, gauss, count, camera, with_depth):

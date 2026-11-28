@@ -47,6 +47,24 @@ float convAt(StructuredBuffer<float> img, int x, int y, int c) {
     return acc;
 }
 
+float4 ssimStatistics(float mu1, float mu2, float x2, float y2, float xy) {
+    float variance1 = x2 - mu1 * mu1;
+    float s1 = max(variance1, 0.0);
+    float s2 = max(y2 - mu2 * mu2, 0.0);
+    float s12 = xy - mu1 * mu2;
+    float A = 2.0 * mu1 * mu2 + kC1;
+    float B = mu1 * mu1 + mu2 * mu2 + kC1;
+    float C = 2.0 * s12 + kC2;
+    float D = s1 + s2 + kC2;
+    float den = B * D;
+    float ssim = A * C / den;
+    float dMu = ((2.0 * mu2 * C) * den - A * C * (2.0 * mu1 * D)) / (den * den);
+    float dS1 = variance1 > 0.0 ? -(A * C * B) / (den * den) : 0.0;
+    float dS12 = (2.0 * A * den) / (den * den);
+    dMu += dS1 * (-2.0 * mu1) + dS12 * (-mu2);
+    return float4(ssim, dMu, dS1, dS12);
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void ssimForward(uint3 tid : SV_DispatchThreadID) {
@@ -72,25 +90,113 @@ void ssimForward(uint3 tid : SV_DispatchThreadID) {
                 xy += w * a * b;
             }
         }
-        float variance1 = x2 - mu1 * mu1;
-        float s1 = max(variance1, 0.0);
-        float s2 = max(y2 - mu2 * mu2, 0.0);
-        float s12 = xy - mu1 * mu2;
-        float A = 2.0 * mu1 * mu2 + kC1;
-        float B = mu1 * mu1 + mu2 * mu2 + kC1;
-        float C = 2.0 * s12 + kC2;
-        float D = s1 + s2 + kC2;
-        float den = B * D;
-        float ssim = A * C / den;
-        float dMu = ((2.0 * mu2 * C) * den - A * C * (2.0 * mu1 * D)) / (den * den);
-        float dS1 = variance1 > 0.0 ? -(A * C * B) / (den * den) : 0.0;
-        float dS12 = (2.0 * A * den) / (den * den);
-        dMu += dS1 * (-2.0 * mu1) + dS12 * (-mu2);
+        float4 value = ssimStatistics(mu1, mu2, x2, y2, xy);
         int base = (pixId * 3 + c) * 4;
-        stats[base] = ssim;
-        stats[base + 1] = dMu;
-        stats[base + 2] = dS1;
-        stats[base + 3] = dS12;
+        stats[base] = value.x;
+        stats[base + 1] = value.y;
+        stats[base + 2] = value.z;
+        stats[base + 3] = value.w;
+    }
+}
+
+[[vk::binding(7, 0)]]
+RWStructuredBuffer<float> rowSums;
+
+[shader("compute")]
+[numthreads(16, 8, 1)]
+void ssimForwardRows(uint3 tid : SV_DispatchThreadID) {
+    int x = int(tid.x);
+    int y = int(tid.y);
+    if (x >= pc.width || y >= pc.height) return;
+    for (int c = 0; c < 3; ++c) {
+        float4 moments = 0;
+        float product = 0;
+        [unroll]
+        for (int dx = -5; dx <= 5; ++dx) {
+            if (x + dx < 0 || x + dx >= pc.width) continue;
+            int i = (y * pc.width + x + dx) * 3 + c;
+            float a = rendered[i];
+            float b = target[i];
+            float w = kW[abs(dx)];
+            moments += w * float4(a, b, a * a, b * b);
+            product += w * a * b;
+        }
+        int i = ((y * pc.width + x) * 3 + c) * 5;
+        rowSums[i] = moments.x;
+        rowSums[i + 1] = moments.y;
+        rowSums[i + 2] = moments.z;
+        rowSums[i + 3] = moments.w;
+        rowSums[i + 4] = product;
+    }
+}
+
+[shader("compute")]
+[numthreads(16, 8, 1)]
+void ssimForwardColumns(uint3 tid : SV_DispatchThreadID) {
+    int x = int(tid.x);
+    int y = int(tid.y);
+    if (x >= pc.width || y >= pc.height) return;
+    for (int c = 0; c < 3; ++c) {
+        float4 moments = 0;
+        float product = 0;
+        [unroll]
+        for (int dy = -5; dy <= 5; ++dy) {
+            if (y + dy < 0 || y + dy >= pc.height) continue;
+            int i = (((y + dy) * pc.width + x) * 3 + c) * 5;
+            float w = kW[abs(dy)];
+            moments += w * float4(rowSums[i], rowSums[i + 1], rowSums[i + 2], rowSums[i + 3]);
+            product += w * rowSums[i + 4];
+        }
+        float4 value = ssimStatistics(moments.x, moments.y, moments.z, moments.w, product);
+        int base = ((y * pc.width + x) * 3 + c) * 4;
+        stats[base] = value.x;
+        stats[base + 1] = value.y;
+        stats[base + 2] = value.z;
+        stats[base + 3] = value.w;
+    }
+}
+
+[shader("compute")]
+[numthreads(16, 8, 1)]
+void ssimBackwardRows(uint3 tid : SV_DispatchThreadID) {
+    int x = int(tid.x);
+    int y = int(tid.y);
+    if (x >= pc.width || y >= pc.height) return;
+    for (int c = 0; c < 3; ++c) {
+        float3 partial = 0;
+        [unroll]
+        for (int dx = -5; dx <= 5; ++dx) {
+            if (x + dx < 0 || x + dx >= pc.width) continue;
+            int i = ((y * pc.width + x + dx) * 3 + c) * 4;
+            partial += kW[abs(dx)] * float3(stats[i + 1], stats[i + 2], stats[i + 3]);
+        }
+        int i = ((y * pc.width + x) * 3 + c) * 3;
+        rowSums[i] = partial.x;
+        rowSums[i + 1] = partial.y;
+        rowSums[i + 2] = partial.z;
+    }
+}
+
+[shader("compute")]
+[numthreads(16, 8, 1)]
+void ssimBackwardColumns(uint3 tid : SV_DispatchThreadID) {
+    int x = int(tid.x);
+    int y = int(tid.y);
+    if (x >= pc.width || y >= pc.height) return;
+    for (int c = 0; c < 3; ++c) {
+        float3 grad = 0;
+        [unroll]
+        for (int dy = -5; dy <= 5; ++dy) {
+            if (y + dy < 0 || y + dy >= pc.height) continue;
+            int i = (((y + dy) * pc.width + x) * 3 + c) * 3;
+            grad += kW[abs(dy)] * float3(rowSums[i], rowSums[i + 1], rowSums[i + 2]);
+        }
+        int pixId = (y * pc.width + x) * 3 + c;
+        float a = rendered[pixId];
+        float b = target[pixId];
+        float inv = 1.0 / float(pc.width * pc.height * 3);
+        float l1 = a > b ? inv : (a < b ? -inv : 0.0);
+        imageGrad[pixId] = pc.scale * (grad.x + grad.y * 2.0 * a + grad.z * b) + l1;
     }
 }
 
@@ -138,14 +244,12 @@ StructuredBuffer<float> corrected;
 [[vk::binding(6, 0)]]
 RWStructuredBuffer<float> partial;
 
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void reduceLoss(uint3 tid : SV_DispatchThreadID) {
+void reduceColorLoss(int lane, int stride) {
     float l1 = 0;
     float mse = 0;
     float ssim = 0;
     int n = pc.width * pc.height;
-    for (int p = int(tid.x); p < n; p += 256) {
+    for (int p = lane; p < n; p += stride) {
         for (int c = 0; c < 3; ++c) {
             float d = corrected[p * 3 + c] - target[p * 3 + c];
             l1 += abs(d);
@@ -153,7 +257,19 @@ void reduceLoss(uint3 tid : SV_DispatchThreadID) {
             ssim += stats[(p * 3 + c) * 4];
         }
     }
-    partial[tid.x * 3] = l1;
-    partial[tid.x * 3 + 1] = mse;
-    partial[tid.x * 3 + 2] = ssim;
+    partial[lane * 3] = l1;
+    partial[lane * 3 + 1] = mse;
+    partial[lane * 3 + 2] = ssim;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void reduceLoss(uint3 tid : SV_DispatchThreadID) {
+    reduceColorLoss(int(tid.x), 256);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void reduceLossWide(uint3 tid : SV_DispatchThreadID) {
+    reduceColorLoss(int(tid.x), 8192);
 }

@@ -15,6 +15,7 @@ class Hyper:
     lrQuat: float = 1e-3
     lrOpacity: float = 5e-2
     lrColor: float = 2.5e-3
+    lrColorEnd: float = 1.0
     lrGrid: float = 2e-3
     lrGridStart: float = 0.01
     lrGridEnd: float = 0.01
@@ -45,6 +46,9 @@ class Hyper:
 
     def mean_rate(self, step, horizon):
         return self.lrMean * self.lrMeanEnd ** min(1.0, step / horizon)
+
+    def color_rate(self, step, horizon):
+        return self.lrColor * self.lrColorEnd ** min(1.0, step / horizon)
 
     def grid_rate(self, step, horizon):
         warm = max(1, min(self.gridWarmMax, horizon // max(1, self.gridWarmDivisor)))

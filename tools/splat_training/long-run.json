@@ -1,0 +1,15 @@
+{
+  "seedContour": 1.25,
+  "lrMean": 0.00035,
+  "lrMeanEnd": 0.08,
+  "lrColor": 0.006,
+  "lrColorEnd": 0.25,
+  "lrGrid": 0,
+  "depthLambda": 0.04,
+  "densifyFrom": 256,
+  "densifyUntil": 5120,
+  "densifyInterval": 256,
+  "gradThreshold": 0.001,
+  "percentDense": 0.003,
+  "opacityResetEvery": 0
+}
